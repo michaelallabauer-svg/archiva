@@ -4,31 +4,27 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from archiva.api import init_router, router
+from archiva.api import router as admin_router
+from archiva.api_documents import init_router, router as documents_router
 from archiva.config import load_settings
 from archiva.database import create_tables, init_db
 from archiva.storage import StorageManager
 
 
 def create_app() -> FastAPI:
-    """Create and configure the FastAPI application."""
     settings = load_settings()
 
-    # Initialize database
     init_db(settings)
     create_tables()
 
-    # Initialize storage
     storage = StorageManager(settings.storage.base_path)
 
-    # Create FastAPI app
     app = FastAPI(
         title="Archiva",
         description="Lightweight Enterprise Content Management with Full-Text Search",
         version="0.1.0",
     )
 
-    # CORS middleware
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -37,11 +33,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Initialize router with storage
     init_router(storage)
-
-    # Include API routes
-    app.include_router(router)
+    app.include_router(documents_router)
+    app.include_router(admin_router)
 
     return app
 

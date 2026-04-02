@@ -6,23 +6,21 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from archiva.models import DocumentType
 
-
-# --- Enums ---
+# --- Field Types (mirrors models.FieldType) ---
 
 class FieldType(str):
     """Metadata field types."""
 
-    TEXT = "text"  # Single line
+    TEXT = "text"
     NUMBER = "number"
     CURRENCY = "currency"
     DATE = "date"
     DATETIME = "datetime"
-    SELECTION = "selection"  # Dropdown single choice
-    MULTI_SELECTION = "multi_selection"  # Multiple choices
-    BOOLEAN = "boolean"  # Yes/No
-    LONG_TEXT = "long_text"  # Multi-line
+    SELECTION = "selection"
+    MULTI_SELECTION = "multi_selection"
+    BOOLEAN = "boolean"
+    LONG_TEXT = "long_text"
     URL = "url"
     EMAIL = "email"
     PHONE = "phone"
@@ -31,19 +29,10 @@ class FieldType(str):
 class DisplayWidth(str):
     """Form layout width."""
 
-    FULL = "full"  # 100%
-    HALF = "half"  # 50%
-    THIRD = "third"  # 33%
-    QUARTER = "quarter"  # 25%
-
-
-class FieldDisplayConfig(BaseModel):
-    """Display configuration for a field."""
-
-    width: DisplayWidth = DisplayWidth.HALF
-    order: int = 0
-    show_label: bool = True
-    placeholder: Optional[str] = None
+    FULL = "full"
+    HALF = "half"
+    THIRD = "third"
+    QUARTER = "quarter"
 
 
 # --- Cabinet (Schrank) ---
@@ -138,7 +127,7 @@ class DocumentTypeBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     order: int = Field(default=0)
-    icon: Optional[str] = None  # Emoji or icon name
+    icon: Optional[str] = None
 
 
 class DocumentTypeCreate(DocumentTypeBase):
@@ -181,26 +170,22 @@ class MetadataFieldBase(BaseModel):
     """Base metadata field schema."""
 
     name: str = Field(..., min_length=1, max_length=255)
-    field_type: str = Field(..., description="Field type from FieldType enum")
-    label: Optional[str] = None  # Display label, defaults to name
-    description: Optional[str] = None  # Help text
+    field_type: str = Field(...)
+    label: Optional[str] = None
+    description: Optional[str] = None
     placeholder: Optional[str] = None
     default_value: Optional[str] = None
     is_required: bool = Field(default=False)
     is_unique: bool = Field(default=False)
     order: int = Field(default=0)
     width: DisplayWidth = Field(default=DisplayWidth.HALF)
-    config_json: Optional[str] = None  # JSON for type-specific config
-
-    # For selection/multi_selection types
-    options: Optional[list[str]] = None  # Available choices
-
-    # Validation
+    config_json: Optional[str] = None
+    options: Optional[list[str]] = None
     min_value: Optional[float] = None
     max_value: Optional[float] = None
     min_length: Optional[int] = None
     max_length: Optional[int] = None
-    pattern: Optional[str] = None  # Regex pattern
+    pattern: Optional[str] = None
 
 
 class MetadataFieldCreate(MetadataFieldBase):
@@ -266,14 +251,6 @@ class GeneratedLayout(BaseModel):
     document_type_name: str
     rows: list[LayoutRow]
     total_fields: int
-
-
-# --- CRUD Schemas ---
-
-class DocumentTypeDetail(DocumentTypeWithFields):
-    """Full document type with layout."""
-
-    layout: GeneratedLayout
 
 
 # Update forward refs
