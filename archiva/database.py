@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from archiva.config import Settings, load_settings
@@ -35,6 +35,32 @@ def create_tables() -> None:
     if _engine is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
     Base.metadata.create_all(bind=_engine)
+    _ensure_document_cabinet_column()
+
+
+def _ensure_document_cabinet_column() -> None:
+    if _engine is None:
+        return
+    with _engine.begin() as conn:
+        conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS cabinet_id UUID NULL"))
+        fk_exists = conn.execute(
+            text(
+                """
+                SELECT 1
+                FROM information_schema.table_constraints
+                WHERE table_name = 'documents'
+                  AND constraint_name = 'fk_documents_cabinet_id'
+                LIMIT 1
+                """
+            )
+        ).first()
+        if not fk_exists:
+            conn.execute(
+                text(
+                    "ALTER TABLE documents ADD CONSTRAINT fk_documents_cabinet_id FOREIGN KEY (cabinet_id) REFERENCES cabinets(id)"
+                )
+            )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_cabinet_id ON documents (cabinet_id)"))
 
 
 @contextmanager

@@ -1,17 +1,22 @@
 """Document management routes for Archiva ECM."""
 
+import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from archiva.config import Settings, load_settings
 from archiva.database import get_db
-from archiva.models import DocType, Document, DocumentVersion
+from archiva.metadata_validation import (
+    metadata_from_json,
+    metadata_to_json,
+    validate_document_metadata,
+)
+from archiva.models import DocType, Document, DocumentType, DocumentVersion
 from archiva.search import build_search_query, update_document_vector
 from archiva.storage import StorageManager
 
@@ -39,11 +44,25 @@ class DocumentBase(BaseModel):
     tags: Optional[str] = None
 
 
+class DocumentTypeSummary(BaseModel):
+    id: UUID
+    name: str
+    icon: Optional[str] = None
+    register_id: UUID
+
+    class Config:
+        from_attributes = True
+
+
 class DocumentResponse(DocumentBase):
     id: UUID
     doc_type: str
     mime_type: Optional[str]
     size_bytes: int
+    document_type_id: Optional[UUID] = None
+    cabinet_id: Optional[UUID] = None
+    metadata: Optional[dict[str, Any]] = None
+    document_type: Optional[DocumentTypeSummary] = None
     created_at: datetime
     updated_at: datetime
 
@@ -89,13 +108,29 @@ async def health_check() -> dict:
 @router.post("/documents", response_model=DocumentResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    title: Optional[str] = None,
-    author: Optional[str] = None,
-    description: Optional[str] = None,
-    tags: Optional[str] = None,
+    title: Optional[str] = Form(default=None),
+    author: Optional[str] = Form(default=None),
+    description: Optional[str] = Form(default=None),
+    tags: Optional[str] = Form(default=None),
+    document_type_id: Optional[UUID] = Form(default=None),
+    metadata: Optional[str] = Form(default=None),
     db: Session = Depends(get_db),
     storage: StorageManager = Depends(get_storage),
-) -> Document:
+) -> DocumentResponse:
+    metadata_payload = _parse_metadata_payload(metadata)
+    metadata_json = None
+
+    if metadata_payload and not document_type_id:
+        raise HTTPException(
+            status_code=422,
+            detail={"errors": [{"field": "document_type_id", "message": "document_type_id is required when metadata is provided"}]},
+        )
+
+    if document_type_id:
+        validation = validate_document_metadata(db, document_type_id, metadata_payload)
+        metadata_payload = validation.normalized
+        metadata_json = metadata_to_json(metadata_payload)
+
     doc_type = _guess_doc_type(file.content_type)
     storage_path = storage.generate_path(file.filename)
     await storage.save(file, storage_path)
@@ -112,6 +147,9 @@ async def upload_document(
         author=author,
         description=description,
         tags=tags,
+        document_type_id=document_type_id,
+        cabinet_id=_resolve_cabinet_id(db, document_type_id),
+        metadata_json=metadata_json,
     )
 
     db.add(document)
@@ -122,7 +160,7 @@ async def upload_document(
 
     db.commit()
     db.refresh(document)
-    return document
+    return _document_to_response(document)
 
 
 @router.get("/documents", response_model=DocumentListResponse)
@@ -130,12 +168,15 @@ async def list_documents(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     doc_type: Optional[str] = None,
+    document_type_id: Optional[UUID] = None,
     db: Session = Depends(get_db),
 ) -> DocumentListResponse:
     query = db.query(Document)
 
     if doc_type:
         query = query.where(Document.doc_type == doc_type)
+    if document_type_id:
+        query = query.where(Document.document_type_id == document_type_id)
 
     total = query.count()
     offset = (page - 1) * page_size
@@ -143,7 +184,7 @@ async def list_documents(
     documents = query.order_by(Document.created_at.desc()).offset(offset).limit(page_size).all()
 
     return DocumentListResponse(
-        items=[DocumentResponse.model_validate(d) for d in documents],
+        items=[_document_to_response(d) for d in documents],
         total=total,
         page=page,
         page_size=page_size,
@@ -151,11 +192,11 @@ async def list_documents(
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
-async def get_document(document_id: UUID, db: Session = Depends(get_db)) -> Document:
+async def get_document(document_id: UUID, db: Session = Depends(get_db)) -> DocumentResponse:
     document = db.query(Document).where(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    return document
+    return _document_to_response(document)
 
 
 @router.delete("/documents/{document_id}", response_model=MessageResponse)
@@ -176,6 +217,54 @@ async def delete_document(
     return MessageResponse(message="Document deleted successfully")
 
 
+@router.get("/document-types/{document_type_id}/capture")
+async def get_capture_definition(document_type_id: UUID, db: Session = Depends(get_db)) -> dict[str, Any]:
+    document_type = db.query(DocumentType).where(DocumentType.id == document_type_id).first()
+    if not document_type:
+        raise HTTPException(status_code=404, detail="Document type not found")
+
+    fields = []
+    for field in sorted(document_type.fields, key=lambda item: item.order):
+        options = None
+        if field.options:
+            try:
+                options = json.loads(field.options)
+            except json.JSONDecodeError:
+                options = None
+        fields.append(
+            {
+                "id": str(field.id),
+                "name": field.name,
+                "label": field.label or field.name,
+                "field_type": field.field_type,
+                "description": field.description,
+                "placeholder": field.placeholder,
+                "default_value": field.default_value,
+                "is_required": field.is_required,
+                "is_unique": field.is_unique,
+                "order": field.order,
+                "width": field.width,
+                "options": options,
+                "min_value": field.min_value,
+                "max_value": field.max_value,
+                "min_length": field.min_length,
+                "max_length": field.max_length,
+                "pattern": field.pattern,
+            }
+        )
+
+    return {
+        "document_type": {
+            "id": str(document_type.id),
+            "name": document_type.name,
+            "description": document_type.description,
+            "icon": document_type.icon,
+            "register_id": str(document_type.register_id),
+        },
+        "fields": fields,
+    }
+
+
 @router.get("/search", response_model=SearchResponse)
 async def search_documents(
     q: str = Query(..., min_length=1),
@@ -187,6 +276,61 @@ async def search_documents(
         db, q, doc_type=doc_type, limit=limit, highlight_fragment_size=150
     )
     return SearchResponse(query=q, results=[SearchResult(**r) for r in results], total=len(results))
+
+
+def _document_to_response(document: Document) -> DocumentResponse:
+    document_type = None
+    if document.document_type:
+        document_type = DocumentTypeSummary.model_validate(document.document_type)
+
+    return DocumentResponse(
+        id=document.id,
+        name=document.name,
+        title=document.title,
+        author=document.author,
+        description=document.description,
+        tags=document.tags,
+        doc_type=document.doc_type.value if hasattr(document.doc_type, "value") else str(document.doc_type),
+        mime_type=document.mime_type,
+        size_bytes=document.size_bytes,
+        document_type_id=document.document_type_id,
+        cabinet_id=document.cabinet_id,
+        metadata=metadata_from_json(document.metadata_json),
+        document_type=document_type,
+        created_at=document.created_at,
+        updated_at=document.updated_at,
+    )
+
+
+def _resolve_cabinet_id(db: Session, document_type_id: Optional[UUID]) -> Optional[UUID]:
+    if not document_type_id:
+        return None
+    document_type = db.query(DocumentType).where(DocumentType.id == document_type_id).first()
+    if not document_type:
+        return None
+    if document_type.cabinet_id:
+        return document_type.cabinet_id
+    if document_type.register and document_type.register.cabinet_id:
+        return document_type.register.cabinet_id
+    return None
+
+
+def _parse_metadata_payload(metadata: Optional[str]) -> dict[str, Any] | None:
+    if metadata is None or not metadata.strip():
+        return None
+    try:
+        payload = json.loads(metadata)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"errors": [{"field": "metadata", "message": "metadata must be valid JSON"}]},
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=422,
+            detail={"errors": [{"field": "metadata", "message": "metadata must be a JSON object"}]},
+        )
+    return payload
 
 
 def _guess_doc_type(mime_type: Optional[str]) -> DocType:

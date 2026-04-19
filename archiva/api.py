@@ -14,6 +14,7 @@ from archiva.database import get_db
 from archiva.layout import generate_layout
 from archiva.models import (
     Cabinet,
+    CabinetType,
     Document,
     DocumentType,
     DocumentVersion,
@@ -23,6 +24,9 @@ from archiva.models import (
 from archiva.schema import (
     CabinetCreate,
     CabinetResponse,
+    CabinetTypeCreate,
+    CabinetTypeResponse,
+    CabinetTypeUpdate,
     CabinetUpdate,
     CabinetWithRegisters,
     DocumentTypeCreate,
@@ -46,6 +50,40 @@ router = APIRouter(prefix="/api/v1", tags=["admin"])
 # Re-export document routes for convenience
 from archiva.api_documents import router as documents_router
 router.include_router(documents_router)
+
+
+# =============================================================================
+# CabinetType Routes
+# =============================================================================
+
+@router.get("/cabinet-types", response_model=list[CabinetTypeResponse])
+async def list_cabinet_types(db: Session = Depends(get_db)) -> list[CabinetType]:
+    return db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
+
+
+@router.post("/cabinet-types", response_model=CabinetTypeResponse)
+async def create_cabinet_type(data: CabinetTypeCreate, db: Session = Depends(get_db)) -> CabinetType:
+    cabinet_type = CabinetType(name=data.name, description=data.description, order=data.order)
+    db.add(cabinet_type)
+    db.commit()
+    db.refresh(cabinet_type)
+    return cabinet_type
+
+
+@router.put("/cabinet-types/{cabinet_type_id}", response_model=CabinetTypeResponse)
+async def update_cabinet_type(cabinet_type_id: UUID, data: CabinetTypeUpdate, db: Session = Depends(get_db)) -> CabinetType:
+    cabinet_type = db.query(CabinetType).where(CabinetType.id == cabinet_type_id).first()
+    if not cabinet_type:
+        raise HTTPException(status_code=404, detail="Cabinet type not found")
+    if data.name is not None:
+        cabinet_type.name = data.name
+    if data.description is not None:
+        cabinet_type.description = data.description
+    if data.order is not None:
+        cabinet_type.order = data.order
+    db.commit()
+    db.refresh(cabinet_type)
+    return cabinet_type
 
 
 # =============================================================================
@@ -94,7 +132,13 @@ async def list_cabinets(db: Session = Depends(get_db)) -> list[CabinetWithRegist
                     field_dict = _field_to_response(f)
                     doc_type_dict["fields"].append(field_dict)
                 reg_dict["document_types"].append(doc_type_dict)
+            reg_dict["metadata_fields"] = [
+                _field_to_response(f) for f in sorted(r.metadata_fields, key=lambda x: x.order)
+            ]
             cabinet_dict["registers"].append(reg_dict)
+        cabinet_dict["metadata_fields"] = [
+            _field_to_response(f) for f in sorted(c.metadata_fields, key=lambda x: x.order)
+        ]
         result.append(CabinetWithRegisters(**cabinet_dict))
     return result
 
@@ -102,7 +146,10 @@ async def list_cabinets(db: Session = Depends(get_db)) -> list[CabinetWithRegist
 @router.post("/cabinets", response_model=CabinetResponse)
 async def create_cabinet(data: CabinetCreate, db: Session = Depends(get_db)) -> Cabinet:
     """Create a new cabinet."""
-    cabinet = Cabinet(name=data.name, description=data.description, order=data.order)
+    cabinet_type = db.query(CabinetType).where(CabinetType.id == data.cabinet_type_id).first()
+    if not cabinet_type:
+        raise HTTPException(status_code=404, detail="Cabinet type not found")
+    cabinet = Cabinet(cabinet_type_id=data.cabinet_type_id, name=data.name, description=data.description, order=data.order)
     db.add(cabinet)
     db.commit()
     db.refresh(cabinet)
@@ -130,6 +177,11 @@ async def update_cabinet(cabinet_id: UUID, data: CabinetUpdate, db: Session = De
         cabinet.description = data.description
     if data.order is not None:
         cabinet.order = data.order
+    if data.cabinet_type_id is not None:
+        cabinet_type = db.query(CabinetType).where(CabinetType.id == data.cabinet_type_id).first()
+        if not cabinet_type:
+            raise HTTPException(status_code=404, detail="Cabinet type not found")
+        cabinet.cabinet_type_id = data.cabinet_type_id
     db.commit()
     db.refresh(cabinet)
     return cabinet
@@ -213,12 +265,23 @@ async def delete_register(register_id: UUID, db: Session = Depends(get_db)) -> M
 
 @router.post("/document-types", response_model=DocumentTypeResponse)
 async def create_document_type(data: DocumentTypeCreate, db: Session = Depends(get_db)) -> DocumentType:
-    """Create a new document type in a register."""
-    register = db.query(Register).where(Register.id == data.register_id).first()
-    if not register:
-        raise HTTPException(status_code=404, detail="Register not found")
+    """Create a new document type in a cabinet or register."""
+    target_count = sum(1 for value in [data.cabinet_id, data.register_id] if value is not None)
+    if target_count != 1:
+        raise HTTPException(status_code=422, detail="Exactly one of cabinet_id or register_id must be set")
+
+    if data.register_id is not None:
+        register = db.query(Register).where(Register.id == data.register_id).first()
+        if not register:
+            raise HTTPException(status_code=404, detail="Register not found")
+    if data.cabinet_id is not None:
+        cabinet = db.query(Cabinet).where(Cabinet.id == data.cabinet_id).first()
+        if not cabinet:
+            raise HTTPException(status_code=404, detail="Cabinet not found")
+
     doc_type = DocumentType(
         register_id=data.register_id,
+        cabinet_id=data.cabinet_id,
         name=data.name,
         description=data.description,
         icon=data.icon,
@@ -272,8 +335,12 @@ async def update_document_type(
         doc_type.icon = data.icon
     if data.order is not None:
         doc_type.order = data.order
-    if data.register_id is not None:
+    if data.register_id is not None or data.cabinet_id is not None:
+        target_count = sum(1 for value in [data.cabinet_id, data.register_id] if value is not None)
+        if target_count != 1:
+            raise HTTPException(status_code=422, detail="Exactly one of cabinet_id or register_id must be set")
         doc_type.register_id = data.register_id
+        doc_type.cabinet_id = data.cabinet_id
     db.commit()
     db.refresh(doc_type)
     return doc_type
@@ -296,15 +363,30 @@ async def delete_document_type(document_type_id: UUID, db: Session = Depends(get
 
 @router.post("/metadata-fields", response_model=MetadataFieldResponse)
 async def create_metadata_field(data: MetadataFieldCreate, db: Session = Depends(get_db)) -> MetadataField:
-    """Create a new metadata field for a document type."""
-    doc_type = db.query(DocumentType).where(DocumentType.id == data.document_type_id).first()
-    if not doc_type:
-        raise HTTPException(status_code=404, detail="Document type not found")
-    
+    """Create a new metadata field for a cabinet, register, or document type."""
+    target_count = sum(1 for value in [data.document_type_id, data.cabinet_id, data.register_id] if value is not None)
+    if target_count != 1:
+        raise HTTPException(status_code=422, detail="Exactly one of document_type_id, cabinet_id, or register_id must be set")
+
+    if data.document_type_id is not None:
+        doc_type = db.query(DocumentType).where(DocumentType.id == data.document_type_id).first()
+        if not doc_type:
+            raise HTTPException(status_code=404, detail="Document type not found")
+    if data.cabinet_id is not None:
+        cabinet = db.query(Cabinet).where(Cabinet.id == data.cabinet_id).first()
+        if not cabinet:
+            raise HTTPException(status_code=404, detail="Cabinet not found")
+    if data.register_id is not None:
+        register = db.query(Register).where(Register.id == data.register_id).first()
+        if not register:
+            raise HTTPException(status_code=404, detail="Register not found")
+
     options_json = json.dumps(data.options) if data.options else None
-    
+
     field = MetadataField(
         document_type_id=data.document_type_id,
+        cabinet_id=data.cabinet_id,
+        register_id=data.register_id,
         name=data.name,
         field_type=data.field_type,
         label=data.label or data.name,
@@ -391,6 +473,8 @@ def _field_to_response(field: MetadataField) -> MetadataFieldResponse:
     return MetadataFieldResponse(
         id=field.id,
         document_type_id=field.document_type_id,
+        cabinet_id=field.cabinet_id,
+        register_id=field.register_id,
         name=field.name,
         field_type=field.field_type,
         label=field.label,
@@ -425,6 +509,9 @@ def _register_to_response(register: Register) -> RegisterWithDocumentTypes:
         updated_at=register.updated_at,
         document_types=[
             _document_type_to_response(dt) for dt in sorted(register.document_types, key=lambda x: x.order)
+        ],
+        metadata_fields=[
+            _field_to_response(f) for f in sorted(register.metadata_fields, key=lambda x: x.order)
         ]
     )
 
@@ -434,6 +521,7 @@ def _document_type_to_response(doc_type: DocumentType) -> DocumentTypeWithFields
     return DocumentTypeWithFields(
         id=doc_type.id,
         register_id=doc_type.register_id,
+        cabinet_id=doc_type.cabinet_id,
         name=doc_type.name,
         description=doc_type.description,
         icon=doc_type.icon,
@@ -448,12 +536,17 @@ def _cabinet_to_response(cabinet: Cabinet) -> CabinetWithRegisters:
     """Convert a Cabinet model to response schema with nested registers."""
     return CabinetWithRegisters(
         id=cabinet.id,
+        cabinet_type_id=cabinet.cabinet_type_id,
         name=cabinet.name,
         description=cabinet.description,
         order=cabinet.order,
         created_at=cabinet.created_at,
         updated_at=cabinet.updated_at,
+        cabinet_type=CabinetTypeResponse.model_validate(cabinet.cabinet_type) if cabinet.cabinet_type else None,
         registers=[
             _register_to_response(r) for r in sorted(cabinet.registers, key=lambda x: x.order)
+        ],
+        metadata_fields=[
+            _field_to_response(f) for f in sorted(cabinet.metadata_fields, key=lambda x: x.order)
         ]
     )

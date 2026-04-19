@@ -2,6 +2,7 @@
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from archiva.api import router as admin_router
@@ -9,6 +10,7 @@ from archiva.api_documents import init_router, router as documents_router
 from archiva.config import load_settings
 from archiva.database import create_tables, init_db
 from archiva.storage import StorageManager
+from archiva.ui import router as ui_router
 
 
 def create_app() -> FastAPI:
@@ -34,6 +36,8 @@ def create_app() -> FastAPI:
     )
 
     init_router(storage)
+    app.mount("/assets", StaticFiles(directory="assets"), name="assets")
+    app.include_router(ui_router, prefix="/ui")
     app.include_router(documents_router)
     app.include_router(admin_router)
 

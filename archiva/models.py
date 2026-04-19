@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
 )
+from sqlalchemy.dialects.postgresql import ENUM as PGEnum
 from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -52,13 +53,41 @@ class DisplayWidth(str, enum.Enum):
 
 # --- ECM Hierarchy Models ---
 
+class CabinetType(Base):
+    """Fachlicher Cabinet-Typ, z. B. ERB oder Personal."""
+
+    __tablename__ = "cabinet_types"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    cabinets: Mapped[list["Cabinet"]] = relationship(
+        "Cabinet", back_populates="cabinet_type", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("ix_cabinet_types_order", "order"),)
+
+
 class Cabinet(Base):
-    """Schrank (Cabinet) - top level container."""
+    """Konkretes Cabinet innerhalb eines Cabinet-Typs, z. B. 2025 oder 2026."""
 
     __tablename__ = "cabinets"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    cabinet_type_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cabinet_types.id"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -70,11 +99,21 @@ class Cabinet(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
 
+    cabinet_type: Mapped["CabinetType"] = relationship("CabinetType", back_populates="cabinets")
     registers: Mapped[list["Register"]] = relationship(
         "Register", back_populates="cabinet", cascade="all, delete-orphan"
     )
+    document_types: Mapped[list["DocumentType"]] = relationship(
+        "DocumentType", back_populates="cabinet", cascade="all, delete-orphan"
+    )
+    metadata_fields: Mapped[list["MetadataField"]] = relationship(
+        "MetadataField", back_populates="cabinet", cascade="all, delete-orphan"
+    )
 
-    __table_args__ = (Index("ix_cabinets_order", "order"),)
+    __table_args__ = (
+        Index("ix_cabinets_order", "order"),
+        Index("ix_cabinets_cabinet_type_id", "cabinet_type_id"),
+    )
 
 
 class Register(Base):
@@ -102,6 +141,9 @@ class Register(Base):
     document_types: Mapped[list["DocumentType"]] = relationship(
         "DocumentType", back_populates="register", cascade="all, delete-orphan"
     )
+    metadata_fields: Mapped[list["MetadataField"]] = relationship(
+        "MetadataField", back_populates="register", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (Index("ix_registers_cabinet_id", "cabinet_id"),)
 
@@ -114,8 +156,11 @@ class DocumentType(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    register_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("registers.id"), nullable=False
+    register_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("registers.id"), nullable=True
+    )
+    cabinet_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cabinets.id"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -128,7 +173,8 @@ class DocumentType(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
 
-    register: Mapped["Register"] = relationship("Register", back_populates="document_types")
+    register: Mapped[Optional["Register"]] = relationship("Register", back_populates="document_types")
+    cabinet: Mapped[Optional["Cabinet"]] = relationship("Cabinet", back_populates="document_types")
     fields: Mapped[list["MetadataField"]] = relationship(
         "MetadataField", back_populates="document_type", cascade="all, delete-orphan"
     )
@@ -136,7 +182,10 @@ class DocumentType(Base):
         "Document", back_populates="document_type"
     )
 
-    __table_args__ = (Index("ix_document_types_register_id", "register_id"),)
+    __table_args__ = (
+        Index("ix_document_types_register_id", "register_id"),
+        Index("ix_document_types_cabinet_id", "cabinet_id"),
+    )
 
 
 class MetadataField(Base):
@@ -147,8 +196,14 @@ class MetadataField(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    document_type_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("document_types.id"), nullable=False
+    document_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document_types.id"), nullable=True
+    )
+    cabinet_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cabinets.id"), nullable=True
+    )
+    register_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("registers.id"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     field_type: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -174,12 +229,20 @@ class MetadataField(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
 
-    document_type: Mapped["DocumentType"] = relationship(
+    document_type: Mapped[Optional["DocumentType"]] = relationship(
         "DocumentType", back_populates="fields"
+    )
+    cabinet: Mapped[Optional["Cabinet"]] = relationship(
+        "Cabinet", back_populates="metadata_fields"
+    )
+    register: Mapped[Optional["Register"]] = relationship(
+        "Register", back_populates="metadata_fields"
     )
 
     __table_args__ = (
         Index("ix_metadata_fields_document_type_id", "document_type_id"),
+        Index("ix_metadata_fields_cabinet_id", "cabinet_id"),
+        Index("ix_metadata_fields_register_id", "register_id"),
         Index("ix_metadata_fields_order", "order"),
     )
 
@@ -216,6 +279,9 @@ class Document(Base):
     document_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("document_types.id"), nullable=True
     )
+    cabinet_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cabinets.id"), nullable=True
+    )
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Full-text search vector
@@ -240,6 +306,7 @@ class Document(Base):
     document_type: Mapped[Optional["DocumentType"]] = relationship(
         "DocumentType", back_populates="documents"
     )
+    cabinet: Mapped[Optional["Cabinet"]] = relationship("Cabinet")
     versions: Mapped[list["DocumentVersion"]] = relationship(
         "DocumentVersion", back_populates="document", cascade="all, delete-orphan"
     )
@@ -250,6 +317,62 @@ class Document(Base):
         Index("ix_documents_doc_type", "doc_type"),
         Index("ix_documents_created_at", "created_at"),
         Index("ix_documents_document_type_id", "document_type_id"),
+        Index("ix_documents_cabinet_id", "cabinet_id"),
+    )
+
+
+class PreviewJobStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+preview_job_status_enum = PGEnum(
+    PreviewJobStatus,
+    name="previewjobstatus",
+    create_type=False,
+)
+
+
+class PreviewJob(Base):
+    __tablename__ = "preview_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False)
+    status: Mapped[PreviewJobStatus] = mapped_column(preview_job_status_enum, nullable=False, default=PreviewJobStatus.PENDING)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    document: Mapped["Document"] = relationship("Document")
+
+    __table_args__ = (
+        Index("ix_preview_jobs_document_id", "document_id"),
+        Index("ix_preview_jobs_status", "status"),
+        Index("ix_preview_jobs_created_at", "created_at"),
+    )
+
+
+class PreviewArtifact(Base):
+    __tablename__ = "preview_artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(50), nullable=False, default="html")
+    mime_type: Mapped[str] = mapped_column(String(100), nullable=False, default="text/html")
+    storage_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="ready")
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    document: Mapped["Document"] = relationship("Document")
+
+    __table_args__ = (
+        Index("ix_preview_artifacts_document_id", "document_id"),
+        Index("ix_preview_artifacts_status", "status"),
     )
 
 
