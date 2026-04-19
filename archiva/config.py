@@ -34,6 +34,9 @@ class SearchSettings(BaseSettings):
 
     max_results: int = 100
     highlight_fragment_size: int = 150
+    engine: str = "opensearch"
+    opensearch_url: str = "http://localhost:9200"
+    index_name: str = "archiva-documents-v1"
 
 
 class AppSettings(BaseSettings):

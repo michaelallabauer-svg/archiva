@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from archiva.api import router as admin_router
 from archiva.api_documents import init_router, router as documents_router
+from archiva.internal_index_api import router as internal_index_router
+from archiva.search_api import router as search_router
 from archiva.config import load_settings
 from archiva.database import create_tables, init_db
 from archiva.storage import StorageManager
@@ -40,6 +42,8 @@ def create_app() -> FastAPI:
     app.include_router(ui_router, prefix="/ui")
     app.include_router(documents_router)
     app.include_router(admin_router)
+    app.include_router(search_router)
+    app.include_router(internal_index_router)
 
     return app
 

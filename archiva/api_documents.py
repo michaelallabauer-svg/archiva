@@ -11,13 +11,14 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from archiva.database import get_db
+from archiva.indexer.dispatcher import enqueue_document_index
 from archiva.metadata_validation import (
     metadata_from_json,
     metadata_to_json,
     validate_document_metadata,
 )
 from archiva.models import DocType, Document, DocumentType, DocumentVersion
-from archiva.search import build_search_query, update_document_vector
+from archiva.search_legacy import build_search_query, update_document_vector
 from archiva.storage import StorageManager
 
 router = APIRouter(prefix="/api/v1", tags=["documents"])
@@ -160,6 +161,7 @@ async def upload_document(
 
     db.commit()
     db.refresh(document)
+    enqueue_document_index(db, document=document, reason="document_uploaded_api")
     return _document_to_response(document)
 
 

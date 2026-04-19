@@ -74,6 +74,19 @@ class CabinetType(Base):
     cabinets: Mapped[list["Cabinet"]] = relationship(
         "Cabinet", back_populates="cabinet_type", cascade="all, delete-orphan"
     )
+    register_types: Mapped[list["RegisterType"]] = relationship(
+        "RegisterType", back_populates="cabinet_type", cascade="all, delete-orphan"
+    )
+    document_type_definitions: Mapped[list["DocumentType"]] = relationship(
+        "DocumentType",
+        back_populates="cabinet_type_definition",
+        foreign_keys="DocumentType.cabinet_type_id",
+    )
+    metadata_fields: Mapped[list["MetadataField"]] = relationship(
+        "MetadataField",
+        back_populates="cabinet_type_definition",
+        foreign_keys="MetadataField.cabinet_type_id",
+    )
 
     __table_args__ = (Index("ix_cabinet_types_order", "order"),)
 
@@ -127,6 +140,9 @@ class Register(Base):
     cabinet_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("cabinets.id"), nullable=False
     )
+    register_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("register_types.id"), nullable=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -138,6 +154,7 @@ class Register(Base):
     )
 
     cabinet: Mapped["Cabinet"] = relationship("Cabinet", back_populates="registers")
+    register_type: Mapped[Optional["RegisterType"]] = relationship("RegisterType", back_populates="registers")
     document_types: Mapped[list["DocumentType"]] = relationship(
         "DocumentType", back_populates="register", cascade="all, delete-orphan"
     )
@@ -145,7 +162,50 @@ class Register(Base):
         "MetadataField", back_populates="register", cascade="all, delete-orphan"
     )
 
-    __table_args__ = (Index("ix_registers_cabinet_id", "cabinet_id"),)
+    __table_args__ = (
+        Index("ix_registers_cabinet_id", "cabinet_id"),
+        Index("ix_registers_register_type_id", "register_type_id"),
+    )
+
+
+class RegisterType(Base):
+    """Definition of allowed registers beneath a cabinet type."""
+
+    __tablename__ = "register_types"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    cabinet_type_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cabinet_types.id"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    cabinet_type: Mapped["CabinetType"] = relationship("CabinetType", back_populates="register_types")
+    document_type_definitions: Mapped[list["DocumentType"]] = relationship(
+        "DocumentType",
+        back_populates="register_type_definition",
+        foreign_keys="DocumentType.register_type_id",
+    )
+    registers: Mapped[list["Register"]] = relationship("Register", back_populates="register_type")
+    metadata_fields: Mapped[list["MetadataField"]] = relationship(
+        "MetadataField",
+        back_populates="register_type_definition",
+        foreign_keys="MetadataField.register_type_id",
+    )
+
+    __table_args__ = (
+        Index("ix_register_types_cabinet_type_id", "cabinet_type_id"),
+        Index("ix_register_types_order", "order"),
+    )
 
 
 class DocumentType(Base):
@@ -162,6 +222,12 @@ class DocumentType(Base):
     cabinet_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("cabinets.id"), nullable=True
     )
+    cabinet_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cabinet_types.id"), nullable=True
+    )
+    register_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("register_types.id"), nullable=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     icon: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
@@ -175,6 +241,16 @@ class DocumentType(Base):
 
     register: Mapped[Optional["Register"]] = relationship("Register", back_populates="document_types")
     cabinet: Mapped[Optional["Cabinet"]] = relationship("Cabinet", back_populates="document_types")
+    cabinet_type_definition: Mapped[Optional["CabinetType"]] = relationship(
+        "CabinetType",
+        back_populates="document_type_definitions",
+        foreign_keys=[cabinet_type_id],
+    )
+    register_type_definition: Mapped[Optional["RegisterType"]] = relationship(
+        "RegisterType",
+        back_populates="document_type_definitions",
+        foreign_keys=[register_type_id],
+    )
     fields: Mapped[list["MetadataField"]] = relationship(
         "MetadataField", back_populates="document_type", cascade="all, delete-orphan"
     )
@@ -185,6 +261,8 @@ class DocumentType(Base):
     __table_args__ = (
         Index("ix_document_types_register_id", "register_id"),
         Index("ix_document_types_cabinet_id", "cabinet_id"),
+        Index("ix_document_types_cabinet_type_id", "cabinet_type_id"),
+        Index("ix_document_types_register_type_id", "register_type_id"),
     )
 
 
@@ -204,6 +282,12 @@ class MetadataField(Base):
     )
     register_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("registers.id"), nullable=True
+    )
+    cabinet_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cabinet_types.id"), nullable=True
+    )
+    register_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("register_types.id"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     field_type: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -238,11 +322,23 @@ class MetadataField(Base):
     register: Mapped[Optional["Register"]] = relationship(
         "Register", back_populates="metadata_fields"
     )
+    cabinet_type_definition: Mapped[Optional["CabinetType"]] = relationship(
+        "CabinetType",
+        back_populates="metadata_fields",
+        foreign_keys=[cabinet_type_id],
+    )
+    register_type_definition: Mapped[Optional["RegisterType"]] = relationship(
+        "RegisterType",
+        back_populates="metadata_fields",
+        foreign_keys=[register_type_id],
+    )
 
     __table_args__ = (
         Index("ix_metadata_fields_document_type_id", "document_type_id"),
         Index("ix_metadata_fields_cabinet_id", "cabinet_id"),
         Index("ix_metadata_fields_register_id", "register_id"),
+        Index("ix_metadata_fields_cabinet_type_id", "cabinet_type_id"),
+        Index("ix_metadata_fields_register_type_id", "register_type_id"),
         Index("ix_metadata_fields_order", "order"),
     )
 
@@ -301,6 +397,12 @@ class Document(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
     indexed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    index_status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+    index_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    content_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    index_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    index_engine: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    index_ocr_used: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     # Relationships
     document_type: Mapped[Optional["DocumentType"]] = relationship(
@@ -318,6 +420,40 @@ class Document(Base):
         Index("ix_documents_created_at", "created_at"),
         Index("ix_documents_document_type_id", "document_type_id"),
         Index("ix_documents_cabinet_id", "cabinet_id"),
+    )
+
+
+class IndexJob(Base):
+    """Queue entry for asynchronous search indexing."""
+
+    __tablename__ = "index_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False
+    )
+    job_type: Mapped[str] = mapped_column(String(50), nullable=False, default="index_document")
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    worker_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    document: Mapped["Document"] = relationship("Document")
+
+    __table_args__ = (
+        Index("ix_index_jobs_document_id", "document_id"),
+        Index("ix_index_jobs_status", "status"),
+        Index("ix_index_jobs_scheduled_at", "scheduled_at"),
     )
 
 
