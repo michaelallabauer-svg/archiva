@@ -34,7 +34,7 @@ class SearchService:
         if result.get("ok"):
             payload = result["data"]
             hits = payload.get("hits", {}).get("hits", [])
-            return {
+            parsed = {
                 "hits": [
                     {
                         "document_id": hit.get("_source", {}).get("document_id"),
@@ -51,6 +51,29 @@ class SearchService:
                 "page": page,
                 "page_size": page_size,
             }
+            fallback = build_search_response(
+                db=self.db,
+                q=q,
+                document_type_id=document_type_id,
+                cabinet_type_id=cabinet_type_id,
+                cabinet_id=cabinet_id,
+                page=page,
+                page_size=page_size,
+            )
+            if parsed["total"] > 0:
+                fallback_ids = {hit.get("document_id") for hit in fallback.get("hits", []) if hit.get("document_id")}
+                seen: set[str] = set()
+                merged_hits = []
+                for hit in parsed["hits"] + fallback.get("hits", []):
+                    doc_id = hit.get("document_id")
+                    if not doc_id or doc_id in seen:
+                        continue
+                    seen.add(doc_id)
+                    merged_hits.append(hit)
+                parsed["hits"] = merged_hits
+                parsed["total"] = len(merged_hits)
+                return parsed
+            return fallback
         return build_search_response(
             db=self.db,
             q=q,

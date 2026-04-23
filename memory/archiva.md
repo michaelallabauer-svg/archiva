@@ -1,6 +1,6 @@
 # Archiva
 
-Stand: 2026-04-19
+Stand: 2026-04-23
 
 ## Projektziel
 Archiva ist ein ECM mit getrennten Flächen für Admin, App, Workflows und Preview. Zielstruktur ist:
@@ -104,6 +104,52 @@ Als Nächstes die **Verschieben-Funktionalität** bauen, zuerst pragmatisch im U
 ## Wichtige technische Erkenntnis
 Eine saubere Move-Funktion war vorher nicht möglich, weil Dokumente nur indirekt über `document_type_id` hingen. Mit `documents.cabinet_id` ist die Grundlage dafür jetzt gelegt.
 
+## Workflow Designer (Stand 2026-04-23)
+- Der Workflow-Designer in `archiva/ui.py` ist als zusammenhängender Renderer-Block vorhanden und derzeit konsistent.
+- Aktuell umgesetzt:
+  - Workflow-Liste
+  - grafische Schrittkette mit Drag-and-Drop-Reihenfolge
+  - Schritt anlegen
+  - Schritt bearbeiten
+  - Schritt löschen
+  - Transitionen anzeigen
+  - Transitionen anlegen
+  - Transitionen bearbeiten
+  - Transitionen löschen
+- Gemeinsame Workflow-Designer-Helfer wurden ergänzt:
+  - zentrale Redirect-Hilfe
+  - zentrale Transition-Validierung
+- Validierungsregeln für Transitionen:
+  - kein Übergang auf denselben Schritt
+  - kein leeres Label
+  - keine doppelte Transition mit gleichem Label/Ziel vom selben Schritt
+  - pro Schritt maximal ein `is_default=True`-Übergang
+- Neue relevante UI-Routen:
+  - `POST /workflow-designer/transitions/{transition_id}`
+  - `POST /workflow-designer/transitions/{transition_id}/delete`
+  - `POST /workflow-designer/steps/{step_id}/delete`
+- Schrittkarten zeigen jetzt zusätzlich:
+  - Anzahl der Transitionen
+  - Anzahl der Standard-Transitionen
+  - Hinweis bei mehreren Ausgängen bzw. fehlendem Standardpfad
+  - Hinweis, ob ein Schritt gelöscht werden kann oder wegen Transitionen blockiert ist
+- Verifizierter Runtime-Stand:
+  - `archiva.ui` importiert sauber
+  - Renderer-Smoke-Test war erfolgreich
+  - `/ui/workflow-designer` liefert HTTP 200
+  - Transition-Flow end-to-end verifiziert für create / update / delete / Default-Validierung
+  - Step-Delete-Flow end-to-end verifiziert:
+    - Schritt mit ausgehender Transition wird blockiert
+    - Schritt mit eingehender Transition wird blockiert
+    - Schritt ohne Transitionen wird gelöscht
+    - verbleibende Schritte werden danach neu nummeriert
+- Wichtige Diagnose aus dem Runtime-Test:
+  - nach Exec-/OpenClaw-Neustart lief auf `:8000` zunächst noch eine stale Instanz ohne die neue Step-Delete-Route
+  - nach richtigem Archiva-Neustart war auch die Hauptinstanz auf `:8000` grün
+- Nächstes sinnvolles Ausbauziel im Workflow-Designer:
+  - visuelle Andeutung mehrerer Ausgänge in der Grafik
+  - oder Workflow-Versionierung / Duplizieren
+
 ## Altbestand-Repair
 - Es gibt jetzt zusätzlich einen vollständigen Repair-Pfad für den Altbestand:
   - Route: `POST /ui/admin/repair-bestand`
@@ -164,6 +210,55 @@ Eine saubere Move-Funktion war vorher nicht möglich, weil Dokumente nur indirek
   - kein künstlicher Root-Knoten mehr
   - keine Meta-Zeilen mehr direkt im Baum
   - Kontextmenüs für Cabinettyp und Registertyp enthalten jetzt auch `Metadatenfeld anlegen`
+
+## Volltext / Suche (Status nach Prüfung am 2026-04-21 Abend)
+
+- Volltext ist nicht nur geplant, sondern bereits teilweise umgesetzt.
+- `main.py` bindet bereits ein:
+  - `search_router`
+  - `internal_index_router`
+- Es gibt eine Such-API unter `GET /api/search`.
+- Die neue Suchschicht läuft über `archiva/search/service.py`:
+  - bevorzugt Suche via `OpenSearchClient`
+  - fällt bei Bedarf auf eine lokale Suchantwort über `build_search_response(...)` zurück
+- Es gibt weiterhin ältere PostgreSQL-FTS-Bausteine in `archiva/search.py`:
+  - `content_vector`
+  - `to_tsvector(...)`
+  - `to_tsquery(...)`
+  - `ts_rank(...)`
+  - `ts_headline(...)`
+- Der aktuelle Zustand ist daher hybrid / Übergangszustand:
+  - alte PostgreSQL-Volltextbausteine existieren noch
+  - neue OpenSearch-orientierte Service-Schicht existiert ebenfalls
+- Es gibt ein Index-Job-System:
+  - `enqueue_document_index(...)`
+  - setzt `document.index_status = pending`
+  - erhöht `index_revision`
+  - legt `IndexJob` an
+- Es gibt interne Index-Endpunkte:
+  - `GET /api/internal/index/status`
+  - `POST /api/internal/index/documents/{id}/reindex`
+- API-Upload (`archiva/api_documents.py`) ist bereits an Volltext angebunden:
+  - Datei wird gespeichert
+  - Text wird extrahiert
+  - `content_vector` wird aktualisiert
+  - zusätzlich wird ein Index-Job enqueued
+- OCR-/Index-Runtime-Status ist ebenfalls vorhanden und prüft u. a.:
+  - `tesseract`
+  - `ocrmypdf`
+  - `pdftotext`
+  - `pypdf`
+- Wichtige Erkenntnis nach Prüfung:
+  - `preview_worker.py` verarbeitet Preview-Jobs, nicht die eigentliche Volltext-Indexierung
+  - die UI nutzt für Objektlisten/Suche teilweise noch serverseitige lokale Filterung, die neue `/api/search`-Schicht ist im UI offenbar noch nicht vollständig durchverdrahtet
+- Fazit:
+  - Backend-seitig ist Volltext schon deutlich weiter als gedacht
+  - aber Sucharchitektur und UI-Anbindung sind noch nicht vollständig konsolidiert
+- Sauberer Umbau für die App-Suche wurde begonnen:
+  - zyklische Kopplung entschärft, indem `archiva/search/query_builder.py` `metadata_from_json` nicht mehr aus `ui.py`, sondern aus `metadata_validation.py` bezieht
+  - dadurch kann die UI gefahrloser die Search-Service-Schicht verwenden
+  - `ui_app_home()` nutzt bei gesetztem Suchbegriff jetzt `SearchService(db).search(...)`
+  - die Treffer-IDs aus der Volltextsuche werden im App-UI auf die angezeigten Dokumente angewendet, statt nur die alte lokale UI-Filterung zu verwenden
 
 ## Admin-UI: Klickbares Definitionsmodell (2026-04-19 Nachmittag)
 

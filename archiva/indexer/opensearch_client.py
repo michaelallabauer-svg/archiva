@@ -106,6 +106,7 @@ class OpenSearchClient:
             if value:
                 filter_clauses.append({"term": {field_name: value}})
 
+        query_text = (q or "").strip()
         body = {
             "from": max(0, (page - 1) * page_size),
             "size": page_size,
@@ -113,6 +114,13 @@ class OpenSearchClient:
                 "bool": {
                     "must": must,
                     "filter": filter_clauses,
+                    "should": [
+                        {"match": {"fulltext": {"query": query_text, "operator": "and"}}},
+                        {"match_phrase": {"fulltext": {"query": query_text}}},
+                        {"match": {"title": {"query": query_text, "operator": "and", "boost": 4}}},
+                        {"simple_query_string": {"query": query_text, "fields": ["fulltext^3", "title^5", "filename^2", "metadata.*"], "default_operator": "and"}},
+                    ] if query_text else [],
+                    "minimum_should_match": 1 if query_text else 0,
                 }
             },
             "highlight": {

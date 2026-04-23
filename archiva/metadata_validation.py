@@ -243,12 +243,20 @@ def _has_duplicate_value(
             continue
         if field_name not in metadata:
             continue
-        if _canonicalize_unique_value(metadata[field_name]) == serialized:
+
+        existing_value = metadata[field_name]
+        if _is_empty(existing_value):
+            continue
+
+        if _canonicalize_unique_value(existing_value) == serialized:
             return True
     return False
 
 
 def _canonicalize_unique_value(value: Any) -> str:
     if isinstance(value, list):
-        return json.dumps(sorted(str(item) for item in value), ensure_ascii=False)
+        normalized_items = [str(item).strip() for item in value if not _is_empty(item)]
+        return json.dumps(sorted(normalized_items), ensure_ascii=False)
+    if isinstance(value, str):
+        return json.dumps(value.strip(), ensure_ascii=False)
     return json.dumps(value, ensure_ascii=False, sort_keys=True)

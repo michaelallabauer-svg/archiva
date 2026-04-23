@@ -14,17 +14,31 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from urllib.parse import quote_plus
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from archiva.database import get_db
 from archiva.config import load_settings
 from archiva.metadata_validation import metadata_from_json, validate_document_metadata, MetadataValidationError
-from archiva.models import Cabinet, CabinetType, DocType, Document, DocumentType, MetadataField, Register, RegisterType
+from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowStepDefinition, WorkflowTransitionDefinition
 from archiva.preview_queue import enqueue_preview_job, get_latest_preview_artifact, get_latest_preview_job
 from archiva.indexer.dispatcher import enqueue_document_index
 from archiva.indexer.status import indexing_runtime_status
+from archiva.search.service import SearchService
+from archiva.search_legacy import update_document_vector
 from archiva.storage import StorageManager
 
 router = APIRouter(tags=["ui"])
+
+
+def _admin_identity_redirect(*, identity_tab: str = "users", selected_user_id: str | None = None, selected_role_id: str | None = None, message: str | None = None) -> RedirectResponse:
+    parts = [f"identity_tab={quote_plus(identity_tab)}"]
+    if selected_user_id:
+        parts.append(f"selected_user_id={quote_plus(selected_user_id)}")
+    if selected_role_id:
+        parts.append(f"selected_role_id={quote_plus(selected_role_id)}")
+    if message:
+        parts.append(f"message={quote_plus(message)}")
+    return RedirectResponse(url=f"/ui/admin/identity?{'&'.join(parts)}#identity-admin", status_code=303)
 
 
 def _normalized_label(value: str | None) -> str:
@@ -185,6 +199,11 @@ def _build_move_resolution(document: Document, cabinets: list[Cabinet]) -> dict[
                 candidate_type_name = matching_doc_type_cabinets[0].cabinet_type.name
         else:
             resolution_path = "document_type_direct_cabinets_empty"
+
+    if not candidate_cabinets and not legacy_candidate_cabinets:
+        candidate_cabinets = _sorted_real_target_cabinets(cabinets)
+        if candidate_cabinets:
+            resolution_path = "all_real_cabinets_fallback"
 
     return {
         "current_cabinet": current_cabinet,
@@ -606,15 +625,21 @@ async def ui_root(request: Request) -> RedirectResponse:
 @router.get("/admin", response_class=HTMLResponse)
 async def ui_admin_home(
     request: Request,
+    message: str | None = None,
     selected_definition_kind: str | None = None,
     selected_definition_id: str | None = None,
     selected_metadata_field_id: str | None = None,
+    identity_tab: str | None = None,
+    selected_user_id: str | None = None,
+    selected_role_id: str | None = None,
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     cabinet_types = db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
     cabinets = db.query(Cabinet).order_by(Cabinet.order).all()
     document_types = db.query(DocumentType).order_by(DocumentType.name).all()
     recent_documents = db.query(Document).order_by(Document.created_at.desc()).limit(10).all()
+    preview_jobs = db.query(PreviewJob).order_by(PreviewJob.created_at.desc()).limit(12).all()
+    index_jobs = db.query(IndexJob).order_by(IndexJob.created_at.desc()).limit(12).all()
     selected_document_type = document_types[0] if document_types else None
     return HTMLResponse(
         content=_render_admin_page(
@@ -623,6 +648,8 @@ async def ui_admin_home(
             document_types=document_types,
             recent_documents=recent_documents,
             selected_document_type=selected_document_type,
+            preview_jobs=preview_jobs,
+            index_jobs=index_jobs,
             selected_definition_kind=selected_definition_kind,
             selected_definition_id=selected_definition_id,
             selected_metadata_field_id=selected_metadata_field_id,
@@ -634,15 +661,21 @@ async def ui_admin_home(
 async def ui_admin_document_type_detail(
     document_type_id: UUID,
     request: Request,
+    message: str | None = None,
     selected_definition_kind: str | None = None,
     selected_definition_id: str | None = None,
     selected_metadata_field_id: str | None = None,
+    identity_tab: str | None = None,
+    selected_user_id: str | None = None,
+    selected_role_id: str | None = None,
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     cabinet_types = db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
     cabinets = db.query(Cabinet).order_by(Cabinet.order).all()
     document_types = db.query(DocumentType).order_by(DocumentType.name).all()
     recent_documents = db.query(Document).order_by(Document.created_at.desc()).limit(10).all()
+    preview_jobs = db.query(PreviewJob).order_by(PreviewJob.created_at.desc()).limit(12).all()
+    index_jobs = db.query(IndexJob).order_by(IndexJob.created_at.desc()).limit(12).all()
     selected_document_type = db.query(DocumentType).where(DocumentType.id == document_type_id).first()
     return HTMLResponse(
         content=_render_admin_page(
@@ -651,11 +684,74 @@ async def ui_admin_document_type_detail(
             document_types=document_types,
             recent_documents=recent_documents,
             selected_document_type=selected_document_type,
+            preview_jobs=preview_jobs,
+            index_jobs=index_jobs,
             selected_definition_kind=selected_definition_kind or "document_type",
             selected_definition_id=selected_definition_id or str(document_type_id),
             selected_metadata_field_id=selected_metadata_field_id,
         )
     )
+
+
+@router.get("/admin/queues", response_class=HTMLResponse)
+async def ui_admin_queues(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    preview_jobs = db.query(PreviewJob).order_by(PreviewJob.created_at.desc()).limit(40).all()
+    index_jobs = db.query(IndexJob).order_by(IndexJob.created_at.desc()).limit(40).all()
+    return HTMLResponse(content=_render_admin_queues_page(preview_jobs=preview_jobs, index_jobs=index_jobs))
+
+
+@router.get("/admin/identity", response_class=HTMLResponse)
+async def ui_admin_identity(
+    request: Request,
+    identity_tab: str | None = None,
+    selected_user_id: str | None = None,
+    selected_role_id: str | None = None,
+    selected_team_id: str | None = None,
+    message: str | None = None,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    users = db.query(User).order_by(User.display_name, User.email).all()
+    roles = db.query(Role).order_by(Role.name).all()
+    teams = db.query(Team).order_by(Team.name).all()
+    return HTMLResponse(
+        content=_render_admin_identity_page(
+            users=users,
+            roles=roles,
+            teams=teams,
+            identity_tab=identity_tab or "users",
+            selected_user_id=selected_user_id,
+            selected_role_id=selected_role_id,
+            selected_team_id=selected_team_id,
+            message=message,
+        )
+    )
+
+
+@router.post("/admin/documents/{document_id}/reindex")
+async def ui_admin_reindex_document(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    document = db.query(Document).where(Document.id == document_id).first()
+    if not document:
+        return _ui_redirect_with_message("/ui/admin/queues?message=Dokument+nicht+gefunden")
+    enqueue_document_index(db, document=document, reason="manual_reindex_ui")
+    return _ui_redirect_with_message(f"/ui/admin/queues?message={quote_plus(f'Indexjob für {document.title or document.name} erneut eingereiht')}")
+
+
+@router.get("/admin/documents/{document_id}/extracted-text", response_class=HTMLResponse)
+async def ui_admin_document_extracted_text(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    document = db.query(Document).where(Document.id == document_id).first()
+    if not document:
+        return HTMLResponse(content="<h1>Dokument nicht gefunden</h1>", status_code=404)
+    preview = _escape(document.extracted_text_preview or "Kein extrahierter Text gespeichert.")
+    return HTMLResponse(content=f"""<!doctype html><html lang='de'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Extrahierter Text</title><style>:root {{ color-scheme: dark; }} body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background:#0b1020; color:#eef2ff; }} .page {{ max-width: 1100px; margin:0 auto; padding:16px; }} .panel {{ background:#121933; border:1px solid rgba(77,212,255,0.10); border-radius:18px; padding:16px; }} a {{ color:#4dd4ff; text-decoration:none; }} pre {{ white-space:pre-wrap; word-break:break-word; font: .95rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }}</style></head><body><div class='page'><div class='panel'><p><a href='/ui/admin/queues'>← Zurück zu Queues & Logs</a></p><h1 style='margin-top:0;'>Extrahierter Text, { _escape(document.title or document.name) }</h1><p style='color:#a8b2d1;'>Gespeicherte Vorschau des zuletzt extrahierten Volltexts.</p><pre>{preview}</pre></div></div></body></html>""")
 
 
 @router.get("/app", response_class=HTMLResponse)
@@ -673,6 +769,19 @@ async def ui_app_home(
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     all_documents = db.query(Document).order_by(Document.created_at.desc()).all()
+    search_payload: dict[str, Any] | None = None
+    if (q or "").strip():
+        search_payload = SearchService(db).search(
+            q=q or "",
+            document_type_id=selected_document_type_id,
+            cabinet_type_id=None,
+            cabinet_id=node_id if node_kind == "cabinet" else None,
+            page=1,
+            page_size=100,
+        )
+        hit_ids = [str(hit.get("document_id")) for hit in search_payload.get("hits", []) if hit.get("document_id")]
+        documents_by_id = {str(document.id): document for document in all_documents}
+        all_documents = [documents_by_id[hit_id] for hit_id in hit_ids if hit_id in documents_by_id]
     recent_documents = all_documents[:10]
     cabinets, cabinet_type_model_ready = _safe_load_cabinets(db)
     cabinet_types = db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
@@ -884,16 +993,65 @@ async def ui_preview_document(
     return Response(content=waiting_html, media_type="text/html; charset=utf-8")
 
 
+@router.get("/api/v1/duplicate-check")
+async def api_duplicate_check(
+    hash: str,
+    document_type_id: UUID | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Check if a document with the given MD5 hash already exists."""
+    settings = load_settings("config.yaml")
+    if not settings.app.md5_duplicate_check:
+        return {"enabled": False, "duplicate": False}
+
+    if document_type_id:
+        doc_type = db.query(DocumentType).where(DocumentType.id == document_type_id).first()
+        if doc_type and not doc_type.md5_duplicate_check:
+            return {"enabled": False, "duplicate": False}
+
+    existing = db.query(Document).where(Document.file_hash == hash).first()
+    if existing:
+        return {
+            "enabled": True,
+            "duplicate": True,
+            "existing_document": {
+                "id": str(existing.id),
+                "name": existing.name,
+                "title": existing.title,
+                "created_at": existing.created_at.isoformat() if existing.created_at else None,
+            },
+        }
+    return {"enabled": True, "duplicate": False}
+
+
 @router.post("/app/intake")
 async def ui_app_intake(
     request: Request,
     file: UploadFile = File(...),
     document_type_id: UUID = Form(...),
+    hash: str = Form(""),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
     document_type = db.query(DocumentType).where(DocumentType.id == document_type_id).first()
     if not document_type:
         return _ui_redirect_with_message("/ui/app?message=Dokumenttyp+nicht+gefunden")
+
+    # --- MD5 duplicate check ---
+    settings = load_settings("config.yaml")
+    global_check = settings.app.md5_duplicate_check
+    doc_type_check = document_type.md5_duplicate_check if document_type else True
+
+    if global_check and doc_type_check and hash:
+        existing = db.query(Document).where(Document.file_hash == hash).first()
+        if existing:
+            return _ui_redirect_with_message(
+                _app_message_url(
+                    document_type_id,
+                    message=f"Achtung: Ein Dokument mit identischem Inhalt existiert bereits: {existing.name} (hochgeladen am {existing.created_at.strftime('%d.%m.%Y') if existing.created_at else 'unbekannt'}). Duplikat wurde nicht erneut gespeichert.",
+                    error_field="file",
+                    error_message="Duplikat erkannt",
+                )
+            )
 
     form = await request.form()
     metadata = _collect_form_metadata(form, document_type)
@@ -964,22 +1122,406 @@ async def ui_app_intake(
         size_bytes=int(file_size),
         storage_path=str(relative_path),
         metadata_json=json.dumps(metadata, ensure_ascii=False),
+        file_hash=hash or None,
     )
     db.add(document)
     db.flush()
+
+    extracted_text = None
+
     enqueue_preview_job(db, document)
     db.commit()
     db.refresh(document)
     enqueue_document_index(db, document=document, reason="document_uploaded_ui")
 
+    success_message = "Dokument erfolgreich gespeichert, Preview-Rendering und Volltextindexierung eingereiht"
+    if not extracted_text:
+        success_message = "Dokument gespeichert, Preview-Rendering eingereiht. Kein extrahierbarer Text für Volltext gefunden"
+
     return _ui_redirect_with_message(
-        _app_message_url(document_type_id, message="Dokument erfolgreich gespeichert, Preview-Rendering eingereiht")
+        _app_message_url(document_type_id, message=success_message)
     )
 
 
 @router.get("/workflows", response_class=HTMLResponse)
 async def ui_workflows_home(request: Request) -> HTMLResponse:
-    return HTMLResponse(content=_render_workflows_page())
+    return RedirectResponse(url="/ui/workflow-designer", status_code=303)
+
+
+@router.get("/workflow-designer", response_class=HTMLResponse)
+async def ui_workflow_designer_home(
+    request: Request,
+    selected_workflow_id: str | None = None,
+    selected_step_id: str | None = None,
+    message: str | None = None,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    _sync_assignment_targets(db)
+    workflows = db.query(WorkflowDefinition).order_by(WorkflowDefinition.name).all()
+    assignment_targets = db.query(AssignmentTarget).order_by(AssignmentTarget.target_type, AssignmentTarget.label).all()
+    selected_workflow = None
+    selected_step = None
+    if selected_workflow_id:
+        selected_workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.id == UUID(selected_workflow_id)).first()
+    elif workflows:
+        selected_workflow = workflows[0]
+    if selected_step_id:
+        selected_step = db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.id == UUID(selected_step_id)).first()
+    elif selected_workflow and selected_workflow.steps:
+        selected_step = sorted(selected_workflow.steps, key=lambda item: (item.order, item.name.lower()))[0]
+    return HTMLResponse(content=_render_workflow_designer_page(workflows=workflows, assignment_targets=assignment_targets, selected_workflow=selected_workflow, selected_step=selected_step, message=message))
+
+
+@router.post("/workflow-designer/workflows")
+async def ui_workflow_designer_create_workflow(
+    name: str = Form(...),
+    description: str = Form(""),
+    is_active: str | None = Form(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    workflow = WorkflowDefinition(
+        name=name.strip(),
+        description=description.strip() or None,
+        is_active=bool(is_active),
+    )
+    db.add(workflow)
+    db.commit()
+    db.refresh(workflow)
+    return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={workflow.id}&message={quote_plus(f'Workflow {workflow.name} angelegt')}#designer", status_code=303)
+
+
+@router.post("/workflow-designer/steps")
+async def ui_workflow_designer_create_step(
+    workflow_definition_id: UUID = Form(...),
+    name: str = Form(...),
+    step_key: str = Form(...),
+    description: str = Form(""),
+    order: int = Form(0),
+    assignment_target_id: str = Form(""),
+    due_in_days: str = Form(""),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    _sync_assignment_targets(db)
+    workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.id == workflow_definition_id).first()
+    if not workflow:
+        return RedirectResponse(url="/ui/workflow-designer?message=Workflow+nicht+gefunden#designer", status_code=303)
+    resolved_assignment_target_id = UUID(assignment_target_id) if assignment_target_id else None
+    resolved_due_in_days = int(due_in_days) if str(due_in_days).strip() else None
+    step = WorkflowStepDefinition(
+        workflow_definition_id=workflow_definition_id,
+        name=name.strip(),
+        step_key=step_key.strip(),
+        description=description.strip() or None,
+        order=order,
+        assignment_target_id=resolved_assignment_target_id,
+        due_in_days=resolved_due_in_days,
+    )
+    db.add(step)
+    db.commit()
+    db.refresh(step)
+    return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={workflow.id}&selected_step_id={step.id}&message={quote_plus(f'Schritt {step.name} angelegt')}#designer", status_code=303)
+
+
+@router.post("/workflow-designer/steps/{step_id}")
+async def ui_workflow_designer_update_step(
+    step_id: UUID,
+    name: str = Form(...),
+    step_key: str = Form(...),
+    description: str = Form(""),
+    order: int = Form(0),
+    assignment_target_id: str = Form(""),
+    due_in_days: str = Form(""),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    _sync_assignment_targets(db)
+    step = db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.id == step_id).first()
+    if not step:
+        return RedirectResponse(url="/ui/workflow-designer?message=Schritt+nicht+gefunden#designer", status_code=303)
+    step.name = name.strip()
+    step.step_key = step_key.strip()
+    step.description = description.strip() or None
+    step.order = order
+    step.assignment_target_id = UUID(assignment_target_id) if assignment_target_id else None
+    step.due_in_days = int(due_in_days) if str(due_in_days).strip() else None
+    db.add(step)
+    db.commit()
+    return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={step.workflow_definition_id}&selected_step_id={step.id}&message={quote_plus(f'Schritt {step.name} aktualisiert')}#designer", status_code=303)
+
+
+@router.post("/workflow-designer/steps/{step_id}/move")
+async def ui_workflow_designer_move_step(
+    step_id: UUID,
+    direction: str = Form(...),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    step = db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.id == step_id).first()
+    if not step:
+        return RedirectResponse(url="/ui/workflow-designer?message=Schritt+nicht+gefunden#designer", status_code=303)
+    sibling_steps = sorted(
+        db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.workflow_definition_id == step.workflow_definition_id).all(),
+        key=lambda item: (item.order, item.name.lower()),
+    )
+    current_index = next((index for index, item in enumerate(sibling_steps) if item.id == step.id), None)
+    if current_index is None:
+        return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={step.workflow_definition_id}&message=Schritt+nicht+einsortierbar#designer", status_code=303)
+    target_index = current_index - 1 if direction == "up" else current_index + 1
+    if target_index < 0 or target_index >= len(sibling_steps):
+        return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={step.workflow_definition_id}&selected_step_id={step.id}&message=Schritt+kann+nicht+weiter+verschoben+werden#designer", status_code=303)
+    sibling_steps[current_index], sibling_steps[target_index] = sibling_steps[target_index], sibling_steps[current_index]
+    for index, sibling in enumerate(sibling_steps, start=1):
+        sibling.order = index * 10
+        db.add(sibling)
+    db.commit()
+    return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={step.workflow_definition_id}&selected_step_id={step.id}&message={quote_plus('Reihenfolge aktualisiert')}#designer", status_code=303)
+
+
+@router.post("/workflow-designer/steps/{step_id}/delete")
+async def ui_workflow_designer_delete_step(
+    step_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    step = db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.id == step_id).first()
+    if not step:
+        return _workflow_designer_redirect(message="Schritt nicht gefunden")
+
+    workflow_id = step.workflow_definition_id
+    step_name = step.name
+    incoming_count = db.query(WorkflowTransitionDefinition).where(WorkflowTransitionDefinition.to_step_id == step.id).count()
+    outgoing_count = db.query(WorkflowTransitionDefinition).where(WorkflowTransitionDefinition.from_step_id == step.id).count()
+    if incoming_count or outgoing_count:
+        parts: list[str] = []
+        if incoming_count:
+            parts.append(f"{incoming_count} eingehende")
+        if outgoing_count:
+            parts.append(f"{outgoing_count} ausgehende")
+        return _workflow_designer_redirect(
+            workflow_id=workflow_id,
+            step_id=step.id,
+            message=f"Schritt {step_name} kann nicht gelöscht werden, solange {', '.join(parts)} Transitionen existieren",
+        )
+
+    remaining_steps = sorted(
+        db.query(WorkflowStepDefinition).where(
+            WorkflowStepDefinition.workflow_definition_id == workflow_id,
+            WorkflowStepDefinition.id != step.id,
+        ).all(),
+        key=lambda item: (item.order, item.name.lower()),
+    )
+    next_selected_step_id = str(remaining_steps[0].id) if remaining_steps else None
+
+    db.delete(step)
+    db.commit()
+
+    for index, sibling in enumerate(remaining_steps, start=1):
+        sibling.order = index * 10
+        db.add(sibling)
+    db.commit()
+
+    return _workflow_designer_redirect(
+        workflow_id=workflow_id,
+        step_id=next_selected_step_id,
+        message=f"Schritt {step_name} gelöscht",
+    )
+
+
+@router.post("/workflow-designer/workflows/{workflow_id}/reorder")
+async def ui_workflow_designer_reorder_steps(
+    workflow_id: UUID,
+    step_ids: str = Form(...),
+    selected_step_id: str = Form(""),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.id == workflow_id).first()
+    if not workflow:
+        return RedirectResponse(url="/ui/workflow-designer?message=Workflow+nicht+gefunden#designer", status_code=303)
+
+    ordered_ids: list[UUID] = []
+    for raw_id in [item.strip() for item in step_ids.split(",") if item.strip()]:
+        try:
+            ordered_ids.append(UUID(raw_id))
+        except ValueError:
+            continue
+
+    steps = db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.workflow_definition_id == workflow_id).all()
+    steps_by_id = {step.id: step for step in steps}
+    final_steps = [steps_by_id[step_id] for step_id in ordered_ids if step_id in steps_by_id]
+    missing_steps = [step for step in steps if step.id not in {item.id for item in final_steps}]
+    final_steps.extend(sorted(missing_steps, key=lambda item: (item.order, item.name.lower())))
+
+    for index, step in enumerate(final_steps, start=1):
+        step.order = index * 10
+        db.add(step)
+    db.commit()
+
+    selected_step_query = f"&selected_step_id={selected_step_id}" if selected_step_id else ""
+    return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={workflow_id}{selected_step_query}&message={quote_plus('Grafische Reihenfolge aktualisiert')}#designer", status_code=303)
+
+
+def _workflow_designer_redirect(*, workflow_id: UUID | str | None = None, step_id: UUID | str | None = None, message: str | None = None) -> RedirectResponse:
+    params: list[str] = []
+    if workflow_id:
+        params.append(f"selected_workflow_id={quote_plus(str(workflow_id))}")
+    if step_id:
+        params.append(f"selected_step_id={quote_plus(str(step_id))}")
+    if message:
+        params.append(f"message={quote_plus(message)}")
+    query = f"?{'&'.join(params)}" if params else ""
+    return RedirectResponse(url=f"/ui/workflow-designer{query}#designer", status_code=303)
+
+
+def _validate_workflow_transition_payload(
+    *,
+    db: Session,
+    workflow_definition_id: UUID,
+    from_step_id: UUID,
+    to_step_id: UUID,
+    label: str,
+    is_default: bool,
+    transition_id: UUID | None = None,
+) -> tuple[WorkflowDefinition | None, WorkflowStepDefinition | None, str | None]:
+    workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.id == workflow_definition_id).first()
+    if not workflow:
+        return None, None, "Workflow nicht gefunden"
+
+    from_step = db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.id == from_step_id).first()
+    if not from_step or from_step.workflow_definition_id != workflow_definition_id:
+        return workflow, None, "Ausgangsschritt nicht gefunden"
+
+    to_step = db.query(WorkflowStepDefinition).where(WorkflowStepDefinition.id == to_step_id).first()
+    if not to_step or to_step.workflow_definition_id != workflow_definition_id:
+        return workflow, from_step, "Zielschritt nicht gefunden oder gehört zu einem anderen Workflow"
+
+    normalized_label = label.strip()
+    if not normalized_label:
+        return workflow, from_step, "Transitions-Label fehlt"
+
+    if from_step_id == to_step_id:
+        return workflow, from_step, "Transition auf denselben Schritt ist nicht erlaubt"
+
+    existing_query = db.query(WorkflowTransitionDefinition).where(
+        WorkflowTransitionDefinition.workflow_definition_id == workflow_definition_id,
+        WorkflowTransitionDefinition.from_step_id == from_step_id,
+        WorkflowTransitionDefinition.to_step_id == to_step_id,
+        WorkflowTransitionDefinition.label.ilike(normalized_label),
+    )
+    if transition_id:
+        existing_query = existing_query.where(WorkflowTransitionDefinition.id != transition_id)
+    if existing_query.first():
+        return workflow, from_step, "Diese Transition existiert bereits"
+
+    if is_default:
+        default_query = db.query(WorkflowTransitionDefinition).where(
+            WorkflowTransitionDefinition.workflow_definition_id == workflow_definition_id,
+            WorkflowTransitionDefinition.from_step_id == from_step_id,
+            WorkflowTransitionDefinition.is_default.is_(True),
+        )
+        if transition_id:
+            default_query = default_query.where(WorkflowTransitionDefinition.id != transition_id)
+        if default_query.first():
+            return workflow, from_step, "Es ist nur ein Standardübergang pro Schritt erlaubt"
+
+    return workflow, from_step, None
+
+
+@router.post("/workflow-designer/transitions")
+async def ui_workflow_designer_create_transition(
+    workflow_definition_id: UUID = Form(...),
+    from_step_id: UUID = Form(...),
+    to_step_id: UUID = Form(...),
+    label: str = Form("Weiter"),
+    is_default: str | None = Form(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    workflow, from_step, error_message = _validate_workflow_transition_payload(
+        db=db,
+        workflow_definition_id=workflow_definition_id,
+        from_step_id=from_step_id,
+        to_step_id=to_step_id,
+        label=label,
+        is_default=bool(is_default),
+    )
+    if error_message:
+        return _workflow_designer_redirect(
+            workflow_id=workflow_definition_id if workflow else None,
+            step_id=from_step_id if from_step else None,
+            message=error_message,
+        )
+
+    transition = WorkflowTransitionDefinition(
+        workflow_definition_id=workflow_definition_id,
+        from_step_id=from_step_id,
+        to_step_id=to_step_id,
+        label=label.strip(),
+        is_default=bool(is_default),
+    )
+    db.add(transition)
+    db.commit()
+    return _workflow_designer_redirect(
+        workflow_id=workflow_definition_id,
+        step_id=from_step_id,
+        message="Transition angelegt",
+    )
+
+
+@router.post("/workflow-designer/transitions/{transition_id}")
+async def ui_workflow_designer_update_transition(
+    transition_id: UUID,
+    to_step_id: UUID = Form(...),
+    label: str = Form("Weiter"),
+    is_default: str | None = Form(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    transition = db.query(WorkflowTransitionDefinition).where(WorkflowTransitionDefinition.id == transition_id).first()
+    if not transition:
+        return _workflow_designer_redirect(message="Transition nicht gefunden")
+
+    workflow, from_step, error_message = _validate_workflow_transition_payload(
+        db=db,
+        workflow_definition_id=transition.workflow_definition_id,
+        from_step_id=transition.from_step_id,
+        to_step_id=to_step_id,
+        label=label,
+        is_default=bool(is_default),
+        transition_id=transition.id,
+    )
+    if error_message:
+        return _workflow_designer_redirect(
+            workflow_id=transition.workflow_definition_id if workflow else None,
+            step_id=transition.from_step_id if from_step else None,
+            message=error_message,
+        )
+
+    transition.to_step_id = to_step_id
+    transition.label = label.strip()
+    transition.is_default = bool(is_default)
+    db.add(transition)
+    db.commit()
+    return _workflow_designer_redirect(
+        workflow_id=transition.workflow_definition_id,
+        step_id=transition.from_step_id,
+        message="Transition aktualisiert",
+    )
+
+
+@router.post("/workflow-designer/transitions/{transition_id}/delete")
+async def ui_workflow_designer_delete_transition(
+    transition_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    transition = db.query(WorkflowTransitionDefinition).where(WorkflowTransitionDefinition.id == transition_id).first()
+    if not transition:
+        return _workflow_designer_redirect(message="Transition nicht gefunden")
+
+    workflow_id = transition.workflow_definition_id
+    from_step_id = transition.from_step_id
+    label = transition.label
+    db.delete(transition)
+    db.commit()
+    return _workflow_designer_redirect(
+        workflow_id=workflow_id,
+        step_id=from_step_id,
+        message=f"Transition {label} gelöscht",
+    )
 
 
 @router.post("/admin/cabinet-types")
@@ -1081,6 +1623,241 @@ async def ui_create_register(
             status_code=303,
         )
     return RedirectResponse(url="/ui/admin", status_code=303)
+
+
+@router.post("/admin/roles")
+async def ui_create_role(
+    name: str = Form(...),
+    description: str = Form(""),
+    permissions_json: str = Form("[]"),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    normalized_name = name.strip()
+    if not normalized_name:
+        return _admin_identity_redirect(identity_tab="roles", message="Rollenname fehlt")
+    existing_role = db.query(Role).where(Role.name.ilike(normalized_name)).first()
+    if existing_role:
+        return _admin_identity_redirect(identity_tab="roles", selected_role_id=str(existing_role.id), message=f"Rolle {existing_role.name} existiert bereits")
+    role = Role(
+        name=normalized_name,
+        description=description.strip() or None,
+        permissions_json=permissions_json.strip() or "[]",
+        is_system=False,
+    )
+    try:
+        db.add(role)
+        db.commit()
+        db.refresh(role)
+    except IntegrityError:
+        db.rollback()
+        return _admin_identity_redirect(identity_tab="roles", message="Rolle konnte nicht gespeichert werden, wahrscheinlich wegen doppeltem Namen")
+    return _admin_identity_redirect(identity_tab="roles", selected_role_id=str(role.id), message=f"Rolle {role.name} gespeichert")
+
+
+@router.post("/admin/users")
+async def ui_create_user(
+    email: str = Form(...),
+    display_name: str = Form(...),
+    status: str = Form("active"),
+    role_ids: list[str] | None = Form(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    normalized_email = email.strip().lower()
+    if not normalized_email or not display_name.strip():
+        return _admin_identity_redirect(identity_tab="users", message="Anzeigename und E-Mail sind erforderlich")
+    existing_user = db.query(User).where(User.email == normalized_email).first()
+    if existing_user:
+        return _admin_identity_redirect(identity_tab="users", selected_user_id=str(existing_user.id), message=f"Benutzer mit {existing_user.email} existiert bereits")
+    user = User(
+        email=normalized_email,
+        display_name=display_name.strip(),
+        status=status.strip() or "active",
+        auth_source="local",
+    )
+    try:
+        db.add(user)
+        db.flush()
+
+        selected_role_ids = role_ids or []
+        for role_id in selected_role_ids:
+            try:
+                role_uuid = UUID(role_id)
+            except ValueError:
+                continue
+            role = db.query(Role).where(Role.id == role_uuid).first()
+            if role:
+                db.add(UserRoleAssignment(user_id=user.id, role_id=role.id))
+
+        db.commit()
+        db.refresh(user)
+    except IntegrityError:
+        db.rollback()
+        return _admin_identity_redirect(identity_tab="users", message="Benutzer konnte nicht gespeichert werden, wahrscheinlich wegen doppelter E-Mail")
+    return _admin_identity_redirect(identity_tab="users", selected_user_id=str(user.id), message=f"Benutzer {user.display_name} gespeichert")
+
+
+@router.post("/admin/users/{user_id}")
+async def ui_update_user(
+    user_id: UUID,
+    email: str = Form(...),
+    display_name: str = Form(...),
+    status: str = Form("active"),
+    role_ids: list[str] | None = Form(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    user = db.query(User).where(User.id == user_id).first()
+    if not user:
+        return _admin_identity_redirect(identity_tab="users", message="Benutzer nicht gefunden")
+
+    normalized_email = email.strip().lower()
+    if not normalized_email or not display_name.strip():
+        return _admin_identity_redirect(identity_tab="users", selected_user_id=str(user.id), message="Anzeigename und E-Mail sind erforderlich")
+
+    duplicate_user = db.query(User).where(User.email == normalized_email, User.id != user.id).first()
+    if duplicate_user:
+        return _admin_identity_redirect(identity_tab="users", selected_user_id=str(user.id), message=f"Die E-Mail {normalized_email} ist bereits vergeben")
+
+    user.email = normalized_email
+    user.display_name = display_name.strip()
+    user.status = status.strip() or "active"
+    try:
+        db.add(user)
+
+        db.query(UserRoleAssignment).where(UserRoleAssignment.user_id == user.id).delete()
+        selected_role_ids = role_ids or []
+        for role_id in selected_role_ids:
+            try:
+                role_uuid = UUID(role_id)
+            except ValueError:
+                continue
+            role = db.query(Role).where(Role.id == role_uuid).first()
+            if role:
+                db.add(UserRoleAssignment(user_id=user.id, role_id=role.id))
+
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return _admin_identity_redirect(identity_tab="users", selected_user_id=str(user.id), message="Benutzer konnte nicht aktualisiert werden")
+    return _admin_identity_redirect(identity_tab="users", selected_user_id=str(user.id), message=f"Benutzer {user.display_name} aktualisiert")
+
+
+@router.post("/admin/users/{user_id}/toggle-status")
+async def ui_toggle_user_status(
+    user_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    user = db.query(User).where(User.id == user_id).first()
+    if not user:
+        return _admin_identity_redirect(identity_tab="users", message="Benutzer nicht gefunden")
+    user.status = "disabled" if user.status == "active" else "active"
+    db.add(user)
+    db.commit()
+    return _admin_identity_redirect(identity_tab="users", selected_user_id=str(user.id), message=f"Status von {user.display_name} ist jetzt {user.status}")
+
+
+@router.post("/admin/roles/{role_id}")
+async def ui_update_role(
+    role_id: UUID,
+    name: str = Form(...),
+    description: str = Form(""),
+    permissions_json: str = Form("[]"),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    role = db.query(Role).where(Role.id == role_id).first()
+    if not role:
+        return _admin_identity_redirect(identity_tab="roles", message="Rolle nicht gefunden")
+
+    normalized_name = name.strip()
+    if not normalized_name:
+        return _admin_identity_redirect(identity_tab="roles", selected_role_id=str(role.id), message="Rollenname fehlt")
+
+    duplicate_role = db.query(Role).where(Role.name.ilike(normalized_name), Role.id != role.id).first()
+    if duplicate_role:
+        return _admin_identity_redirect(identity_tab="roles", selected_role_id=str(role.id), message=f"Die Rolle {normalized_name} existiert bereits")
+
+    role.name = normalized_name
+    role.description = description.strip() or None
+    role.permissions_json = permissions_json.strip() or "[]"
+    try:
+        db.add(role)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return _admin_identity_redirect(identity_tab="roles", selected_role_id=str(role.id), message="Rolle konnte nicht aktualisiert werden")
+    return _admin_identity_redirect(identity_tab="roles", selected_role_id=str(role.id), message=f"Rolle {role.name} aktualisiert")
+
+
+@router.post("/admin/teams")
+async def ui_create_team(
+    name: str = Form(...),
+    description: str = Form(""),
+    member_user_ids: list[str] | None = Form(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    normalized_name = name.strip()
+    if not normalized_name:
+        return _admin_identity_redirect(identity_tab="teams", message="Teamname fehlt")
+    existing_team = db.query(Team).where(Team.name.ilike(normalized_name)).first()
+    if existing_team:
+        return _admin_identity_redirect(identity_tab="teams", selected_role_id=str(existing_team.id), message=f"Team {existing_team.name} existiert bereits")
+
+    team = Team(name=normalized_name, description=description.strip() or None)
+    try:
+        db.add(team)
+        db.flush()
+        for user_id in member_user_ids or []:
+            try:
+                user_uuid = UUID(user_id)
+            except ValueError:
+                continue
+            user = db.query(User).where(User.id == user_uuid).first()
+            if user:
+                db.add(TeamMembership(team_id=team.id, user_id=user.id))
+        db.commit()
+        db.refresh(team)
+    except IntegrityError:
+        db.rollback()
+        return _admin_identity_redirect(identity_tab="teams", message="Team konnte nicht gespeichert werden")
+    return RedirectResponse(url=f"/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}#identity-admin", status_code=303)
+
+
+@router.post("/admin/teams/{team_id}")
+async def ui_update_team(
+    team_id: UUID,
+    name: str = Form(...),
+    description: str = Form(""),
+    member_user_ids: list[str] | None = Form(None),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    team = db.query(Team).where(Team.id == team_id).first()
+    if not team:
+        return RedirectResponse(url="/ui/admin/identity?identity_tab=teams#identity-admin", status_code=303)
+
+    normalized_name = name.strip()
+    if not normalized_name:
+        return RedirectResponse(url=f"/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}&message={quote_plus('Teamname fehlt')}#identity-admin", status_code=303)
+    duplicate_team = db.query(Team).where(Team.name.ilike(normalized_name), Team.id != team.id).first()
+    if duplicate_team:
+        return RedirectResponse(url=f"/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}&message={quote_plus(f'Team {normalized_name} existiert bereits')}#identity-admin", status_code=303)
+
+    team.name = normalized_name
+    team.description = description.strip() or None
+    try:
+        db.add(team)
+        db.query(TeamMembership).where(TeamMembership.team_id == team.id).delete()
+        for user_id in member_user_ids or []:
+            try:
+                user_uuid = UUID(user_id)
+            except ValueError:
+                continue
+            user = db.query(User).where(User.id == user_uuid).first()
+            if user:
+                db.add(TeamMembership(team_id=team.id, user_id=user.id))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return RedirectResponse(url=f"/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}&message={quote_plus('Team konnte nicht aktualisiert werden')}#identity-admin", status_code=303)
+    return RedirectResponse(url=f"/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}&message={quote_plus(f'Team {team.name} aktualisiert')}#identity-admin", status_code=303)
 
 
 @router.post("/admin/register-types")
@@ -1357,6 +2134,203 @@ async def ui_update_metadata_field(
     return _ui_redirect_with_message(redirect_url)
 
 
+def _render_queue_panel(title: str, subtitle: str, jobs: list[Any], kind: str) -> str:
+    if not jobs:
+        return f"<div class='panel'><h2>{_escape(title)}</h2><p class='muted'>{_escape(subtitle)}</p><div class='def-empty'>Keine Einträge vorhanden.</div></div>"
+
+    rows: list[str] = []
+    for job in jobs:
+        document = getattr(job, 'document', None)
+        document_name = getattr(document, 'title', None) or getattr(document, 'name', None) or 'Unbekanntes Dokument'
+        status = str(getattr(job, 'status', 'unbekannt'))
+        error_message = getattr(job, 'error_message', None)
+        meta_parts = [
+            f"Status: {_escape(status)}",
+            f"Erstellt: {_escape(str(getattr(job, 'created_at', '')))}",
+        ]
+        started_at = getattr(job, 'started_at', None)
+        finished_at = getattr(job, 'finished_at', None)
+        if started_at:
+            meta_parts.append(f"Start: {_escape(str(started_at))}")
+        if finished_at:
+            meta_parts.append(f"Ende: {_escape(str(finished_at))}")
+        diagnostics_html = ""
+        if kind == 'index':
+            attempts = getattr(job, 'attempts', None)
+            if attempts is not None:
+                meta_parts.append(f"Versuche: {_escape(str(attempts))}")
+            if document:
+                diag_parts = [
+                    f"Indexstatus: {_escape(str(getattr(document, 'index_status', '')))}",
+                    f"Engine: {_escape(str(getattr(document, 'index_engine', '') or 'unbekannt'))}",
+                    f"Text: {_escape(str(getattr(document, 'extracted_text_length', 0) or 0))} Zeichen",
+                    f"Indexed at: {_escape(str(getattr(document, 'indexed_at', '') or ''))}",
+                ]
+                diagnostics_html = f"<div class='queue-diagnostics'>{' · '.join(part for part in diag_parts if part and not part.endswith(': '))}</div>"
+                if getattr(document, 'index_error', None):
+                    diagnostics_html += f"<div class='queue-error'>{_escape(str(document.index_error))}</div>"
+        rows.append(
+            "<div class='queue-item'>"
+            f"<div class='queue-head'><div><strong>{_escape(document_name)}</strong><div class='queue-meta'>{' · '.join(meta_parts)}</div></div><span class='queue-status queue-status-{_escape(status.lower())}'>{_escape(status)}</span></div>"
+            + diagnostics_html
+            + (f"<div class='queue-error'>{_escape(error_message)}</div>" if error_message else "")
+            + (f"<div class='queue-actions'><a class='pill' href='/ui/app/documents/{document.id}'>Dokument öffnen</a><a class='pill' href='/ui/admin/documents/{document.id}/extracted-text' target='_blank' rel='noopener noreferrer'>Extrahierten Text anzeigen</a><form method='post' action='/ui/admin/documents/{document.id}/reindex' style='display:inline;'><button class='pill' type='submit'>Indexjob wiederholen</button></form></div>" if document and kind == 'index' else (f"<div class='queue-actions'><a class='pill' href='/ui/app/documents/{document.id}'>Dokument öffnen</a></div>" if document else ""))
+            + "</div>"
+        )
+
+    return f"<div class='panel'><h2>{_escape(title)}</h2><p class='muted'>{_escape(subtitle)}</p><div class='queue-list'>{''.join(rows)}</div></div>"
+
+
+
+def _render_admin_queues_page(*, preview_jobs: list[PreviewJob], index_jobs: list[IndexJob]) -> str:
+    preview_queue_html = _render_queue_panel('Preview Queue', 'Livebild der letzten Preview-Renderjobs inklusive Fehlern.', preview_jobs, 'preview')
+    index_queue_html = _render_queue_panel('Index Queue', 'Livebild der letzten Indexjobs inklusive Fehlern und Wiederholungen.', index_jobs, 'index')
+    return f"""
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archiva Admin Queues</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+  <style>
+    :root {{ color-scheme: dark; --bg: #0b1020; --panel: #121933; --panel-deep:#0f1630; --text: #eef2ff; --muted: #a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; --shadow:0 18px 48px rgba(0,0,0,0.28); }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), var(--bg); color:var(--text); }}
+    a {{ color:var(--accent-2); text-decoration:none; }}
+    .page {{ padding:14px 16px; max-width:1400px; margin:0 auto; }}
+    .panel {{ background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border:1px solid rgba(77,212,255,0.10); border-radius:18px; padding:16px; box-shadow:var(--shadow); }}
+    .hero {{ margin-bottom:16px; }}
+    .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color: var(--accent-2); font-weight:700; }}
+    .hero h1 {{ margin:4px 0 6px; font-size:1.7rem; }}
+    .hero p {{ margin:0; color:var(--muted); max-width:64ch; line-height:1.45; }}
+    .pillbar {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
+    .pill {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(77,212,255,0.12); border-radius: 999px; padding: 7px 11px; color: var(--text); font-size:.92rem; }}
+    .stack {{ display:grid; gap:16px; }}
+    .muted {{ color:var(--muted); }}
+    .def-empty {{ color:var(--muted); font-style:italic; font-size:.9rem; padding:10px 0; }}
+    .queue-list {{ display:grid; gap:10px; }}
+    .queue-item {{ padding:14px; border-radius:16px; border:1px solid rgba(77,212,255,0.10); background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.02)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }}
+    .queue-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }}
+    .queue-head strong {{ font-size:1rem; line-height:1.35; }}
+    .queue-meta {{ margin-top:8px; color:var(--muted); font-size:.85rem; line-height:1.5; }}
+    .queue-status {{ display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:5px 10px; font-size:.78rem; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.04); text-transform:uppercase; letter-spacing:.08em; }}
+    .queue-status-pending {{ color:#fcd34d; border-color:rgba(252,211,77,0.24); background:rgba(252,211,77,0.10); }}
+    .queue-status-processing {{ color:#7dd3fc; border-color:rgba(125,211,252,0.24); background:rgba(125,211,252,0.10); }}
+    .queue-status-completed {{ color:#86efac; border-color:rgba(134,239,172,0.24); background:rgba(134,239,172,0.10); }}
+    .queue-status-failed {{ color:#fca5a5; border-color:rgba(252,165,165,0.24); background:rgba(252,165,165,0.10); }}
+    .queue-error {{ margin-top:12px; padding:10px 12px; border-radius:12px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.24); color:#ffd0d0; font-size:.88rem; }}
+    .queue-diagnostics {{ margin-top:12px; color:var(--muted); font-size:.84rem; line-height:1.5; padding-top:10px; border-top:1px solid rgba(255,255,255,0.06); }}
+    .queue-actions {{ margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="panel hero">
+      <div class="eyebrow">Admin Monitoring</div>
+      <h1>Queues & Logs</h1>
+      <p>Die letzten Preview- und Indexjobs, kompakt und ruhig dargestellt, mit Reindex und Textprüfung direkt am jeweiligen Eintrag.</p>
+      <div class="pillbar">
+        <a class="pill" href="/ui/admin">Zurück zum Admin</a>
+        <a class="pill" href="/ui/app">Zur ECM-App</a>
+      </div>
+    </section>
+    <section class="stack">
+      {preview_queue_html}
+      {index_queue_html}
+    </section>
+  </div>
+</body>
+</html>
+"""
+
+
+def _render_admin_identity_page(
+    *,
+    users: list[User],
+    roles: list[Role],
+    teams: list[Team],
+    identity_tab: str,
+    selected_user_id: str | None,
+    selected_role_id: str | None,
+    selected_team_id: str | None,
+    message: str | None,
+) -> str:
+    identity_html = _render_identity_panel(
+        users,
+        roles,
+        teams,
+        identity_tab=identity_tab,
+        selected_user_id=selected_user_id,
+        selected_role_id=selected_role_id,
+        selected_team_id=selected_team_id,
+        message=message,
+    )
+    return f"""
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archiva Admin Identity</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+  <style>
+    :root {{ color-scheme: dark; --bg: #0b1020; --panel: #121933; --panel-deep:#0f1630; --text: #eef2ff; --muted: #a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; --shadow:0 18px 48px rgba(0,0,0,0.28); }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), var(--bg); color:var(--text); }}
+    a {{ color:var(--accent-2); text-decoration:none; }}
+    .page {{ padding:14px 16px; max-width:1400px; margin:0 auto; }}
+    .panel {{ background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border:1px solid rgba(77,212,255,0.10); border-radius:18px; padding:16px; box-shadow:var(--shadow); }}
+    .hero {{ margin-bottom:16px; }}
+    .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color: var(--accent-2); font-weight:700; }}
+    .hero h1 {{ margin:4px 0 6px; font-size:1.7rem; }}
+    .hero p {{ margin:0; color:var(--muted); max-width:64ch; line-height:1.45; }}
+    .pillbar {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
+    .pill {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(77,212,255,0.12); border-radius: 999px; padding: 7px 11px; color: var(--text); font-size:.92rem; }}
+    .stack {{ display:grid; gap:16px; }}
+    .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
+    .field {{ display:grid; gap:6px; }}
+    .field.full {{ grid-column: 1 / -1; }}
+    .checkbox-group {{ display:grid; gap:10px; padding:14px; border:1px solid rgba(77,212,255,0.08); border-radius:16px; background:var(--panel-deep); }}
+    .checkbox-item {{ display:flex; gap:10px; align-items:center; font-weight:400; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,0.02); }}
+    label {{ font-weight:600; font-size:0.95rem; }}
+    input, textarea, select {{ width:100%; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:var(--panel-deep); color:var(--text); padding:12px; font:inherit; }}
+    textarea {{ min-height:92px; resize:vertical; }}
+    .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; align-items:flex-start; }}
+    button {{ border:none; border-radius:999px; padding:10px 14px; font:inherit; cursor:pointer; max-width:100%; }}
+    .primary {{ background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: white; box-shadow: 0 8px 24px rgba(77,212,255,0.22); }}
+    .badge {{ display:inline-block; margin-right:8px; margin-bottom:6px; padding:4px 8px; border-radius:999px; background:rgba(77,212,255,0.16); color:var(--accent-2); font-size:0.85rem; }}
+    .def-detail-card {{ background:linear-gradient(135deg, rgba(176,126,255,0.07), rgba(77,212,255,0.04)); border:1px solid rgba(176,126,255,0.20); border-radius:16px; padding:14px; }}
+    .def-detail-card h3 {{ margin:0 0 10px; font-size:1rem; color:#b07ae6; }}
+    .def-detail-row {{ display:grid; grid-template-columns:140px 1fr; gap:10px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,.06); font-size:.92rem; }}
+    .def-detail-row:last-child {{ border-bottom:none; }}
+    .def-detail-key {{ color:var(--muted); font-weight:600; }}
+    .def-empty {{ color:var(--muted); font-style:italic; font-size:.9rem; padding:10px 0; }}
+    .muted {{ color:var(--muted); }}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="panel hero">
+      <div class="eyebrow">Admin Identity</div>
+      <h1>Identity & Rollen</h1>
+      <p>Native Benutzer- und Rollenverwaltung für Archiva, bewusst getrennt vom Haupt-Admin und vorbereitet für spätere Entra-ID-Anbindung.</p>
+      <div class="pillbar">
+        <a class="pill" href="/ui/admin">Zurück zum Admin</a>
+        <a class="pill" href="/ui/admin/queues">Queues & Logs</a>
+        <a class="pill" href="/ui/app">Zur ECM-App</a>
+      </div>
+    </section>
+    <section class="stack" id="identity-admin">
+      {identity_html}
+    </section>
+  </div>
+</body>
+</html>
+"""
+
+
+
 def _render_admin_page(
     *,
     cabinet_types: list[CabinetType],
@@ -1364,6 +2338,8 @@ def _render_admin_page(
     document_types: list[DocumentType],
     recent_documents: list[Document],
     selected_document_type: DocumentType | None,
+    preview_jobs: list[PreviewJob],
+    index_jobs: list[IndexJob],
     selected_definition_kind: str | None = None,
     selected_definition_id: str | None = None,
     selected_metadata_field_id: str | None = None,
@@ -1398,6 +2374,8 @@ def _render_admin_page(
         selected_definition_id=selected_definition_id,
         selected_metadata_field_id=selected_metadata_field_id,
     )
+    indexing_status = indexing_runtime_status()
+    indexing_status_html = f"<div class='status-chip'><span>OCR / Index</span><span class='service-badge'><span class='status-dot'></span> {'bereit' if any(item.get('available') for item in indexing_status.get('ocr', {}).values() if isinstance(item, dict)) else 'Basisbetrieb'}</span></div>"
     tooltip_hint = '<span class="tooltip" tabindex="0">?<span class="tooltip-bubble">Mehr Kontext bei Hover oder Fokus.</span></span>'
 
     return f"""
@@ -1495,7 +2473,20 @@ def _render_admin_page(
     .tooltip {{ position:relative; display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; margin-left:8px; border-radius:999px; border:1px solid rgba(77,212,255,0.24); color:var(--accent-2); font-size:.78rem; font-weight:700; cursor:help; vertical-align:middle; }}
     .tooltip-bubble {{ position:absolute; left:50%; bottom:calc(100% + 10px); transform:translateX(-50%); min-width:220px; max-width:320px; padding:10px 12px; border-radius:12px; background:#0f1630; border:1px solid rgba(77,212,255,0.24); box-shadow:0 18px 48px rgba(0,0,0,0.35); color:var(--text); font-size:.84rem; line-height:1.45; opacity:0; pointer-events:none; transition:opacity .14s ease, transform .14s ease; z-index:30; }}
     .tooltip:hover .tooltip-bubble, .tooltip:focus .tooltip-bubble, .tooltip:focus-within .tooltip-bubble {{ opacity:1; transform:translateX(-50%) translateY(-2px); }}
-    .status-chip {{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:rgba(110,231,183,0.10); border:1px solid rgba(110,231,183,0.18); color:#d6fff0; }}
+    .status-stack {{ display:grid; gap:8px; position:relative; z-index:1; }}
+    .status-chip {{ display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:12px; background: rgba(255,255,255,0.03); border:1px solid rgba(77,212,255,0.10); font-size:.9rem; }}
+    .status-dot {{ width:10px; height:10px; border-radius:999px; background: #6ee7b7; box-shadow: 0 0 12px rgba(110,231,183,0.5); display:inline-block; }}
+    .queue-list {{ display:grid; gap:10px; }}
+    .queue-item {{ padding:12px; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); }}
+    .queue-head {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }}
+    .queue-meta {{ margin-top:6px; color:var(--muted); font-size:.85rem; line-height:1.4; }}
+    .queue-status {{ display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:5px 10px; font-size:.8rem; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.04); text-transform:uppercase; }}
+    .queue-status-pending {{ color:#fcd34d; border-color:rgba(252,211,77,0.24); background:rgba(252,211,77,0.10); }}
+    .queue-status-processing {{ color:#7dd3fc; border-color:rgba(125,211,252,0.24); background:rgba(125,211,252,0.10); }}
+    .queue-status-completed {{ color:#86efac; border-color:rgba(134,239,172,0.24); background:rgba(134,239,172,0.10); }}
+    .queue-status-failed {{ color:#fca5a5; border-color:rgba(252,165,165,0.24); background:rgba(252,165,165,0.10); }}
+    .queue-error {{ margin-top:10px; padding:10px 12px; border-radius:12px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.24); color:#ffd0d0; font-size:.88rem; }}
+    .queue-actions {{ margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }}
     @media (max-width: 1400px) {{ .grid {{ grid-template-columns: 280px minmax(0, 1fr); }} .admin-detail-column {{ grid-column: 1 / -1; }} }}
     @media (max-width: 1100px) {{ .grid, .hero, .cols {{ grid-template-columns: 1fr; }} }}
   </style>
@@ -1519,12 +2510,18 @@ def _render_admin_page(
           <span class="pill">Cabinettypen / Registertypen / Dokumenttypen</span>
           <span class="pill">Metadatenmodell</span>
           <a class="pill" href="/ui/app">Zur ECM-App</a>
-          <a class="pill" href="/ui/workflows">Zu Workflows</a>
+          <a class="pill" href="/ui/admin/queues">Queues & Logs</a>
+          <a class="pill" href="/ui/admin/identity">Identity & Rollen</a>
+          <a class="pill" href="/ui/workflow-designer">Workflow Designer</a>
         </div>
       </div>
       <div class="panel hero-side">
-        <h3>Admin-Kontext{tooltip_hint.replace('Mehr Kontext bei Hover oder Fokus.', 'Hier definierst du das Systemgerüst. Die Erfassung und tägliche Nutzung laufen in der App, Workflows bleiben als eigene Ebene getrennt.')}</h3>
-        <div class="status-chip">Flow-Archiv Modellierung</div>
+        <h3>Systemstatus{tooltip_hint.replace('Mehr Kontext bei Hover oder Fokus.', 'Hier siehst du die technischen Lauflichter für Preview, Suche und OCR/Index direkt im Admin.')}</h3>
+        <div class="status-stack" style="margin-top:12px;">
+          <div class="status-chip"><span>Preview</span><span class="service-badge"><span class="status-dot"></span> async</span></div>
+          <div class="status-chip"><span>Suche</span><span class="service-badge"><span class="status-dot"></span> bereit</span></div>
+          {indexing_status_html}
+        </div>
       </div>
     </section>
     <section class="grid">
@@ -1741,6 +2738,21 @@ def _render_admin_script() -> str:
 """
 
 
+def _render_search_results(documents: list[Document], search_query: str) -> tuple[str, str]:
+    if not documents:
+        return (
+            "<div class='panel'><p class='muted'>Keine Objekte für diese Suche oder Filter gefunden.</p></div>",
+            f"<div class=\"panel\" style=\"margin-bottom:16px;\"><h2 style=\"margin-top:0;\">Suchtreffer</h2><p class=\"muted\">Volltextsuche nach: {_escape(search_query)}</p></div>",
+        )
+    results = ''.join(
+        f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')} · {_escape(document.name)}</div></a>"
+        for document in documents
+    )
+    header = f"<div class=\"panel\" style=\"margin-bottom:16px;\"><h2 style=\"margin-top:0;\">Suchtreffer</h2><p class=\"muted\">Volltextsuche nach: {_escape(search_query)} · {len(documents)} Treffer</p></div>"
+    return f"<div class='object-list'>{results}</div>", header
+
+
+
 def _render_app_page(
     cabinets: list[Cabinet],
     document_types: list[DocumentType],
@@ -1770,7 +2782,10 @@ def _render_app_page(
         search_query=search_query,
         filter_kind=filter_kind,
     )
-    node_results_html, node_header_html = _render_node_results(cabinets, all_documents, selected_node, search_query)
+    if search_query.strip():
+        node_results_html, node_header_html = _render_search_results(all_documents, search_query)
+    else:
+        node_results_html, node_header_html = _render_node_results(cabinets, all_documents, selected_node, search_query)
     context_panel_html = _render_context_panel(selected_node, cabinets, cabinet_types)
     selected_document = None
     if selected_node and selected_node.get("kind") == "document":
@@ -1934,6 +2949,23 @@ def _render_app_page(
     typed_filter_link = f"/ui/app?filter_kind=typed&q={quote_plus(search_query or '')}{f'&selected_document_type_id={selected_capture_document_type.id}' if selected_capture_document_type else ''}"
     untyped_filter_link = f"/ui/app?filter_kind=untyped&q={quote_plus(search_query or '')}{f'&selected_document_type_id={selected_capture_document_type.id}' if selected_capture_document_type else ''}"
     recent_filter_link = f"/ui/app?filter_kind=recent&q={quote_plus(search_query or '')}{f'&selected_document_type_id={selected_capture_document_type.id}' if selected_capture_document_type else ''}"
+    capture_empty_hint_html = f'<div class="muted" style="margin-top:10px;">{capture_preview}</div>' if not capture_field_inputs else ""
+    intake_panel_html = ""
+    if show_intake_panel:
+        intake_panel_html = (
+            f'<div id="intake-form" class="panel">'
+            f'<div class="section-head"><div><h2 style="margin:0;">Dokument erfassen</h2><div class="muted" style="margin-top:6px;">Datei per Drag and Drop ablegen und Indexdaten direkt im aktuellen Kontext erfassen.</div></div></div>'
+            f'<form method="post" action="/ui/app/intake" enctype="multipart/form-data" id="intake-form-element">'
+            f'<input type="hidden" name="node_kind" value="{_escape(selected_node.get("kind", "") if selected_node else "")}">'
+            f'<input type="hidden" name="node_id" value="{_escape(selected_node.get("id", "") if selected_node else "")}">'
+            f'<input type="hidden" name="selected_document_type_id" value="{_escape(str(selected_capture_document_type.id)) if selected_capture_document_type else ""}">'
+            f'<input type="hidden" name="hash" id="file-hash-input" value="">'
+            f'<div id="file-dropzone" class="dropzone" style="margin-top:8px;"><strong>Datei hier ablegen</strong><div class="muted" id="dropzone-hint" style="margin-top:8px;">oder klicken, um eine Datei auszuwählen</div><input id="file-input" type="file" name="file" required style="display:none"></div>'
+            f'<div class="field-grid" style="margin-top:16px;"><div class="field"><label>Cabinet</label><select name="cabinet_id" required>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id">{register_options}</select></div><div class="field full"><label>Dokumenttyp</label><select id="document-type-select" name="document_type_id" required>{document_type_options}</select></div></div>'
+            f'<div class="panel" style="margin:16px 0 0 0; padding:16px;"><h3 style="margin:0 0 12px 0;">Indexdaten</h3><div class="field-grid">{capture_fields_html}</div>{capture_empty_hint_html}</div>'
+            f'<div id="duplicate-warning" class="panel" style="display:none; margin-top:12px; padding:12px 16px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.30); border-radius:12px;"><strong style="color:#ff7b7b;">⚠ Duplikat erkannt!</strong><div id="duplicate-info" style="margin-top:6px; color:var(--muted); font-size:.9rem;"></div></div>'
+            f'<div class="actions"><button class="primary" type="submit" id="intake-submit-btn">Dokument speichern</button></div></form></div>'
+        )
 
     return f"""
 <!doctype html>
@@ -1988,6 +3020,8 @@ def _render_app_page(
     input:focus, textarea:focus, select:focus {{ outline:none; border-color: rgba(77,212,255,0.46); box-shadow: 0 0 0 4px var(--glow); }}
     textarea {{ min-height: 110px; resize: vertical; }}
     .dropzone {{ border:2px dashed rgba(77,212,255,0.16); border-radius:20px; padding:28px; text-align:center; background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02)); }}
+    .duplicate-warning {{ margin-top:12px; padding:12px 16px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.30); border-radius:12px; display:none; }}
+    .duplicate-warning.visible {{ display:block; }}
     .actions {{ display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }}
     button, .chip {{ border:none; border-radius:999px; padding:10px 14px; font:inherit; cursor:pointer; transition: all .18s ease; }}
     .primary {{ background: linear-gradient(135deg, var(--accent), var(--accent-2)); color:white; box-shadow: 0 8px 24px rgba(77,212,255,0.22); }}
@@ -2071,15 +3105,6 @@ def _render_app_page(
             <button class="primary" type="submit">Suchen</button>
           </div>
         </form>
-        <div class="pillbar"><a class="pill" href="/ui/app">Objektübersicht</a><a class="pill" href="#search-form">Volltextsuche</a><a class="pill" href="#filters">Schnellfilter</a></div>
-      </div>
-      <div class="panel hero-status">
-        <h3>System</h3>
-        <div class="status-stack">
-          <div class="status-chip"><span>Preview</span><span class="service-badge"><span class="status-dot"></span> async</span></div>
-          <div class="status-chip"><span>Suche</span><span class="service-badge"><span class="status-dot"></span> bereit</span></div>
-          {indexing_status_html}
-        </div>
       </div>
       <div style="height:100%;">
         {context_panel_html}
@@ -2104,7 +3129,7 @@ def _render_app_page(
         </div>
         <div style="display:block;">
           {node_header_html}
-          {f'''<div id="intake-form" class="panel"><div class="section-head"><div><h2 style="margin:0;">Dokument erfassen</h2><div class="muted" style="margin-top:6px;">Datei per Drag and Drop ablegen und Indexdaten direkt im aktuellen Kontext erfassen.</div></div></div><form method="post" action="/ui/app/intake" enctype="multipart/form-data"><input type="hidden" name="node_kind" value="{_escape(selected_node.get("kind", "") if selected_node else "")}"><input type="hidden" name="node_id" value="{_escape(selected_node.get("id", "") if selected_node else "")}"><input type="hidden" name="selected_document_type_id" value="{_escape(str(selected_capture_document_type.id)) if selected_capture_document_type else ''}"><div class="field-grid"><div class="field"><label>Cabinet</label><select name="cabinet_id" required>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id">{register_options}</select></div><div class="field full"><label>Dokumenttyp</label><select id="document-type-select" name="document_type_id" required>{document_type_options}</select></div></div><div id="file-dropzone" class="dropzone" style="margin-top:16px;"><strong>Datei hier ablegen</strong><div class="muted" id="dropzone-hint" style="margin-top:8px;">oder klicken, um eine Datei auszuwählen</div><input id="file-input" type="file" name="file" required style="display:none"></div><div class="actions"><button class="primary" type="submit">Dokument speichern</button></div></form></div>''' if show_intake_panel else ''}
+          {intake_panel_html}
           {node_results_html}
           <div style="margin-top:20px;">{object_summary_html}</div>
           {object_overview_html}
@@ -2266,12 +3291,48 @@ def _render_app_page(
     }}
 
     if (fileDropzone && fileInput) {{
-      const setFile = (fileList) => {{
+      const setFile = (fileList, skipHashCheck) => {{
         if (!fileList || !fileList.length) return;
+        const file = fileList[0];
         fileInput.files = fileList;
         if (dropzoneHint) {{
-          dropzoneHint.textContent = `Ausgewählt: ${'{'}fileList[0].name{'}'}`;
+          dropzoneHint.textContent = `Ausgewählt: ${{file.name}}`;
         }}
+        if (skipHashCheck) return;
+        const reader = new FileReader();
+        reader.onload = async (e) => {{
+          const buffer = e.target?.result;
+          if (!buffer) return;
+          let hashHex = '';
+          try {{
+            const shaBuffer = await crypto.subtle.digest('SHA-256', buffer);
+            const shaArray = new Uint8Array(shaBuffer);
+            hashHex = Array.from(shaArray).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
+          }} catch (err) {{
+            console.error('Hash computation failed:', err);
+            return;
+          }}
+          const hashInput = document.getElementById('file-hash-input');
+          if (hashInput) hashInput.value = hashHex;
+          const docTypeSelect = document.getElementById('document-type-select');
+          const docTypeId = docTypeSelect?.value;
+          try {{
+            const resp = await fetch(`/api/v1/duplicate-check?hash=${{encodeURIComponent(hashHex)}}${{docTypeId ? '&document_type_id=' + docTypeId : ''}}`);
+            const data = await resp.json();
+            const warning = document.getElementById('duplicate-warning');
+            const info = document.getElementById('duplicate-info');
+            const submitBtn = document.getElementById('intake-submit-btn');
+            if (data.duplicate && data.existing_document) {{
+              if (warning) {{ warning.style.display = 'block'; warning.style.background = 'rgba(255,123,123,0.10)'; warning.style.borderColor = 'rgba(255,123,123,0.30)'; }}
+              if (info) {{ const date = data.existing_document.created_at ? new Date(data.existing_document.created_at).toLocaleDateString('de-DE') : 'unbekannt'; info.textContent = `Existiert bereits: "${{data.existing_document.name}}" (hochgeladen am ${{date}}) - Dokument wird nicht erneut gespeichert.`; }}
+              if (submitBtn) submitBtn.disabled = true;
+            }} else {{
+              if (warning) warning.style.display = 'none';
+              if (submitBtn) submitBtn.disabled = false;
+            }}
+          }} catch (err) {{ console.error('Duplicate check failed:', err); }}
+        }};
+        reader.readAsArrayBuffer(file);
       }};
 
       fileDropzone.addEventListener('click', () => fileInput.click());
@@ -2510,40 +3571,24 @@ def _render_document_detail_page(
         </div>
         <div class="actions">
           <a class="button primary" href="{download_link}">Download</a>
+          <a class="button" href="#metadata-edit">Metadaten editieren</a>
           <a class="button" href="/ui/app">Zurück zur Übersicht</a>
+        </div>
+        <div class="panel compact-indexdata" style="margin-top:12px; margin-bottom:0; position:relative; z-index:1;">
+          <h2 style="margin-top:0;">Metadaten</h2>
+          {metadata_rows}
         </div>
       </div>
       <div class="panel">
-        <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start;">
-          <div>
-            <h3 style="margin-top:0; margin-bottom:6px;">Dokumentinfo</h3>
-          </div>
-          <span class="service-badge"><span class="status-dot"></span> aktiv</span>
-        </div>
-        <div class="detail-row"><div class="detail-key">Erstellt</div><div class="detail-value">{_escape(str(document.created_at))}</div></div>
-        <div class="detail-row"><div class="detail-key">Aktualisiert</div><div class="detail-value">{_escape(str(document.updated_at))}</div></div>
-        <div class="detail-row"><div class="detail-key">MIME-Type</div><div class="detail-value">{_escape(document.mime_type or 'unbekannt')}</div></div>
-        <div class="detail-row"><div class="detail-key">Storage-Pfad</div><div class="detail-value"><pre>{_escape(document.storage_path)}</pre></div></div>
-        <div class="detail-row"><div class="detail-key">Cabinettyp</div><div class="detail-value">{_escape(current_cabinet_type_label)}</div></div>
-        <div class="detail-row"><div class="detail-key">Cabinet</div><div class="detail-value">{_escape(current_cabinet_label)}</div></div>
+        <h2 style="margin-top:0;">Vorschau</h2>
+        {preview_html}
       </div>
     </div>
 
     <div class="detail-grid">
       <div>
-        <div class="panel">
-          <details class="compact-panel">
-            <summary>
-              <span>Metadaten</span>
-              <span class="summary-meta">anzeigen</span>
-            </summary>
-            <div class="compact-body">
-              {metadata_rows}
-            </div>
-          </details>
-        </div>
-        <div class="panel">
-          <details class="compact-panel">
+        <div class="panel" id="metadata-edit">
+          <details class="compact-panel" open>
             <summary>
               <span>Metadaten bearbeiten</span>
               <span class="summary-meta">öffnen</span>
@@ -2563,8 +3608,18 @@ def _render_document_detail_page(
       </div>
       <div>
         <div class="panel">
-          <h2 style="margin-top:0;">Vorschau</h2>
-          {preview_html}
+          <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start;">
+            <div>
+              <h3 style="margin-top:0; margin-bottom:6px;">Dokumentinfo</h3>
+            </div>
+            <span class="service-badge"><span class="status-dot"></span> aktiv</span>
+          </div>
+          <div class="detail-row"><div class="detail-key">Erstellt</div><div class="detail-value">{_escape(str(document.created_at))}</div></div>
+          <div class="detail-row"><div class="detail-key">Aktualisiert</div><div class="detail-value">{_escape(str(document.updated_at))}</div></div>
+          <div class="detail-row"><div class="detail-key">MIME-Type</div><div class="detail-value">{_escape(document.mime_type or 'unbekannt')}</div></div>
+          <div class="detail-row"><div class="detail-key">Storage-Pfad</div><div class="detail-value"><pre>{_escape(document.storage_path)}</pre></div></div>
+          <div class="detail-row"><div class="detail-key">Cabinettyp</div><div class="detail-value">{_escape(current_cabinet_type_label)}</div></div>
+          <div class="detail-row"><div class="detail-key">Cabinet</div><div class="detail-value">{_escape(current_cabinet_label)}</div></div>
         </div>
         <div class="panel">
           <h2 style="margin-top:0;">Einordnung</h2>
@@ -2645,42 +3700,354 @@ def _render_preview_waiting_state(document_id: UUID, document_name: str, status:
     return html.encode("utf-8")
 
 
-def _render_workflows_page() -> str:
-    return """
+def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assignment_targets: list[AssignmentTarget], selected_workflow: WorkflowDefinition | None, selected_step: WorkflowStepDefinition | None, message: str | None = None) -> str:
+    workflow_cards: list[str] = []
+    for workflow in workflows:
+        active_badge = "aktiv" if workflow.is_active else "inaktiv"
+        workflow_cards.append(
+            f"<a class='workflow-card' href='/ui/workflow-designer?selected_workflow_id={workflow.id}#designer'><strong>{_escape(workflow.name)}</strong><div class='muted'>{_escape(workflow.description or 'Keine Beschreibung')}</div><div class='pillbar' style='margin-top:10px;'><span class='pill'>{active_badge}</span><span class='pill'>v{workflow.version}</span><span class='pill'>{len(workflow.steps)} Schritte</span></div></a>"
+        )
+    workflows_html = "".join(workflow_cards) or "<div class='muted'>Noch keine Workflows definiert.</div>"
+
+    def assignment_label_for_target(target: AssignmentTarget | None) -> str:
+        if not target:
+            return "Nicht zugewiesen"
+        return target.label or (
+            target.user.display_name if target.user else (
+                target.role.name if target.role else (
+                    target.team.name if target.team else "Unbenannt"
+                )
+            )
+        )
+
+    assignment_options_create_rows = ['<option value="">Nicht zuweisen</option>']
+    assignment_options_edit_rows = ['<option value="">Nicht zuweisen</option>']
+    for target in assignment_targets:
+        target_label = assignment_label_for_target(target)
+        option_label = f"{target.target_type} · {target_label}"
+        assignment_options_create_rows.append(
+            f'<option value="{target.id}">{_escape(option_label)}</option>'
+        )
+        selected_attr = " selected" if selected_step and selected_step.assignment_target_id == target.id else ""
+        assignment_options_edit_rows.append(
+            f'<option value="{target.id}"{selected_attr}>{_escape(option_label)}</option>'
+        )
+    assignment_options_create_html = "".join(assignment_options_create_rows)
+    assignment_options_edit_html = "".join(assignment_options_edit_rows)
+
+    sorted_steps: list[WorkflowStepDefinition] = []
+    step_cards: list[str] = []
+    workflow_graph_nodes: list[str] = []
+    if selected_workflow:
+        sorted_steps = sorted(selected_workflow.steps, key=lambda item: (item.order, item.name.lower()))
+        for index, step in enumerate(sorted_steps, start=1):
+            assignment_label = assignment_label_for_target(step.assignment_target)
+            selected_class = " is-selected" if selected_step and selected_step.id == step.id else ""
+            workflow_graph_nodes.append(
+                f"<div class='workflow-graph-node{selected_class}' draggable='true' data-step-id='{step.id}'><div class='workflow-graph-order'>{step.order}</div><strong><a href='/ui/workflow-designer?selected_workflow_id={selected_workflow.id}&selected_step_id={step.id}#designer'>{_escape(step.name)}</a></strong><div class='muted' style='font-size:.92rem;'>{_escape(assignment_label)}</div><div class='workflow-graph-key'>{_escape(step.step_key)}</div></div>"
+            )
+            transition_count = len(step.outgoing_transitions)
+            default_transition_count = sum(1 for transition in step.outgoing_transitions if transition.is_default)
+            transition_summary = f"{transition_count} Transitionen"
+            if default_transition_count:
+                transition_summary += f" · {default_transition_count} Standard"
+            delete_hint = 'Schritt erst löschen, wenn alle eingehenden und ausgehenden Transitionen entfernt sind.' if transition_count else 'Schritt kann gelöscht werden.'
+            step_cards.append(
+                f"<div class='panel' style='margin-bottom:0;'><div class='eyebrow'>Schritt {index}</div><h3 style='margin:6px 0 6px;'><a href='/ui/workflow-designer?selected_workflow_id={selected_workflow.id}&selected_step_id={step.id}#designer'>{_escape(step.name)}</a></h3><p class='muted' style='margin:0 0 12px 0;'>{_escape(step.description or 'Keine Beschreibung')}</p><div class='pillbar'><span class='pill'>Key: {_escape(step.step_key)}</span><span class='pill'>Reihenfolge: {step.order}</span><span class='pill'>Zuweisung: {_escape(assignment_label)}</span><span class='pill'>Frist: {step.due_in_days if step.due_in_days is not None else '—'} Tage</span></div><div class='workflow-step-summary'><span class='pill'>{_escape(transition_summary)}</span></div><div class='workflow-transition-hint'>{'Mehrere Ausgänge vorhanden.' if transition_count > 1 else ('Ein Standardpfad ist gesetzt.' if default_transition_count else 'Noch kein Standardpfad definiert.')} { _escape(delete_hint) }</div><div class='actions'><form method='post' action='/ui/workflow-designer/steps/{step.id}/move'><input type='hidden' name='direction' value='up'><button type='submit'>↑ Hoch</button></form><form method='post' action='/ui/workflow-designer/steps/{step.id}/move'><input type='hidden' name='direction' value='down'><button type='submit'>↓ Runter</button></form><form method='post' action='/ui/workflow-designer/steps/{step.id}/delete' onsubmit=\"return confirm('Schritt wirklich löschen?');\"><button type='submit'>Schritt löschen</button></form></div></div>"
+            )
+
+    workflow_graph_html = "<div class='workflow-graph-lane'><div class='workflow-graph-empty muted'>Noch keine Schritte für die grafische Ansicht vorhanden.</div></div>"
+    if workflow_graph_nodes and selected_workflow:
+        ordered_ids = ",".join(str(step.id) for step in sorted_steps)
+        selected_step_id_value = str(selected_step.id) if selected_step else ""
+        workflow_graph_html = (
+            f"<form method='post' action='/ui/workflow-designer/workflows/{selected_workflow.id}/reorder' class='workflow-graph-form' id='workflow-graph-form'>"
+            f"<input type='hidden' name='step_ids' id='workflow-graph-step-ids' value='{ordered_ids}'>"
+            f"<input type='hidden' name='selected_step_id' id='workflow-graph-selected-step-id' value='{selected_step_id_value}'>"
+            "<div class='workflow-graph-lane'><div class='workflow-graph-start'>Start</div><div class='workflow-graph-arrow'>→</div><div class='workflow-graph-track'><div class='workflow-graph-sequence' id='workflow-graph-sequence'>"
+            + "<div class='workflow-graph-connector'></div>".join(workflow_graph_nodes)
+            + "</div></div><div class='workflow-graph-arrow'>→</div><div class='workflow-graph-end'>Ende</div></div><div class='actions' style='margin-top:12px;'><button type='submit'>Grafische Reihenfolge speichern</button></div></form>"
+        )
+
+    transition_target_options_rows: list[str] = []
+    transition_target_options_by_selected_step_id: dict[str, str] = {}
+    if selected_step:
+        for candidate_step in sorted_steps:
+            if candidate_step.id == selected_step.id:
+                continue
+            transition_target_options_rows.append(
+                f'<option value="{candidate_step.id}">{_escape(candidate_step.name)}</option>'
+            )
+        for transition_step in sorted_steps:
+            options_rows_for_step: list[str] = []
+            for candidate_step in sorted_steps:
+                if candidate_step.id == transition_step.id:
+                    continue
+                options_rows_for_step.append(
+                    f'<option value="{candidate_step.id}">{_escape(candidate_step.name)}</option>'
+                )
+            transition_target_options_by_selected_step_id[str(transition_step.id)] = "".join(options_rows_for_step) or '<option value="">Kein anderer Schritt verfügbar</option>'
+    transition_target_options_html = "".join(transition_target_options_rows) or '<option value="">Kein anderer Schritt verfügbar</option>'
+
+    step_transition_rows: list[str] = []
+    if selected_step:
+        sorted_transitions = sorted(selected_step.outgoing_transitions, key=lambda item: (0 if item.is_default else 1, item.label.lower(), str(item.id)))
+        if sorted_transitions:
+            edit_transition_cards: list[str] = []
+            for transition in sorted_transitions:
+                target_label = transition.to_step.name if transition.to_step else "Unbekannt"
+                default_badge = " <span class='pill'>Standard</span>" if transition.is_default else ""
+                selected_target_options_rows: list[str] = []
+                for candidate_step in sorted_steps:
+                    if candidate_step.id == selected_step.id:
+                        continue
+                    selected_attr = " selected" if transition.to_step_id == candidate_step.id else ""
+                    selected_target_options_rows.append(
+                        f'<option value="{candidate_step.id}"{selected_attr}>{_escape(candidate_step.name)}</option>'
+                    )
+                transition_target_select_html = "".join(selected_target_options_rows) or '<option value="">Kein anderer Schritt verfügbar</option>'
+                edit_transition_cards.append(
+                    f"<div class='panel' style='margin-bottom:0;'>"
+                    f"<div style='display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;'>"
+                    f"<div><strong>{_escape(transition.label)}</strong>{default_badge}<div class='muted'>→ {_escape(target_label)}</div></div>"
+                    f"<form method='post' action='/ui/workflow-designer/transitions/{transition.id}/delete' style='margin:0;'>"
+                    f"<button type='submit' onclick=\"return confirm('Transition wirklich löschen?');\">Löschen</button>"
+                    f"</form>"
+                    f"</div>"
+                    f"<form method='post' action='/ui/workflow-designer/transitions/{transition.id}' style='margin-top:14px;'>"
+                    f"<div class='field-grid'>"
+                    f"<div class='field'><label>Label</label><input type='text' name='label' value='{_escape(transition.label)}' required></div>"
+                    f"<div class='field'><label>Zielschritt</label><select name='to_step_id' required>{transition_target_select_html}</select></div>"
+                    f"<div class='field full'><label><input type='checkbox' name='is_default' {'checked' if transition.is_default else ''}> Standardübergang</label></div>"
+                    f"</div>"
+                    f"<div class='actions'><button type='submit'>Transition aktualisieren</button></div>"
+                    f"</form>"
+                    f"</div>"
+                )
+            step_transition_rows = edit_transition_cards
+        else:
+            outgoing_count = len(selected_step.outgoing_transitions)
+            step_transition_rows.append(
+                f"<div class='panel' style='margin-bottom:0;'><strong>Noch keine Transitionen</strong><div class='muted'>Dieser Schritt hat aktuell {outgoing_count} ausgehende Übergänge.</div></div>"
+            )
+    step_transitions_html = "".join(step_transition_rows) or "<div class='muted'>Noch keine Transitionen für diesen Schritt.</div>"
+    step_cards_html = "".join(step_cards) or "<div class='muted'>Noch keine Schritte angelegt.</div>"
+    message_html = f"<div class='panel' style='padding:12px 16px;'><strong>{_escape(message)}</strong></div>" if message else ""
+
+    return f"""
 <!doctype html>
 <html lang=\"de\">
 <head>
   <meta charset=\"utf-8\">
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>Archiva Workflows</title>
+  <title>Archiva Workflow Designer</title>
   <link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
   <style>
-    :root { color-scheme: dark; }
-    body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), #0b1020; color: #eef2ff; margin: 0; }
-    .page { max-width: 1200px; margin: 0 auto; padding: 28px; }
-    .panel { background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border: 1px solid rgba(77,212,255,0.10); border-radius: 20px; padding: 22px; margin-bottom: 20px; box-shadow: 0 18px 48px rgba(0,0,0,0.28); }
-    a { color: #4dd4ff; text-decoration: none; }
-    .muted { color: #a8b2d1; line-height: 1.6; }
-    .eyebrow { letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color:#4dd4ff; font-weight:700; }
-    .pillbar { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
-    .pill { background: rgba(255,255,255,0.04); border:1px solid rgba(77,212,255,0.12); border-radius:999px; padding:9px 14px; color:#eef2ff; }
+    :root {{ color-scheme: dark; }}
+    body {{ font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), #0b1020; color: #eef2ff; margin: 0; }}
+    .page {{ max-width: 1280px; margin: 0 auto; padding: 28px; }}
+    .panel {{ background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border: 1px solid rgba(77,212,255,0.10); border-radius: 20px; padding: 22px; margin-bottom: 20px; box-shadow: 0 18px 48px rgba(0,0,0,0.28); }}
+    a {{ color: #4dd4ff; text-decoration: none; }}
+    .muted {{ color: #a8b2d1; line-height: 1.6; }}
+    .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color:#4dd4ff; font-weight:700; }}
+    .pillbar {{ display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }}
+    .pill {{ background: rgba(255,255,255,0.04); border:1px solid rgba(77,212,255,0.12); border-radius:999px; padding:9px 14px; color:#eef2ff; }}
+    .grid {{ display:grid; grid-template-columns: 340px minmax(0, 1fr); gap:20px; align-items:start; }}
+    .stack {{ display:grid; gap:16px; }}
+    .workflow-card {{ display:block; padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); color:#eef2ff; }}
+    .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
+    .field {{ display:grid; gap:6px; }}
+    .field.full {{ grid-column:1 / -1; }}
+    label {{ font-weight:600; font-size:.95rem; }}
+    input, textarea, select {{ width:100%; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:#0f1630; color:#eef2ff; padding:12px; font:inherit; }}
+    textarea {{ min-height:92px; resize:vertical; }}
+    .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }}
+    button {{ border:none; border-radius:999px; padding:10px 14px; font:inherit; cursor:pointer; }}
+    .primary {{ background: linear-gradient(135deg, #4f8cff, #4dd4ff); color: white; box-shadow: 0 8px 24px rgba(77,212,255,0.22); }}
+    .workflow-graph-lane {{ display:flex; align-items:center; gap:14px; overflow:auto; padding-bottom:8px; }}
+    .workflow-graph-track {{ overflow:auto; flex:1; }}
+    .workflow-graph-sequence {{ display:flex; align-items:center; gap:0; min-width:max-content; padding:6px 0; }}
+    .workflow-graph-form {{ display:block; }}
+    .workflow-graph-node {{ min-width:220px; max-width:220px; padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.16); background:rgba(255,255,255,0.04); color:#eef2ff; position:relative; box-shadow: 0 12px 32px rgba(0,0,0,0.18); cursor:grab; }}
+    .workflow-graph-node.is-selected {{ border-color:#4dd4ff; box-shadow: 0 0 0 1px rgba(77,212,255,0.55), 0 16px 36px rgba(77,212,255,0.16); }}
+    .workflow-graph-order {{ display:inline-flex; padding:4px 10px; border-radius:999px; background:rgba(77,212,255,0.12); color:#4dd4ff; font-size:.84rem; margin-bottom:10px; }}
+    .workflow-graph-key {{ margin-top:12px; color:#a8b2d1; font-size:.84rem; }}
+    .workflow-graph-connector {{ width:54px; height:2px; background:linear-gradient(90deg, rgba(77,212,255,0.30), rgba(77,212,255,0.85)); margin:0 10px; border-radius:999px; }}
+    .workflow-graph-start, .workflow-graph-end {{ padding:10px 14px; border-radius:999px; border:1px solid rgba(77,212,255,0.18); background:rgba(255,255,255,0.03); color:#eef2ff; white-space:nowrap; }}
+    .workflow-graph-arrow {{ color:#4dd4ff; font-size:1.2rem; }}
+    .workflow-graph-empty {{ padding:8px 0; }}
+    .workflow-step-summary {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
+    .workflow-transition-hint {{ margin-top:10px; font-size:.88rem; color:#a8b2d1; }}
   </style>
 </head>
 <body>
   <div class=\"page\">
     <div class=\"panel\">
-      <div class=\"eyebrow\">Orchestration Layer</div>
-      <h1>Archiva Workflows</h1>
-      <p class=\"muted\">Diese Fläche ist für Objekt-Workflows vorgesehen. Hier werden später Regeln, Übergänge, Freigaben und prozessuale Schritte auf die gleiche Flow-Archiv-Logik aufsetzen wie Intake, Preview und Retrieve.</p>
+      <div class=\"eyebrow\">Workflow Designer</div>
+      <h1>Archiva Workflow Designer</h1>
+      <p class=\"muted\">Diese eigene App ist für die Definition von Workflows vorgesehen, getrennt von Admin, Identity und Monitoring. Hier entstehen später Workflow-Definitionen, Schritte, Zuständigkeiten, Regeln, Fristen und Eskalationen.</p>
+      <div class=\"pillbar\">
+        <span class=\"pill\">Definitionsebene</span>
+        <span class=\"pill\">Schritte & Zuständigkeiten</span>
+        <span class=\"pill\">Assignment Targets</span>
+      </div>
       <div class=\"pillbar\">
         <a class=\"pill\" href=\"/ui/app\">Zur ECM-App</a>
         <a class=\"pill\" href=\"/ui/admin\">Zur Admin-Oberfläche</a>
+        <a class=\"pill\" href=\"/ui/admin/identity\">Zur Identity</a>
+      </div>
+    </div>
+    {message_html}
+    <div class=\"grid\" id=\"designer\">
+      <div class=\"stack\">
+        <div class=\"panel\">
+          <h2 style=\"margin-top:0;\">Workflows</h2>
+          <p class=\"muted\">Ein Workflow ist die Vorlage. Schritte werden darunter in Reihenfolge definiert.</p>
+          <div class=\"stack\">{workflows_html}</div>
+        </div>
+        <form method=\"post\" action=\"/ui/workflow-designer/workflows\" class=\"panel\">
+          <h2 style=\"margin-top:0;\">Workflow anlegen</h2>
+          <div class=\"field-grid\">
+            <div class=\"field\"><label>Name</label><input type=\"text\" name=\"name\" required></div>
+            <div class=\"field\"><label><input type=\"checkbox\" name=\"is_active\" checked> Aktiv</label></div>
+            <div class=\"field full\"><label>Beschreibung</label><textarea name=\"description\"></textarea></div>
+          </div>
+          <div class=\"actions\"><button class=\"primary\" type=\"submit\">Workflow speichern</button></div>
+        </form>
+      </div>
+      <div class=\"stack\">
+        <div class=\"panel\">
+          <h2 style=\"margin-top:0;\">Designer</h2>
+          <p class=\"muted\">Schritte werden aktuell über ihre Reihenfolge verknüpft. Die visuelle Kette ist also bewusst einfach: Schritt 10, 20, 30. Zuständigkeiten laufen bereits über Assignment Targets. Diese grafische Ansicht sitzt absichtlich direkt auf dem bestehenden Modell und ist der erste Schritt in Richtung visuellem Workflow-Editor.</p>
+          <div class=\"pillbar\">
+            <span class=\"pill\">Verknüpfung: Reihenfolge</span>
+            <span class=\"pill\">Identität: Assignment Target</span>
+            <span class=\"pill\">Grafische Ansicht v1</span>
+          </div>
+          <div style=\"margin-top:18px;\">{workflow_graph_html}</div>
+        </div>
+        <div class=\"panel\">
+          <h2 style=\"margin-top:0;\">{_escape(selected_workflow.name) if selected_workflow else 'Noch kein Workflow ausgewählt'}</h2>
+          <p class=\"muted\">{_escape(selected_workflow.description or 'Wähle links einen Workflow oder lege einen neuen an.') if selected_workflow else 'Ein Workflow sammelt definierte Schritte mit Reihenfolge, Zuständigkeit und Frist.'}</p>
+          <div class=\"stack\">{step_cards_html}</div>
+        </div>
+        <form method=\"post\" action=\"/ui/workflow-designer/steps\" class=\"panel\" style=\"{'display:block;' if selected_workflow else 'display:none;'}\">
+          <h2 style=\"margin-top:0;\">Schritt anlegen</h2>
+          <input type=\"hidden\" name=\"workflow_definition_id\" value=\"{selected_workflow.id if selected_workflow else ''}\">
+          <div class=\"field-grid\">
+            <div class=\"field\"><label>Name</label><input type=\"text\" name=\"name\" required></div>
+            <div class=\"field\"><label>Step Key</label><input type=\"text\" name=\"step_key\" placeholder=\"z. B. freigabe\" required></div>
+            <div class=\"field\"><label>Reihenfolge</label><input type=\"number\" name=\"order\" value=\"{(len(selected_workflow.steps) + 1) * 10 if selected_workflow else 10}\"></div>
+            <div class=\"field\"><label>Frist in Tagen</label><input type=\"number\" name=\"due_in_days\" placeholder=\"optional\"></div>
+            <div class=\"field full\"><label>Zuweisung</label><select name=\"assignment_target_id\">{assignment_options_create_html}</select></div>
+            <div class=\"field full\"><label>Beschreibung</label><textarea name=\"description\"></textarea></div>
+          </div>
+          <div class=\"actions\"><button class=\"primary\" type=\"submit\">Schritt speichern</button></div>
+        </form>
+        <form method=\"post\" action=\"/ui/workflow-designer/steps/{selected_step.id if selected_step else ''}\" class=\"panel\" style=\"{'display:block;' if selected_step else 'display:none;'}\">
+          <h2 style=\"margin-top:0;\">Schritt bearbeiten</h2>
+          <div class=\"field-grid\">
+            <div class=\"field\"><label>Name</label><input type=\"text\" name=\"name\" value=\"{_escape(selected_step.name) if selected_step else ''}\" required></div>
+            <div class=\"field\"><label>Step Key</label><input type=\"text\" name=\"step_key\" value=\"{_escape(selected_step.step_key) if selected_step else ''}\" required></div>
+            <div class=\"field\"><label>Reihenfolge</label><input type=\"number\" name=\"order\" value=\"{selected_step.order if selected_step else 10}\"></div>
+            <div class=\"field\"><label>Frist in Tagen</label><input type=\"number\" name=\"due_in_days\" value=\"{selected_step.due_in_days if selected_step and selected_step.due_in_days is not None else ''}\" placeholder=\"optional\"></div>
+            <div class=\"field full\"><label>Zuweisung</label><select name=\"assignment_target_id\">{assignment_options_edit_html}</select></div>
+            <div class=\"field full\"><label>Beschreibung</label><textarea name=\"description\">{_escape(selected_step.description or '') if selected_step else ''}</textarea></div>
+          </div>
+          <div class=\"actions\"><button class=\"primary\" type=\"submit\">Schritt aktualisieren</button></div>
+        </form>
+        <div class=\"panel\" style=\"{'display:block;' if selected_step else 'display:none;'}\">
+          <h2 style=\"margin-top:0;\">Transitionen</h2>
+          <p class=\"muted\">Hier werden echte Übergänge definiert, also z. B. Genehmigt, Abgelehnt oder Rückfrage.</p>
+          <div class=\"stack\">{step_transitions_html}</div>
+        </div>
+        <form method=\"post\" action=\"/ui/workflow-designer/transitions\" class=\"panel\" style=\"{'display:block;' if selected_step else 'display:none;'}\">
+          <h2 style=\"margin-top:0;\">Transition anlegen</h2>
+          <input type=\"hidden\" name=\"workflow_definition_id\" value=\"{selected_workflow.id if selected_workflow else ''}\">
+          <input type=\"hidden\" name=\"from_step_id\" value=\"{selected_step.id if selected_step else ''}\">
+          <div class=\"field-grid\">
+            <div class=\"field\"><label>Label</label><input type=\"text\" name=\"label\" placeholder=\"z. B. genehmigt\" required></div>
+            <div class=\"field\"><label>Zielschritt</label><select name=\"to_step_id\" required>{transition_target_options_html}</select></div>
+            <div class=\"field full\"><label><input type=\"checkbox\" name=\"is_default\"> Standardübergang</label></div>
+          </div>
+          <div class=\"actions\"><button class=\"primary\" type=\"submit\">Transition speichern</button></div>
+        </form>
       </div>
     </div>
   </div>
+  <script>
+    (() => {{
+      const sequence = document.getElementById('workflow-graph-sequence');
+      const stepIdsInput = document.getElementById('workflow-graph-step-ids');
+      if (!sequence || !stepIdsInput) return;
+
+      let dragged = null;
+      const syncOrder = () => {{
+        const ids = Array.from(sequence.querySelectorAll('.workflow-graph-node')).map((node) => node.dataset.stepId).filter(Boolean);
+        stepIdsInput.value = ids.join(',');
+      }};
+
+      sequence.querySelectorAll('.workflow-graph-node').forEach((node) => {{
+        node.addEventListener('dragstart', () => {{
+          dragged = node;
+          node.style.opacity = '0.45';
+        }});
+        node.addEventListener('dragend', () => {{
+          node.style.opacity = '1';
+          dragged = null;
+          syncOrder();
+        }});
+        node.addEventListener('dragover', (event) => {{
+          event.preventDefault();
+        }});
+        node.addEventListener('drop', (event) => {{
+          event.preventDefault();
+          if (!dragged || dragged === node) return;
+          const nodes = Array.from(sequence.querySelectorAll('.workflow-graph-node'));
+          const draggedIndex = nodes.indexOf(dragged);
+          const targetIndex = nodes.indexOf(node);
+          if (draggedIndex < targetIndex) {{
+            sequence.insertBefore(dragged, node.nextSibling);
+          }} else {{
+            sequence.insertBefore(dragged, node);
+          }}
+          syncOrder();
+        }});
+      }});
+      syncOrder();
+    }})();
+  </script>
 </body>
 </html>
 """
+
+
+def _sync_assignment_targets(db: Session) -> None:
+    users = db.query(User).order_by(User.display_name).all()
+    roles = db.query(Role).order_by(Role.name).all()
+    teams = db.query(Team).order_by(Team.name).all()
+
+    existing_user_ids = {target.user_id for target in db.query(AssignmentTarget).where(AssignmentTarget.user_id.isnot(None)).all()}
+    existing_role_ids = {target.role_id for target in db.query(AssignmentTarget).where(AssignmentTarget.role_id.isnot(None)).all()}
+    existing_team_ids = {target.team_id for target in db.query(AssignmentTarget).where(AssignmentTarget.team_id.isnot(None)).all()}
+
+    changed = False
+
+    for user in users:
+        if user.id not in existing_user_ids:
+            db.add(AssignmentTarget(target_type="user", user_id=user.id, label=user.display_name, description=user.email))
+            changed = True
+    for role in roles:
+        if role.id not in existing_role_ids:
+            db.add(AssignmentTarget(target_type="role", role_id=role.id, label=role.name, description=role.description))
+            changed = True
+    for team in teams:
+        if team.id not in existing_team_ids:
+            db.add(AssignmentTarget(target_type="team", team_id=team.id, label=team.name, description=team.description))
+            changed = True
+
+    if changed:
+        db.commit()
 
 
 def _render_structure(cabinets: list[Cabinet]) -> str:
@@ -2843,7 +4210,7 @@ def _render_definition_structure(
         ]
         chunks.append(def_node(
             kind="cabinet_type", node_id=ct_id, label=cabinet_type.name,
-            icon="🧩", depth=1,
+            icon="🗄️", depth=1,
             actions=ct_actions,
         ))
         # Direkte Dokumenttypen am Cabinettyp
@@ -2930,7 +4297,7 @@ def _render_definition_detail(
             return "<p class='def-empty'>Cabinettyp nicht gefunden.</p>"
         return f"""
         <div class="def-detail-card">
-          <h3>🧩 {_escape(ct.name)}</h3>
+          <h3>🗄️ {_escape(ct.name)}</h3>
           <div class="def-detail-row"><div class="def-detail-key">Name</div><div class="def-detail-value">{_escape(ct.name)}</div></div>
           <div class="def-detail-row"><div class="def-detail-key">Beschreibung</div><div class="def-detail-value">{_escape(ct.description or '—')}</div></div>
           <div class="def-detail-row"><div class="def-detail-key">Reihenfolge</div><div class="def-detail-value">{ct.order}</div></div>
@@ -3169,7 +4536,7 @@ def _render_archive_tree(
     def node_link(kind: str, node_id: str, label: str, depth: int = 0, menu: list[dict[str, str]] | None = None) -> str:
         active = " active" if selected_kind == kind and selected_id == node_id else ""
         just_created = " just-created" if selected_kind == kind and selected_id == node_id else ""
-        href = f"/ui/app?node_kind={kind}&node_id={node_id}&q={quote_plus(search_query or '')}"
+        href = f"/ui/app?node_kind={kind}&node_id={node_id}"
         menu_attr = f" data-menu='{_escape(json.dumps(menu or [], ensure_ascii=False))}'" if menu is not None else ""
         menu_button = "<div class='tree-actions'><button type='button' class='tree-menu-button'>⋯</button><a class='tree-tab-link' href='{}' target='_blank' rel='noopener noreferrer'>↗</a></div>".format(href) if menu is not None else f'<a class="tree-tab-link" href="{href}" target="_blank" rel="noopener noreferrer">↗</a>'
         return (
@@ -3239,7 +4606,7 @@ def _render_archive_tree(
         type_name = cabinet_type.name
         typed_cabinets = sorted(grouped.get(type_id, []), key=lambda item: item.order)
         type_menu = _creation_actions_for_node(node_kind="cabinet_type", node_id=type_id, node_label=type_name)
-        chunks.append(node_link("cabinet_type", type_id, f"🧩 {type_name}", 0, type_menu))
+        chunks.append(node_link("cabinet_type", type_id, f"🗄️ {type_name}", 0, type_menu))
 
         for cabinet in typed_cabinets:
             cabinet_menu = _creation_actions_for_node(node_kind="cabinet", node_id=str(cabinet.id), node_label=cabinet.name, cabinet=cabinet)
@@ -3259,7 +4626,7 @@ def _render_archive_tree(
         typed_cabinets = sorted(grouped.get(type_id, []), key=lambda item: item.order)
         type_name = typed_cabinets[0].cabinet_type.name if typed_cabinets and typed_cabinets[0].cabinet_type else 'Ohne Cabinettyp'
         type_menu = _creation_actions_for_node(node_kind="cabinet_type", node_id=type_id, node_label=type_name)
-        chunks.append(node_link("cabinet_type", type_id, f"🧩 {type_name}", 0, type_menu))
+        chunks.append(node_link("cabinet_type", type_id, f"🗄️ {type_name}", 0, type_menu))
         for cabinet in typed_cabinets:
             cabinet_menu = _creation_actions_for_node(node_kind="cabinet", node_id=str(cabinet.id), node_label=cabinet.name, cabinet=cabinet)
             chunks.append(node_link("cabinet", str(cabinet.id), f"🗂️ {cabinet.name}", 1, cabinet_menu))
@@ -3338,15 +4705,21 @@ def _render_node_results(
         cabinet = next((cab for cab in cabinets if str(cab.id) == selected_id), None)
         if cabinet:
             subtitle = "Inhalt dieses Cabinets"
+            structure_results: list[str] = []
+            document_results: list[str] = []
             for register in sorted(cabinet.registers, key=lambda item: item.order):
                 register_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id) and doc.document_type and doc.document_type.register_id and str(doc.document_type.register_id) == str(register.id)]
-                results.append(f"<a class='object-card' href='/ui/app?node_kind=register&node_id={register.id}'><strong>📑 {_escape(register.name)}</strong><div class='muted'>{len(register.document_types)} Dokumenttypen · {len(register_documents)} Dokumente</div></a>")
+                structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=register&node_id={register.id}'><strong>📑 {_escape(register.name)}</strong><div class='muted'>{len(register.document_types)} Dokumenttypen · {len(register_documents)} Dokumente</div></a>")
             for doc_type in sorted(cabinet.document_types, key=lambda item: item.order):
                 matching_documents = [doc for doc in all_documents if doc.document_type_id and str(doc.document_type_id) == str(doc_type.id)]
-                results.append(f"<a class='object-card' href='/ui/app?node_kind=document_type&node_id={doc_type.id}'><strong>📄 {_escape(doc_type.name)}</strong><div class='muted'>Direkter Dokumenttyp · {len(matching_documents)} Dokumente</div></a>")
+                structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=document_type&node_id={doc_type.id}'><strong>📄 {_escape(doc_type.name)}</strong><div class='muted'>Direkter Dokumenttyp · {len(matching_documents)} Dokumente</div></a>")
             cabinet_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id)]
+            if structure_results:
+                results.append("<div class='panel' style='margin-bottom:12px;'><h3 style='margin:0;'>Struktur</h3></div>")
+                results.extend(structure_results)
             for document in cabinet_documents[:20]:
-                results.append(f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')}</div></a>")
+                document_results.append(f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')} · {_escape(str(document.created_at))}</div></a>")
+            results.extend(document_results)
     elif selected_kind == "register":
         register = None
         parent_cabinet = None
@@ -3383,6 +4756,21 @@ def _render_node_results(
 
     if search_query.strip():
         subtitle = (subtitle + " · " if subtitle else "") + f"Suche aktiv: {_escape(search_query)}"
+
+    if not results and search_query.strip():
+        search_documents = [
+            doc for doc in all_documents
+            if search_query.strip().lower() in ((doc.title or '') + ' ' + (doc.name or '')).lower()
+            or search_query.strip().lower() in str(metadata_from_json(doc.metadata_json) or {}).lower()
+        ]
+        if not search_documents:
+            search_documents = all_documents[:30]
+        if search_documents:
+            subtitle = f"{len(search_documents)} Suchtreffer"
+            results = [
+                f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')} · {_escape(document.name)}</div></a>"
+                for document in search_documents[:30]
+            ]
 
     if not results:
         results_html = "<div class='panel'><p class='muted'>Für diesen Knoten wurden noch keine Unterelemente gefunden.</p></div>"
@@ -3794,5 +5182,180 @@ def _render_admin_create_panel(
 
         <form method="post" action="/ui/admin/metadata-fields" class="panel admin-create-section" id="admin-form-metadata-field" style="display:none; margin-bottom:0;"><h3>Metadatenfeld anlegen</h3><p class="muted">Lege strukturierte Felder für Cabinettyp, Registertyp, Cabinet, Register oder Dokumenttyp fest.</p><div class="field-grid"><div class="field"><label>Zieltyp</label><select name="target_kind"><option value="cabinet_type">Cabinettyp</option><option value="register_type">Registertyp</option><option value="document_type">Dokumenttyp</option><option value="cabinet">Cabinet</option><option value="register">Register</option></select></div><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id"><option value="">Bitte wählen</option>{cabinet_type_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Cabinet</label><select name="cabinet_id"><option value="">Bitte wählen</option>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id"><option value="">Bitte wählen</option>{register_options}</select></div><div class="field"><label>Dokumenttyp</label><select name="document_type_id"><option value="">Bitte wählen</option>{document_type_field_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Label</label><input type="text" name="label"></div><div class="field"><label>Feldtyp</label><select name="field_type">{field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder"></div><div class="field"><label>Default</label><input type="text" name="default_value"></div><div class="field"><label><input type="checkbox" name="is_required"> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique"> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Feld speichern</button></div></form>
         <form method="post" action="/ui/admin/metadata-fields/{selected_metadata_field.id if selected_metadata_field else ''}" class="panel admin-create-section" id="admin-form-metadata-field-edit" style="display:none; margin-bottom:0;"><h3>Metadatenfeld bearbeiten</h3><p class="muted">Änderungen wirken auf Darstellung und Validierung. Bestehende JSON-Werte werden nicht umgeschrieben oder gelöscht.</p><input type="hidden" name="selected_definition_kind" value="{_escape(selected_definition_kind or '')}"><input type="hidden" name="selected_definition_id" value="{_escape(selected_definition_id or '')}"><div class="field-grid"><div class="field"><label>Name</label><input type="text" name="name" value="{_escape(selected_metadata_field.name) if selected_metadata_field else ''}" required></div><div class="field"><label>Label</label><input type="text" name="label" value="{_escape(selected_metadata_field.label or '') if selected_metadata_field else ''}"></div><div class="field"><label>Feldtyp</label><select name="field_type">{edit_field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{edit_width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="{selected_metadata_field.order if selected_metadata_field else 0}"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder" value="{_escape(selected_metadata_field.placeholder or '') if selected_metadata_field else ''}"></div><div class="field"><label>Default</label><input type="text" name="default_value" value="{_escape(selected_metadata_field.default_value or '') if selected_metadata_field else ''}"></div><div class="field"><label><input type="checkbox" name="is_required" {'checked' if selected_metadata_field and selected_metadata_field.is_required else ''}> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique" {'checked' if selected_metadata_field and selected_metadata_field.is_unique else ''}> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description">{_escape(selected_metadata_field.description or '') if selected_metadata_field else ''}</textarea></div></div><div class="actions"><button class="primary" type="submit">Metadatenfeld speichern</button></div></form>
+      </div>
+    """
+
+
+def _render_identity_panel(
+    users: list[User],
+    roles: list[Role],
+    teams: list[Team],
+    *,
+    identity_tab: str = "users",
+    selected_user_id: str | None = None,
+    selected_role_id: str | None = None,
+    selected_team_id: str | None = None,
+    message: str | None = None,
+) -> str:
+    active_tab = identity_tab if identity_tab in {"users", "roles", "teams"} else "users"
+    selected_user = next((user for user in users if str(user.id) == str(selected_user_id or "")), None)
+    selected_role = next((role for role in roles if str(role.id) == str(selected_role_id or "")), None)
+    selected_team = next((team for team in teams if str(team.id) == str(selected_team_id or "")), None)
+    role_options = "".join(
+        f'<label class="checkbox-item"><input type="checkbox" name="role_ids" value="{role.id}"> {_escape(role.name)}</label>'
+        for role in roles
+    ) or '<div class="muted">Noch keine Rollen vorhanden.</div>'
+
+    edit_role_options = "".join(
+        f'<label class="checkbox-item"><input type="checkbox" name="role_ids" value="{role.id}" {"checked" if selected_user and any(assignment.role_id == role.id for assignment in selected_user.role_assignments) else ""}> {_escape(role.name)}</label>'
+        for role in roles
+    ) or '<div class="muted">Noch keine Rollen vorhanden.</div>'
+    team_member_options = "".join(
+        f'<label class="checkbox-item"><input type="checkbox" name="member_user_ids" value="{user.id}"> {_escape(user.display_name)} <span class="muted">({_escape(user.email)})</span></label>'
+        for user in users
+    ) or '<div class="muted">Noch keine Benutzer vorhanden.</div>'
+    edit_team_member_options = "".join(
+        f'<label class="checkbox-item"><input type="checkbox" name="member_user_ids" value="{user.id}" {"checked" if selected_team and any(membership.user_id == user.id for membership in selected_team.memberships) else ""}> {_escape(user.display_name)} <span class="muted">({_escape(user.email)})</span></label>'
+        for user in users
+    ) or '<div class="muted">Noch keine Benutzer vorhanden.</div>'
+    message_html = f'<div class="badge" style="display:inline-block;">{_escape(message)}</div>' if message else ""
+
+    user_rows = []
+    for user in users:
+        assigned_roles = sorted({assignment.role.name for assignment in user.role_assignments if assignment.role})
+        role_badges = " ".join(f'<span class="badge">{_escape(role_name)}</span>' for role_name in assigned_roles) or '<span class="muted">Keine Rollen</span>'
+        source_badge = "Lokal" if user.auth_source == "local" else user.auth_source
+        user_rows.append(
+            f"<div class='def-detail-card'>"
+            f"<h3>👤 {_escape(user.display_name)}</h3>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>E-Mail</div><div class='def-detail-value'>{_escape(user.email)}</div></div>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Quelle</div><div class='def-detail-value'>{_escape(source_badge)}</div></div>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Status</div><div class='def-detail-value'>{_escape(user.status)}</div></div>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Rollen</div><div class='def-detail-value'>{role_badges}</div></div>"
+            f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=users&selected_user_id={user.id}#identity-admin'>Bearbeiten</a>"
+            f"<form method='post' action='/ui/admin/users/{user.id}/toggle-status' style='display:inline;'><button class='chip' type='submit'>{'Deaktivieren' if user.status == 'active' else 'Aktivieren'}</button></form></div>"
+            f"</div>"
+        )
+    users_html = "".join(user_rows) or "<p class='def-empty'>Noch keine Benutzer angelegt.</p>"
+
+    role_rows = []
+    for role in roles:
+        assignment_count = sum(1 for assignment in role.assignments if assignment.user)
+        role_rows.append(
+            f"<div class='def-detail-card'>"
+            f"<h3>🛡️ {_escape(role.name)}</h3>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Beschreibung</div><div class='def-detail-value'>{_escape(role.description or '—')}</div></div>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Systemrolle</div><div class='def-detail-value'>{'Ja' if role.is_system else 'Nein'}</div></div>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Zuweisungen</div><div class='def-detail-value'>{assignment_count}</div></div>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Rechte</div><div class='def-detail-value'><pre style='margin:0;white-space:pre-wrap;word-break:break-word;'>{_escape(role.permissions_json or '[]')}</pre></div></div>"
+            f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=roles&selected_role_id={role.id}#identity-admin'>Bearbeiten</a></div>"
+            f"</div>"
+        )
+    roles_html = "".join(role_rows) or "<p class='def-empty'>Noch keine Rollen angelegt.</p>"
+
+    team_rows = []
+    for team in teams:
+        member_names = sorted({membership.user.display_name for membership in team.memberships if membership.user})
+        member_badges = " ".join(f'<span class="badge">{_escape(member_name)}</span>' for member_name in member_names) or '<span class="muted">Keine Mitglieder</span>'
+        team_rows.append(
+            f"<div class='def-detail-card'>"
+            f"<h3>👥 {_escape(team.name)}</h3>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Beschreibung</div><div class='def-detail-value'>{_escape(team.description or '—')}</div></div>"
+            f"<div class='def-detail-row'><div class='def-detail-key'>Mitglieder</div><div class='def-detail-value'>{member_badges}</div></div>"
+            f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}#identity-admin'>Bearbeiten</a></div>"
+            f"</div>"
+        )
+    teams_html = "".join(team_rows) or "<p class='def-empty'>Noch keine Teams angelegt.</p>"
+
+    users_section_style = "display:block;" if active_tab == "users" else "display:none;"
+    roles_section_style = "display:block;" if active_tab == "roles" else "display:none;"
+    teams_section_style = "display:block;" if active_tab == "teams" else "display:none;"
+
+    return f"""
+      <div class="stack">
+        <div class="panel" style="margin-bottom:0;">
+          <h3>User & Rollen</h3>
+          <p class="muted">Natives Identitätsmodell für Archiva. Später kann Entra ID über dieselben Benutzerkonten und Rollen andocken.</p>
+          {message_html}
+          <div class="actions">
+            <a class="pill{' is-active' if active_tab == 'users' else ''}" href="/ui/admin/identity?identity_tab=users#identity-admin">Benutzer</a>
+            <a class="pill{' is-active' if active_tab == 'roles' else ''}" href="/ui/admin/identity?identity_tab=roles#identity-admin">Rollen</a>
+            <a class="pill{' is-active' if active_tab == 'teams' else ''}" href="/ui/admin/identity?identity_tab=teams#identity-admin">Teams</a>
+          </div>
+        </div>
+
+        <div id="identity-admin" style="{users_section_style}">
+          <form method="post" action="/ui/admin/users" class="panel" style="margin-bottom:0;">
+            <h3>Benutzer anlegen</h3>
+            <p class="muted">Für v1 reicht ein lokaler Benutzerstamm. Externe Anmeldung kann später über `external_subject` und `auth_source` ergänzt werden.</p>
+            <div class="field-grid">
+              <div class="field"><label>Anzeigename</label><input type="text" name="display_name" required></div>
+              <div class="field"><label>E-Mail</label><input type="email" name="email" required></div>
+              <div class="field"><label>Status</label><select name="status"><option value="active">active</option><option value="invited">invited</option><option value="disabled">disabled</option></select></div>
+              <div class="field full"><label>Rollen</label><div class="checkbox-group">{role_options}</div></div>
+            </div>
+            <div class="actions"><button class="primary" type="submit">Benutzer speichern</button></div>
+          </form>
+          <form method="post" action="/ui/admin/users/{selected_user.id if selected_user else ''}" class="panel" style="margin:16px 0 0 0; {'display:block;' if selected_user else 'display:none;'}">
+            <h3>Benutzer bearbeiten</h3>
+            <p class="muted">Bestehende Benutzer können hier umbenannt, neu gerollt oder deaktiviert werden.</p>
+            <div class="field-grid">
+              <div class="field"><label>Anzeigename</label><input type="text" name="display_name" value="{_escape(selected_user.display_name) if selected_user else ''}" required></div>
+              <div class="field"><label>E-Mail</label><input type="email" name="email" value="{_escape(selected_user.email) if selected_user else ''}" required></div>
+              <div class="field"><label>Status</label><select name="status"><option value="active" {'selected' if selected_user and selected_user.status == 'active' else ''}>active</option><option value="invited" {'selected' if selected_user and selected_user.status == 'invited' else ''}>invited</option><option value="disabled" {'selected' if selected_user and selected_user.status == 'disabled' else ''}>disabled</option></select></div>
+              <div class="field full"><label>Rollen</label><div class="checkbox-group">{edit_role_options}</div></div>
+            </div>
+            <div class="actions"><button class="primary" type="submit">Benutzer aktualisieren</button></div>
+          </form>
+          <div class="stack" style="margin-top:16px;">{users_html}</div>
+        </div>
+
+        <div style="{roles_section_style}">
+          <form method="post" action="/ui/admin/roles" class="panel" style="margin-bottom:0;">
+            <h3>Rolle anlegen</h3>
+            <p class="muted">Rollen bleiben bewusst grob und lesbar. Feingranulare Rechte können wir später verfeinern.</p>
+            <div class="field-grid">
+              <div class="field"><label>Name</label><input type="text" name="name" required></div>
+              <div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div>
+              <div class="field full"><label>Rechte als JSON</label><textarea name="permissions_json">[]</textarea></div>
+            </div>
+            <div class="actions"><button class="primary" type="submit">Rolle speichern</button></div>
+          </form>
+          <form method="post" action="/ui/admin/roles/{selected_role.id if selected_role else ''}" class="panel" style="margin:16px 0 0 0; {'display:block;' if selected_role else 'display:none;'}">
+            <h3>Rolle bearbeiten</h3>
+            <p class="muted">Name, Beschreibung und Rechte-JSON lassen sich hier direkt anpassen.</p>
+            <div class="field-grid">
+              <div class="field"><label>Name</label><input type="text" name="name" value="{_escape(selected_role.name) if selected_role else ''}" required></div>
+              <div class="field full"><label>Beschreibung</label><textarea name="description">{_escape(selected_role.description or '') if selected_role else ''}</textarea></div>
+              <div class="field full"><label>Rechte als JSON</label><textarea name="permissions_json">{_escape(selected_role.permissions_json or '[]') if selected_role else '[]'}</textarea></div>
+            </div>
+            <div class="actions"><button class="primary" type="submit">Rolle aktualisieren</button></div>
+          </form>
+          <div class="stack" style="margin-top:16px;">{roles_html}</div>
+        </div>
+
+        <div style="{teams_section_style}">
+          <form method="post" action="/ui/admin/teams" class="panel" style="margin-bottom:0;">
+            <h3>Team anlegen</h3>
+            <p class="muted">Teams und Gruppen sind die nächste fachliche Schicht für Workflow-Zuständigkeiten.</p>
+            <div class="field-grid">
+              <div class="field"><label>Name</label><input type="text" name="name" required></div>
+              <div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div>
+              <div class="field full"><label>Mitglieder</label><div class="checkbox-group">{team_member_options}</div></div>
+            </div>
+            <div class="actions"><button class="primary" type="submit">Team speichern</button></div>
+          </form>
+          <form method="post" action="/ui/admin/teams/{selected_team.id if selected_team else ''}" class="panel" style="margin:16px 0 0 0; {'display:block;' if selected_team else 'display:none;'}">
+            <h3>Team bearbeiten</h3>
+            <p class="muted">Mitglieder und Beschreibung lassen sich hier direkt pflegen.</p>
+            <div class="field-grid">
+              <div class="field"><label>Name</label><input type="text" name="name" value="{_escape(selected_team.name) if selected_team else ''}" required></div>
+              <div class="field full"><label>Beschreibung</label><textarea name="description">{_escape(selected_team.description or '') if selected_team else ''}</textarea></div>
+              <div class="field full"><label>Mitglieder</label><div class="checkbox-group">{edit_team_member_options}</div></div>
+            </div>
+            <div class="actions"><button class="primary" type="submit">Team aktualisieren</button></div>
+          </form>
+          <div class="stack" style="margin-top:16px;">{teams_html}</div>
+        </div>
       </div>
     """

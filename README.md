@@ -5,6 +5,9 @@ Lightweight Enterprise Content Management with Full-Text Search.
 ## Features
 
 - 📄 Document upload and storage
+- 🧩 Admin-managed document/object definitions (Cabinets, Registers, Document Types, Metadata Fields)
+- 📝 Dynamic capture flow: upload document + structured metadata in one step
+- ✅ Server-side metadata validation driven by document type definitions
 - 🔍 Full-text search powered by PostgreSQL tsvector/tsquery
 - 📁 Version tracking
 - 🏷️ Metadata and tagging
@@ -52,10 +55,17 @@ python -m archiva.database init
 
 # Start server
 python -m archiva.main
+
+# In a second shell, start preview worker
+python -m archiva.preview_worker
+
+# Or start both together
+bash dev/start_archiva_dev.sh
 ```
 
 API available at `http://localhost:8000`
 Docs at `http://localhost:8000/docs`
+UI at `http://localhost:8000/ui`
 
 ## Configuration
 
@@ -87,11 +97,40 @@ search:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/v1/health` | Health check |
-| POST | `/api/v1/documents` | Upload a document |
+| GET | `/api/v1/cabinets` | List admin structure with nested registers/types |
+| POST | `/api/v1/cabinets` | Create cabinet |
+| POST | `/api/v1/registers` | Create register |
+| POST | `/api/v1/document-types` | Create document/object type |
+| GET | `/api/v1/document-types/{id}/layout` | Get generated form layout |
+| GET | `/api/v1/document-types/{id}/capture` | Get capture definition for intake UI |
+| POST | `/api/v1/documents` | Upload a document with optional `document_type_id` + JSON `metadata` |
 | GET | `/api/v1/documents` | List documents |
 | GET | `/api/v1/documents/{id}` | Get document by ID |
 | DELETE | `/api/v1/documents/{id}` | Delete document |
 | GET | `/api/v1/search?q=` | Full-text search |
+
+### First built-in UI
+
+There is now a first server-rendered UI at `/ui` with separated surfaces:
+
+- `/ui/admin` for structure, document types, and metadata model administration
+- `/ui/app` for document intake and daily ECM usage
+- `/ui/workflows` as placeholder for future object workflow handling
+
+The app intake UI renders dynamic metadata fields directly as form controls instead of a raw JSON textarea.
+
+### Combined capture flow
+
+API upload to `/api/v1/documents` still uses `multipart/form-data` with:
+
+- `file`: the binary upload
+- `document_type_id`: UUID of the admin-defined document/object type
+- `metadata`: JSON object as string, e.g. `{"invoice_number":"2026-001","amount":129.9}`
+- optional classic fields like `title`, `author`, `description`, `tags`
+
+The built-in UI at `/ui/app` now uses normal form fields for metadata and submits them as multipart form fields alongside the file upload. The server maps these form values back into the validated metadata object before saving.
+
+The backend validates the metadata against the configured `MetadataField` definitions before saving.
 
 ## License
 

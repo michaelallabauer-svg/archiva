@@ -45,6 +45,7 @@ class AppSettings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     debug: bool = False
+    md5_duplicate_check: bool = Field(default=True, description="Globale MD5-Duplikatprüfung beim Dokument-Upload")
 
 
 class Settings(BaseSettings):

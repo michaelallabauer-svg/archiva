@@ -4,10 +4,11 @@ Startpunkt: aktuell noch Postgres-basierter Fallback.
 Später wird diese Schicht auf OpenSearch umgestellt.
 """
 
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from archiva.metadata_validation import metadata_from_json
 from archiva.models import Document
-from archiva.ui import metadata_from_json
 
 
 def build_search_response(
@@ -36,7 +37,7 @@ def build_search_response(
                 continue
 
         metadata = metadata_from_json(document.metadata_json) or {}
-        haystack = " ".join(
+        fallback_haystack = " ".join(
             [
                 document.title or "",
                 document.name or "",
@@ -44,8 +45,22 @@ def build_search_response(
                 str(metadata),
             ]
         ).lower()
-        if normalized_q and normalized_q not in haystack:
-            continue
+        if normalized_q:
+            content_match = False
+            try:
+                content_match = bool(
+                    db.execute(
+                        select(Document.id).where(
+                            Document.id == document.id,
+                            text("content_vector @@ plainto_tsquery('english', :q)"),
+                        ),
+                        {"q": q},
+                    ).first()
+                )
+            except Exception:
+                content_match = False
+            if normalized_q not in fallback_haystack and not content_match:
+                continue
 
         hits.append(
             {

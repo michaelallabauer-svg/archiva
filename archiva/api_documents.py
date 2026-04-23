@@ -1,6 +1,9 @@
 """Document management routes for Archiva ECM."""
 
 import json
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -355,8 +358,51 @@ def _guess_doc_type(mime_type: Optional[str]) -> DocType:
 async def _extract_text(
     file: UploadFile, storage_path: Path, doc_type: DocType
 ) -> Optional[str]:
-    # TODO: Implement text extraction
-    # - PDF: pdfminer.six
-    # - DOCX: python-docx
-    # - Images: OCR (pytesseract)
+    if doc_type == DocType.PDF:
+        suffix = storage_path.suffix or ".pdf"
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                temp_path = Path(tmp.name)
+                await file.seek(0)
+                shutil.copyfileobj(file.file, tmp)
+            await file.seek(0)
+
+            try:
+                from pypdf import PdfReader
+            except Exception:
+                return None
+
+            reader = PdfReader(str(temp_path))
+            parts: list[str] = []
+            for page in reader.pages:
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    text = ""
+                if text.strip():
+                    parts.append(text.strip())
+            extracted = "\n\n".join(parts).strip()
+            if extracted:
+                return extracted
+
+            try:
+                pdftotext = shutil.which("pdftotext")
+                if pdftotext:
+                    result = subprocess.run(
+                        [pdftotext, str(temp_path), "-"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    fallback_text = (result.stdout or "").strip()
+                    if fallback_text:
+                        return fallback_text
+            except Exception:
+                pass
+            return None
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
     return None

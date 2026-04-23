@@ -51,6 +51,29 @@ class DisplayWidth(str, enum.Enum):
     QUARTER = "quarter"
 
 
+class UserAuthSource(str, enum.Enum):
+    """Identity source for admin/app users."""
+
+    LOCAL = "local"
+    ENTRA_ID = "entra_id"
+
+
+class UserStatus(str, enum.Enum):
+    """Lifecycle status for users."""
+
+    ACTIVE = "active"
+    INVITED = "invited"
+    DISABLED = "disabled"
+
+
+class AssignmentTargetType(str, enum.Enum):
+    """Supported assignment target kinds for workflow definitions and tasks."""
+
+    USER = "user"
+    ROLE = "role"
+    TEAM = "team"
+
+
 # --- ECM Hierarchy Models ---
 
 class CabinetType(Base):
@@ -231,6 +254,7 @@ class DocumentType(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     icon: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    md5_duplicate_check: Mapped[bool] = mapped_column(default=True, nullable=False)
     order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
@@ -343,6 +367,300 @@ class MetadataField(Base):
     )
 
 
+class Role(Base):
+    """Native role definition for Archiva admin/app access."""
+
+    __tablename__ = "roles"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_system: Mapped[bool] = mapped_column(default=False, nullable=False)
+    permissions_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    assignments: Mapped[list["UserRoleAssignment"]] = relationship(
+        "UserRoleAssignment", back_populates="role", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("ix_roles_name", "name"),)
+
+
+class User(Base):
+    """Native user record, later extensible with external identity providers."""
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    auth_source: Mapped[str] = mapped_column(String(50), nullable=False, default=UserAuthSource.LOCAL.value)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default=UserStatus.ACTIVE.value)
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    external_subject: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    external_tenant_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    role_assignments: Mapped[list["UserRoleAssignment"]] = relationship(
+        "UserRoleAssignment", back_populates="user", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_users_email", "email"),
+        Index("ix_users_status", "status"),
+        Index("ix_users_auth_source", "auth_source"),
+    )
+
+
+class UserRoleAssignment(Base):
+    """Role assignments between native users and roles."""
+
+    __tablename__ = "user_role_assignments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    role_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("roles.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    user: Mapped["User"] = relationship("User", back_populates="role_assignments")
+    role: Mapped["Role"] = relationship("Role", back_populates="assignments")
+
+    __table_args__ = (
+        Index("ix_user_role_assignments_user_id", "user_id"),
+        Index("ix_user_role_assignments_role_id", "role_id"),
+        Index("ix_user_role_assignments_unique", "user_id", "role_id", unique=True),
+    )
+
+
+class Team(Base):
+    """Native team/group for workflow assignments and shared responsibility."""
+
+    __tablename__ = "teams"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    memberships: Mapped[list["TeamMembership"]] = relationship(
+        "TeamMembership", back_populates="team", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("ix_teams_name", "name"),)
+
+
+class TeamMembership(Base):
+    """Membership relation between users and teams."""
+
+    __tablename__ = "team_memberships"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    team: Mapped["Team"] = relationship("Team", back_populates="memberships")
+    user: Mapped["User"] = relationship("User")
+
+    __table_args__ = (
+        Index("ix_team_memberships_team_id", "team_id"),
+        Index("ix_team_memberships_user_id", "user_id"),
+        Index("ix_team_memberships_unique", "team_id", "user_id", unique=True),
+    )
+
+
+class AssignmentTarget(Base):
+    """Generic assignment target abstraction over user, role, and team."""
+
+    __tablename__ = "assignment_targets"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    target_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    role_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("roles.id"), nullable=True
+    )
+    team_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id"), nullable=True
+    )
+    label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    user: Mapped[Optional["User"]] = relationship("User")
+    role: Mapped[Optional["Role"]] = relationship("Role")
+    team: Mapped[Optional["Team"]] = relationship("Team")
+
+    __table_args__ = (
+        Index("ix_assignment_targets_target_type", "target_type"),
+        Index("ix_assignment_targets_user_id", "user_id"),
+        Index("ix_assignment_targets_role_id", "role_id"),
+        Index("ix_assignment_targets_team_id", "team_id"),
+    )
+
+
+class WorkflowDefinition(Base):
+    """Definition of a reusable workflow inside the workflow designer."""
+
+    __tablename__ = "workflow_definitions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    steps: Mapped[list["WorkflowStepDefinition"]] = relationship(
+        "WorkflowStepDefinition", back_populates="workflow_definition", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_workflow_definitions_name", "name"),
+        Index("ix_workflow_definitions_is_active", "is_active"),
+    )
+
+
+class WorkflowStepDefinition(Base):
+    """Single step inside a workflow definition."""
+
+    __tablename__ = "workflow_step_definitions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    workflow_definition_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_definitions.id"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    step_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    assignment_target_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assignment_targets.id"), nullable=True
+    )
+    due_in_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    workflow_definition: Mapped["WorkflowDefinition"] = relationship("WorkflowDefinition", back_populates="steps")
+    assignment_target: Mapped[Optional["AssignmentTarget"]] = relationship("AssignmentTarget")
+    outgoing_transitions: Mapped[list["WorkflowTransitionDefinition"]] = relationship(
+        "WorkflowTransitionDefinition",
+        foreign_keys="WorkflowTransitionDefinition.from_step_id",
+        back_populates="from_step",
+        cascade="all, delete-orphan",
+    )
+    incoming_transitions: Mapped[list["WorkflowTransitionDefinition"]] = relationship(
+        "WorkflowTransitionDefinition",
+        foreign_keys="WorkflowTransitionDefinition.to_step_id",
+        back_populates="to_step",
+    )
+
+    __table_args__ = (
+        Index("ix_workflow_step_definitions_workflow_definition_id", "workflow_definition_id"),
+        Index("ix_workflow_step_definitions_step_key", "step_key"),
+        Index("ix_workflow_step_definitions_order", "order"),
+    )
+
+
+class WorkflowTransitionDefinition(Base):
+    """Directed transition between two workflow steps."""
+
+    __tablename__ = "workflow_transition_definitions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    workflow_definition_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_definitions.id"), nullable=False
+    )
+    from_step_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_step_definitions.id"), nullable=False
+    )
+    to_step_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_step_definitions.id"), nullable=False
+    )
+    label: Mapped[str] = mapped_column(String(255), nullable=False, default="Weiter")
+    is_default: Mapped[bool] = mapped_column(default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    from_step: Mapped["WorkflowStepDefinition"] = relationship(
+        "WorkflowStepDefinition", foreign_keys=[from_step_id], back_populates="outgoing_transitions"
+    )
+    to_step: Mapped["WorkflowStepDefinition"] = relationship(
+        "WorkflowStepDefinition", foreign_keys=[to_step_id], back_populates="incoming_transitions"
+    )
+
+    __table_args__ = (
+        Index("ix_workflow_transition_definitions_workflow_definition_id", "workflow_definition_id"),
+        Index("ix_workflow_transition_definitions_from_step_id", "from_step_id"),
+        Index("ix_workflow_transition_definitions_to_step_id", "to_step_id"),
+    )
+
+
 # --- Document Models ---
 
 class DocType(str, enum.Enum):
@@ -401,8 +719,12 @@ class Document(Base):
     index_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     content_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     index_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    index_engine: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    index_engine: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    extracted_text_preview: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    extracted_text_length: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     index_ocr_used: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+    file_hash: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     # Relationships
     document_type: Mapped[Optional["DocumentType"]] = relationship(
