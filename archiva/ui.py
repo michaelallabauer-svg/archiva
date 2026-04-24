@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -1188,6 +1189,142 @@ async def ui_workflow_designer_create_workflow(
     db.commit()
     db.refresh(workflow)
     return RedirectResponse(url=f"/ui/workflow-designer?selected_workflow_id={workflow.id}&message={quote_plus(f'Workflow {workflow.name} angelegt')}#designer", status_code=303)
+
+
+def _workflow_designer_base_name(name: str) -> str:
+    normalized = " ".join((name or "").strip().split())
+    if not normalized:
+        return "Workflow"
+    return re.sub(r"\s*\(v\d+\)$", "", normalized).strip() or normalized
+
+
+def _workflow_designer_unique_name(db: Session, preferred_name: str) -> str:
+    candidate = " ".join((preferred_name or "Workflow").strip().split()) or "Workflow"
+    if not db.query(WorkflowDefinition).where(WorkflowDefinition.name == candidate).first():
+        return candidate
+    counter = 2
+    while True:
+        numbered_candidate = f"{candidate} ({counter})"
+        if not db.query(WorkflowDefinition).where(WorkflowDefinition.name == numbered_candidate).first():
+            return numbered_candidate
+        counter += 1
+
+
+def _clone_workflow_definition(
+    *,
+    db: Session,
+    source_workflow: WorkflowDefinition,
+    new_name: str,
+    new_version: int,
+    is_active: bool,
+) -> WorkflowDefinition:
+    cloned_workflow = WorkflowDefinition(
+        name=new_name,
+        description=source_workflow.description,
+        is_active=is_active,
+        version=new_version,
+    )
+    db.add(cloned_workflow)
+    db.flush()
+
+    step_id_mapping: dict[UUID, WorkflowStepDefinition] = {}
+    sorted_source_steps = sorted(source_workflow.steps, key=lambda item: (item.order, item.name.lower(), str(item.id)))
+    for source_step in sorted_source_steps:
+        cloned_step = WorkflowStepDefinition(
+            workflow_definition_id=cloned_workflow.id,
+            name=source_step.name,
+            description=source_step.description,
+            step_key=source_step.step_key,
+            order=source_step.order,
+            assignment_target_id=source_step.assignment_target_id,
+            due_in_days=source_step.due_in_days,
+        )
+        db.add(cloned_step)
+        db.flush()
+        step_id_mapping[source_step.id] = cloned_step
+
+    source_transitions = sorted(
+        [transition for step in sorted_source_steps for transition in step.outgoing_transitions],
+        key=lambda item: (0 if item.is_default else 1, item.label.lower(), str(item.id)),
+    )
+    for source_transition in source_transitions:
+        cloned_from_step = step_id_mapping.get(source_transition.from_step_id)
+        cloned_to_step = step_id_mapping.get(source_transition.to_step_id)
+        if not cloned_from_step or not cloned_to_step:
+            continue
+        db.add(
+            WorkflowTransitionDefinition(
+                workflow_definition_id=cloned_workflow.id,
+                from_step_id=cloned_from_step.id,
+                to_step_id=cloned_to_step.id,
+                label=source_transition.label,
+                is_default=source_transition.is_default,
+            )
+        )
+
+    db.commit()
+    db.refresh(cloned_workflow)
+    return cloned_workflow
+
+
+@router.post("/workflow-designer/workflows/{workflow_id}/duplicate")
+async def ui_workflow_designer_duplicate_workflow(
+    workflow_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.id == workflow_id).first()
+    if not workflow:
+        return _workflow_designer_redirect(message="Workflow nicht gefunden")
+
+    duplicate_name = _workflow_designer_unique_name(
+        db,
+        f"{_workflow_designer_base_name(workflow.name)} (Kopie)",
+    )
+    duplicate_workflow = _clone_workflow_definition(
+        db=db,
+        source_workflow=workflow,
+        new_name=duplicate_name,
+        new_version=workflow.version,
+        is_active=False,
+    )
+    return _workflow_designer_redirect(
+        workflow_id=duplicate_workflow.id,
+        message=f"Workflow {workflow.name} dupliziert als {duplicate_workflow.name}",
+    )
+
+
+@router.post("/workflow-designer/workflows/{workflow_id}/version")
+async def ui_workflow_designer_create_workflow_version(
+    workflow_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.id == workflow_id).first()
+    if not workflow:
+        return _workflow_designer_redirect(message="Workflow nicht gefunden")
+
+    base_name = _workflow_designer_base_name(workflow.name)
+    related_workflows = db.query(WorkflowDefinition).order_by(WorkflowDefinition.created_at).all()
+    max_version = max(
+        (
+            candidate.version
+            for candidate in related_workflows
+            if _workflow_designer_base_name(candidate.name) == base_name
+        ),
+        default=workflow.version or 1,
+    )
+    next_version = max_version + 1
+    version_name = _workflow_designer_unique_name(db, f"{base_name} (v{next_version})")
+    versioned_workflow = _clone_workflow_definition(
+        db=db,
+        source_workflow=workflow,
+        new_name=version_name,
+        new_version=next_version,
+        is_active=False,
+    )
+    return _workflow_designer_redirect(
+        workflow_id=versioned_workflow.id,
+        message=f"Neue Workflow-Version {versioned_workflow.name} angelegt",
+    )
 
 
 @router.post("/workflow-designer/steps")
@@ -3704,8 +3841,9 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     workflow_cards: list[str] = []
     for workflow in workflows:
         active_badge = "aktiv" if workflow.is_active else "inaktiv"
+        selected_class = " is-selected" if selected_workflow and workflow.id == selected_workflow.id else ""
         workflow_cards.append(
-            f"<a class='workflow-card' href='/ui/workflow-designer?selected_workflow_id={workflow.id}#designer'><strong>{_escape(workflow.name)}</strong><div class='muted'>{_escape(workflow.description or 'Keine Beschreibung')}</div><div class='pillbar' style='margin-top:10px;'><span class='pill'>{active_badge}</span><span class='pill'>v{workflow.version}</span><span class='pill'>{len(workflow.steps)} Schritte</span></div></a>"
+            f"<a class='workflow-card{selected_class}' href='/ui/workflow-designer?selected_workflow_id={workflow.id}#designer'><strong>{_escape(workflow.name)}</strong><div class='muted'>{_escape(workflow.description or 'Keine Beschreibung')}</div><div class='pillbar' style='margin-top:10px;'><span class='pill'>{active_badge}</span><span class='pill'>v{workflow.version}</span><span class='pill'>{len(workflow.steps)} Schritte</span></div></a>"
         )
     workflows_html = "".join(workflow_cards) or "<div class='muted'>Noch keine Workflows definiert.</div>"
 
@@ -3738,22 +3876,127 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     sorted_steps: list[WorkflowStepDefinition] = []
     step_cards: list[str] = []
     workflow_graph_nodes: list[str] = []
+    workflow_graph_insight_cards: list[str] = []
+    selected_workflow_summary_html = ""
     if selected_workflow:
         sorted_steps = sorted(selected_workflow.steps, key=lambda item: (item.order, item.name.lower()))
+        ordered_step_ids = [step.id for step in sorted_steps]
+        step_position_by_id = {step_id: index for index, step_id in enumerate(ordered_step_ids)}
+        all_transitions = sorted(
+            [transition for step in sorted_steps for transition in step.outgoing_transitions],
+            key=lambda item: (step_position_by_id.get(item.from_step_id, 0), item.label.lower(), str(item.id)),
+        )
+        outgoing_by_step_id: dict[UUID, list[WorkflowTransitionDefinition]] = {step.id: [] for step in sorted_steps}
+        for transition in all_transitions:
+            outgoing_by_step_id.setdefault(transition.from_step_id, []).append(transition)
+
+        def has_path(start_step_id: UUID, target_step_id: UUID, visited: set[UUID] | None = None) -> bool:
+            if start_step_id == target_step_id:
+                return True
+            seen = visited or set()
+            if start_step_id in seen:
+                return False
+            seen.add(start_step_id)
+            for candidate_transition in outgoing_by_step_id.get(start_step_id, []):
+                if has_path(candidate_transition.to_step_id, target_step_id, seen.copy()):
+                    return True
+            return False
+
+        transition_meta_by_id: dict[UUID, dict[str, bool]] = {}
+        for transition in all_transitions:
+            from_position = step_position_by_id.get(transition.from_step_id, 0)
+            to_position = step_position_by_id.get(transition.to_step_id, 0)
+            is_backward = to_position < from_position
+            is_cycle = has_path(transition.to_step_id, transition.from_step_id)
+            transition_meta_by_id[transition.id] = {
+                "is_backward": is_backward,
+                "is_cycle": is_cycle,
+            }
+
+        backward_transitions = [transition for transition in all_transitions if transition_meta_by_id.get(transition.id, {}).get("is_backward")]
+        cycle_transitions = [transition for transition in all_transitions if transition_meta_by_id.get(transition.id, {}).get("is_cycle")]
+        branching_steps = [step for step in sorted_steps if len(step.outgoing_transitions) > 1]
+        selected_workflow_summary_html = (
+            f"<div class='pillbar' style='margin-top:16px;'>"
+            f"<span class='pill'>v{selected_workflow.version}</span>"
+            f"<span class='pill'>{len(sorted_steps)} Schritte</span>"
+            f"<span class='pill'>{len(all_transitions)} Transitionen</span>"
+            f"<span class='pill'>{len(backward_transitions)} Rücksprünge</span>"
+            f"<span class='pill'>{len(cycle_transitions)} Schleifenpfade</span>"
+            f"</div>"
+        )
+
         for index, step in enumerate(sorted_steps, start=1):
             assignment_label = assignment_label_for_target(step.assignment_target)
             selected_class = " is-selected" if selected_step and selected_step.id == step.id else ""
-            workflow_graph_nodes.append(
-                f"<div class='workflow-graph-node{selected_class}' draggable='true' data-step-id='{step.id}'><div class='workflow-graph-order'>{step.order}</div><strong><a href='/ui/workflow-designer?selected_workflow_id={selected_workflow.id}&selected_step_id={step.id}#designer'>{_escape(step.name)}</a></strong><div class='muted' style='font-size:.92rem;'>{_escape(assignment_label)}</div><div class='workflow-graph-key'>{_escape(step.step_key)}</div></div>"
+            step_in_cycle = any(
+                transition.id in transition_meta_by_id and transition_meta_by_id[transition.id].get("is_cycle")
+                for transition in [*step.outgoing_transitions, *step.incoming_transitions]
             )
+            step_has_backward_outgoing = any(
+                transition_meta_by_id.get(transition.id, {}).get("is_backward")
+                for transition in step.outgoing_transitions
+            )
+            node_badges: list[str] = []
+            if step_has_backward_outgoing:
+                node_badges.append("↩ Rücksprung")
+            if step_in_cycle:
+                node_badges.append("⟳ Schleife")
+            node_badges_html = "".join(
+                f"<div class='workflow-mini-flag'>{_escape(badge)}</div>"
+                for badge in node_badges
+            )
+            workflow_graph_nodes.append(
+                f"<div class='workflow-graph-node{selected_class}' draggable='true' data-step-id='{step.id}'><div class='workflow-graph-order'>{step.order}</div><strong><a href='/ui/workflow-designer?selected_workflow_id={selected_workflow.id}&selected_step_id={step.id}#designer'>{_escape(step.name)}</a></strong><div class='muted' style='font-size:.92rem;'>{_escape(assignment_label)}</div><div class='workflow-graph-key'>{_escape(step.step_key)}</div>{node_badges_html}</div>"
+            )
+            incoming_count = len(step.incoming_transitions)
             transition_count = len(step.outgoing_transitions)
             default_transition_count = sum(1 for transition in step.outgoing_transitions if transition.is_default)
+            backward_transition_count = sum(1 for transition in step.outgoing_transitions if transition_meta_by_id.get(transition.id, {}).get("is_backward"))
+            cycle_transition_count = sum(1 for transition in step.outgoing_transitions if transition_meta_by_id.get(transition.id, {}).get("is_cycle"))
             transition_summary = f"{transition_count} Transitionen"
             if default_transition_count:
                 transition_summary += f" · {default_transition_count} Standard"
-            delete_hint = 'Schritt erst löschen, wenn alle eingehenden und ausgehenden Transitionen entfernt sind.' if transition_count else 'Schritt kann gelöscht werden.'
+            flow_summary_parts: list[str] = [f"{incoming_count} eingehend"]
+            if backward_transition_count:
+                flow_summary_parts.append(f"{backward_transition_count} Rücksprung")
+            if cycle_transition_count:
+                flow_summary_parts.append(f"{cycle_transition_count} Schleifenpfad")
+            delete_hint = 'Schritt erst löschen, wenn alle eingehenden und ausgehenden Transitionen entfernt sind.' if (incoming_count or transition_count) else 'Schritt kann gelöscht werden.'
+            transition_hint = 'Mehrere Ausgänge vorhanden.' if transition_count > 1 else ('Ein Standardpfad ist gesetzt.' if default_transition_count else 'Noch kein Standardpfad definiert.')
+            if backward_transition_count:
+                transition_hint += ' Rücksprünge sind sichtbar markiert.'
+            if cycle_transition_count:
+                transition_hint += ' Dieser Schritt ist Teil eines Schleifenpfads.'
+            flow_summary_html = "".join(
+                f"<span class='pill'>{_escape(part)}</span>"
+                for part in flow_summary_parts
+            )
             step_cards.append(
-                f"<div class='panel' style='margin-bottom:0;'><div class='eyebrow'>Schritt {index}</div><h3 style='margin:6px 0 6px;'><a href='/ui/workflow-designer?selected_workflow_id={selected_workflow.id}&selected_step_id={step.id}#designer'>{_escape(step.name)}</a></h3><p class='muted' style='margin:0 0 12px 0;'>{_escape(step.description or 'Keine Beschreibung')}</p><div class='pillbar'><span class='pill'>Key: {_escape(step.step_key)}</span><span class='pill'>Reihenfolge: {step.order}</span><span class='pill'>Zuweisung: {_escape(assignment_label)}</span><span class='pill'>Frist: {step.due_in_days if step.due_in_days is not None else '—'} Tage</span></div><div class='workflow-step-summary'><span class='pill'>{_escape(transition_summary)}</span></div><div class='workflow-transition-hint'>{'Mehrere Ausgänge vorhanden.' if transition_count > 1 else ('Ein Standardpfad ist gesetzt.' if default_transition_count else 'Noch kein Standardpfad definiert.')} { _escape(delete_hint) }</div><div class='actions'><form method='post' action='/ui/workflow-designer/steps/{step.id}/move'><input type='hidden' name='direction' value='up'><button type='submit'>↑ Hoch</button></form><form method='post' action='/ui/workflow-designer/steps/{step.id}/move'><input type='hidden' name='direction' value='down'><button type='submit'>↓ Runter</button></form><form method='post' action='/ui/workflow-designer/steps/{step.id}/delete' onsubmit=\"return confirm('Schritt wirklich löschen?');\"><button type='submit'>Schritt löschen</button></form></div></div>"
+                f"<div class='panel' style='margin-bottom:0;'><div class='eyebrow'>Schritt {index}</div><h3 style='margin:6px 0 6px;'><a href='/ui/workflow-designer?selected_workflow_id={selected_workflow.id}&selected_step_id={step.id}#designer'>{_escape(step.name)}</a></h3><p class='muted' style='margin:0 0 12px 0;'>{_escape(step.description or 'Keine Beschreibung')}</p><div class='pillbar'><span class='pill'>Key: {_escape(step.step_key)}</span><span class='pill'>Reihenfolge: {step.order}</span><span class='pill'>Zuweisung: {_escape(assignment_label)}</span><span class='pill'>Frist: {step.due_in_days if step.due_in_days is not None else '—'} Tage</span></div><div class='workflow-step-summary'><span class='pill'>{_escape(transition_summary)}</span>{flow_summary_html}</div><div class='workflow-transition-hint'>{_escape(transition_hint)} { _escape(delete_hint) }</div><div class='actions'><form method='post' action='/ui/workflow-designer/steps/{step.id}/move'><input type='hidden' name='direction' value='up'><button type='submit'>↑ Hoch</button></form><form method='post' action='/ui/workflow-designer/steps/{step.id}/move'><input type='hidden' name='direction' value='down'><button type='submit'>↓ Runter</button></form><form method='post' action='/ui/workflow-designer/steps/{step.id}/delete' onsubmit=\"return confirm('Schritt wirklich löschen?');\"><button type='submit'>Schritt löschen</button></form></div></div>"
+            )
+
+        if all_transitions:
+            for transition in all_transitions:
+                transition_meta = transition_meta_by_id.get(transition.id, {})
+                badges: list[str] = []
+                if transition.is_default:
+                    badges.append("Standard")
+                if transition_meta.get("is_backward"):
+                    badges.append("Rücksprung")
+                if transition_meta.get("is_cycle"):
+                    badges.append("Schleife")
+                badge_html = "".join(f"<span class='pill'>{_escape(badge)}</span>" for badge in badges)
+                badge_html = badge_html or "<span class='pill'>Vorwärtspfad</span>"
+                workflow_graph_insight_cards.append(
+                    f"<div class='workflow-insight-card'><strong>{_escape(transition.from_step.name if transition.from_step else 'Unbekannt')}</strong><span class='workflow-insight-arrow'>→</span><strong>{_escape(transition.to_step.name if transition.to_step else 'Unbekannt')}</strong><div class='muted' style='margin-top:8px;'>{_escape(transition.label or 'Weiter')}</div><div class='pillbar' style='margin-top:10px;'>{badge_html}</div></div>"
+                )
+        else:
+            workflow_graph_insight_cards.append("<div class='workflow-insight-card'><strong>Noch keine Transitionen</strong><div class='muted' style='margin-top:8px;'>Rücksprünge und Schleifen werden hier sichtbar, sobald echte Übergänge definiert sind.</div></div>")
+
+        if branching_steps:
+            workflow_graph_insight_cards.append(
+                f"<div class='workflow-insight-card'><strong>Verzweigungen</strong><div class='muted' style='margin-top:8px;'>{', '.join(_escape(step.name) for step in branching_steps)} {'hat' if len(branching_steps) == 1 else 'haben'} mehrere Ausgänge.</div></div>"
             )
 
     workflow_graph_html = "<div class='workflow-graph-lane'><div class='workflow-graph-empty muted'>Noch keine Schritte für die grafische Ansicht vorhanden.</div></div>"
@@ -3767,6 +4010,7 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
             "<div class='workflow-graph-lane'><div class='workflow-graph-start'>Start</div><div class='workflow-graph-arrow'>→</div><div class='workflow-graph-track'><div class='workflow-graph-sequence' id='workflow-graph-sequence'>"
             + "<div class='workflow-graph-connector'></div>".join(workflow_graph_nodes)
             + "</div></div><div class='workflow-graph-arrow'>→</div><div class='workflow-graph-end'>Ende</div></div><div class='actions' style='margin-top:12px;'><button type='submit'>Grafische Reihenfolge speichern</button></div></form>"
+            + f"<div class='workflow-insight-grid' style='margin-top:16px;'>{''.join(workflow_graph_insight_cards)}</div>"
         )
 
     transition_target_options_rows: list[str] = []
@@ -3796,7 +4040,15 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
             edit_transition_cards: list[str] = []
             for transition in sorted_transitions:
                 target_label = transition.to_step.name if transition.to_step else "Unbekannt"
-                default_badge = " <span class='pill'>Standard</span>" if transition.is_default else ""
+                transition_meta = transition_meta_by_id.get(transition.id, {}) if selected_workflow else {}
+                badge_parts: list[str] = []
+                if transition.is_default:
+                    badge_parts.append("Standard")
+                if transition_meta.get("is_backward"):
+                    badge_parts.append("Rücksprung")
+                if transition_meta.get("is_cycle"):
+                    badge_parts.append("Schleife")
+                default_badge = "".join(f" <span class='pill'>{_escape(part)}</span>" for part in badge_parts)
                 selected_target_options_rows: list[str] = []
                 for candidate_step in sorted_steps:
                     if candidate_step.id == selected_step.id:
@@ -3814,6 +4066,7 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
                     f"<button type='submit' onclick=\"return confirm('Transition wirklich löschen?');\">Löschen</button>"
                     f"</form>"
                     f"</div>"
+                    f"<div class='workflow-transition-hint'>{_escape('Rücksprung auf einen früheren Schritt.' if transition_meta.get('is_backward') else 'Vorwärtspfad im Workflow.')} {_escape('Teil einer Schleife im Workflow.' if transition_meta.get('is_cycle') else '')}</div>"
                     f"<form method='post' action='/ui/workflow-designer/transitions/{transition.id}' style='margin-top:14px;'>"
                     f"<div class='field-grid'>"
                     f"<div class='field'><label>Label</label><input type='text' name='label' value='{_escape(transition.label)}' required></div>"
@@ -3855,6 +4108,7 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     .grid {{ display:grid; grid-template-columns: 340px minmax(0, 1fr); gap:20px; align-items:start; }}
     .stack {{ display:grid; gap:16px; }}
     .workflow-card {{ display:block; padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); color:#eef2ff; }}
+    .workflow-card.is-selected {{ border-color:#4dd4ff; box-shadow: 0 0 0 1px rgba(77,212,255,0.45), 0 14px 32px rgba(77,212,255,0.14); }}
     .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
     .field {{ display:grid; gap:6px; }}
     .field.full {{ grid-column:1 / -1; }}
@@ -3872,12 +4126,16 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     .workflow-graph-node.is-selected {{ border-color:#4dd4ff; box-shadow: 0 0 0 1px rgba(77,212,255,0.55), 0 16px 36px rgba(77,212,255,0.16); }}
     .workflow-graph-order {{ display:inline-flex; padding:4px 10px; border-radius:999px; background:rgba(77,212,255,0.12); color:#4dd4ff; font-size:.84rem; margin-bottom:10px; }}
     .workflow-graph-key {{ margin-top:12px; color:#a8b2d1; font-size:.84rem; }}
+    .workflow-mini-flag {{ margin-top:8px; display:inline-flex; padding:4px 10px; border-radius:999px; background:rgba(255,255,255,0.06); border:1px solid rgba(77,212,255,0.10); color:#eef2ff; font-size:.78rem; }}
     .workflow-graph-connector {{ width:54px; height:2px; background:linear-gradient(90deg, rgba(77,212,255,0.30), rgba(77,212,255,0.85)); margin:0 10px; border-radius:999px; }}
     .workflow-graph-start, .workflow-graph-end {{ padding:10px 14px; border-radius:999px; border:1px solid rgba(77,212,255,0.18); background:rgba(255,255,255,0.03); color:#eef2ff; white-space:nowrap; }}
     .workflow-graph-arrow {{ color:#4dd4ff; font-size:1.2rem; }}
     .workflow-graph-empty {{ padding:8px 0; }}
     .workflow-step-summary {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
     .workflow-transition-hint {{ margin-top:10px; font-size:.88rem; color:#a8b2d1; }}
+    .workflow-insight-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }}
+    .workflow-insight-card {{ padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); }}
+    .workflow-insight-arrow {{ color:#4dd4ff; padding:0 8px; }}
   </style>
 </head>
 <body>
@@ -3918,17 +4176,28 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
       <div class=\"stack\">
         <div class=\"panel\">
           <h2 style=\"margin-top:0;\">Designer</h2>
-          <p class=\"muted\">Schritte werden aktuell über ihre Reihenfolge verknüpft. Die visuelle Kette ist also bewusst einfach: Schritt 10, 20, 30. Zuständigkeiten laufen bereits über Assignment Targets. Diese grafische Ansicht sitzt absichtlich direkt auf dem bestehenden Modell und ist der erste Schritt in Richtung visuellem Workflow-Editor.</p>
+          <p class=\"muted\">Die obere Kette zeigt weiter die Reihenfolge der Schritte. Darunter werden echte Transitionen, Rücksprünge und Schleifen separat sichtbar gemacht, damit der Workflow trotz linearer Grunddarstellung verständlich bleibt.</p>
           <div class=\"pillbar\">
             <span class=\"pill\">Verknüpfung: Reihenfolge</span>
+            <span class=\"pill\">Rücksprünge sichtbar</span>
+            <span class=\"pill\">Schleifen verständlich</span>
             <span class=\"pill\">Identität: Assignment Target</span>
-            <span class=\"pill\">Grafische Ansicht v1</span>
+            <span class=\"pill\">Grafische Ansicht v2</span>
           </div>
           <div style=\"margin-top:18px;\">{workflow_graph_html}</div>
         </div>
         <div class=\"panel\">
           <h2 style=\"margin-top:0;\">{_escape(selected_workflow.name) if selected_workflow else 'Noch kein Workflow ausgewählt'}</h2>
           <p class=\"muted\">{_escape(selected_workflow.description or 'Wähle links einen Workflow oder lege einen neuen an.') if selected_workflow else 'Ein Workflow sammelt definierte Schritte mit Reihenfolge, Zuständigkeit und Frist.'}</p>
+          {selected_workflow_summary_html}
+          <div class=\"actions\" style=\"{'display:flex;' if selected_workflow else 'display:none;'}\">
+            <form method=\"post\" action=\"/ui/workflow-designer/workflows/{selected_workflow.id if selected_workflow else ''}/duplicate\" style=\"margin:0;\">
+              <button type=\"submit\">Workflow duplizieren</button>
+            </form>
+            <form method=\"post\" action=\"/ui/workflow-designer/workflows/{selected_workflow.id if selected_workflow else ''}/version\" style=\"margin:0;\">
+              <button type=\"submit\">Neue Version anlegen</button>
+            </form>
+          </div>
           <div class=\"stack\">{step_cards_html}</div>
         </div>
         <form method=\"post\" action=\"/ui/workflow-designer/steps\" class=\"panel\" style=\"{'display:block;' if selected_workflow else 'display:none;'}\">

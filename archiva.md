@@ -96,6 +96,14 @@
 ### Empfohlene nächsten Schritte
 1. Archiva-Hauptprozess auf Port `8000` einmal sauber mit aktuellem Code neu starten, damit die neue Step-Delete-Route auch in der produktiven lokalen Instanz aktiv ist.
 2. Danach kurzer Gegencheck direkt auf `:8000`, ob die Route jetzt denselben grünen Runtime-Stand hat.
-3. Nächster sinnvoller Feature-Schritt danach:
-   - optional visuelle Andeutung mehrerer Ausgänge in der Grafik
-   - oder Workflow-Versionierung / Duplizieren
+3. Danach umgesetzt:
+   - Rücksprünge/Schleifen werden im Workflow Designer jetzt sichtbar und verständlich markiert
+   - Workflow kann jetzt dupliziert werden
+   - neue Workflow-Version kann jetzt aus bestehendem Workflow erzeugt werden
+4. Verifizierter Stand dieses Ausbaus:
+   - frische Runtime-Instanz zeigte UI-Hinweise für Rücksprünge/Schleifen sowie Buttons für Duplizieren/Versionierung
+   - `POST /workflow-designer/workflows/{workflow_id}/duplicate` funktioniert und kopiert Schritte + Transitionen
+   - `POST /workflow-designer/workflows/{workflow_id}/version` funktioniert und erzeugt eine neue Version mit kopierten Schritten + Transitionen
+   - geprüft mit Testworkflow inklusive Rücksprung `B -> A`; Ergebnis: Original + Kopie + `v2` jeweils mit 2 Schritten und 2 Transitionen
+5. Offener Hinweis:
+   - falls die Hauptinstanz auf `:8000` noch ohne Neustart läuft, braucht sie einen Archiva-Neustart, damit die neuen Duplicate-/Version-Routen und UI-Markierungen dort live sind
