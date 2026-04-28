@@ -16,3 +16,6 @@ storage:
 search:
   max_results: 100
   highlight_fragment_size: 150
+  engine: "opensearch"
+  opensearch_url: "http://localhost:9200"
+  index_name: "archiva-documents-v1"

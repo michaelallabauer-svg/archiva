@@ -8,8 +8,9 @@ venv/
 env/
 .env
 
-# Data and uploads
+# Data, uploads and local config
 data/
+config.yaml
 *.db
 *.sqlite
 

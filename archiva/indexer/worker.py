@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import UploadFile
-
-from archiva.api_documents import _extract_text
 from archiva.config import load_settings
 from archiva.database import create_tables, get_session, init_db
+from archiva.indexer.extractor import extract_text_for_indexing
 from archiva.indexer.opensearch_client import OpenSearchClient
-from archiva.models import DocType, Document, IndexJob
+from archiva.models import Document, IndexJob
 from archiva.search_legacy import update_document_vector
 from archiva.storage import StorageManager
 
@@ -82,25 +79,32 @@ def process_pending_index_jobs(storage: StorageManager, client: OpenSearchClient
                 if not full_path.exists():
                     raise FileNotFoundError("Stored file not found")
 
-                doc_type = document.doc_type if isinstance(document.doc_type, DocType) else DocType(str(document.doc_type))
-                with full_path.open("rb") as source_file:
-                    upload = UploadFile(filename=document.name, file=source_file)
-                    upload.headers = None
-                    fulltext = asyncio.run(_extract_text(upload, Path(document.storage_path), doc_type)) or ""
+                extraction_result = extract_text_for_indexing(str(full_path), document.mime_type)
+                if isinstance(extraction_result, tuple):
+                    fulltext, used_ocr, extraction_engine = extraction_result
+                else:
+                    fulltext, used_ocr, extraction_engine = extraction_result or "", False, None
 
                 if fulltext:
                     update_document_vector(db, document.id, fulltext)
                 document.extracted_text_preview = (fulltext or "")[:4000] or None
                 document.extracted_text_length = len(fulltext or "")
+                document.index_ocr_used = bool(used_ocr)
 
                 result = client.index_document(_search_document_payload(document, fulltext))
-                if not result.get("ok"):
-                    raise RuntimeError(result.get("body") or "OpenSearch indexing failed")
 
                 document.index_status = "completed"
                 document.indexed_at = datetime.utcnow()
-                document.index_error = None if fulltext else "Kein extrahierbarer PDF-Text gefunden"
-                document.index_engine = "opensearch"
+                if result.get("ok"):
+                    document.index_error = None if fulltext else "Kein extrahierbarer Text gefunden"
+                    document.index_engine = "opensearch" if not extraction_engine else f"opensearch/{extraction_engine}"
+                else:
+                    # OpenSearch is optional during local development. The PostgreSQL
+                    # content_vector above is still updated, so mark the job completed
+                    # with a clear fallback note instead of leaving the queue pending.
+                    fallback_reason = result.get("body") or "OpenSearch nicht erreichbar"
+                    document.index_error = f"OpenSearch-Fallback: {fallback_reason}"
+                    document.index_engine = "postgres" if not extraction_engine else f"postgres/{extraction_engine}"
                 db.add(document)
 
                 job.status = "completed"

@@ -18,6 +18,8 @@ Lightweight Enterprise Content Management with Full-Text Search.
 
 - **Backend**: Python 3.11+, FastAPI
 - **Database**: PostgreSQL 16 with native full-text search
+- **Search**: OpenSearch 2.x with PostgreSQL fallback
+- **OCR / PDF extraction**: pypdf, Poppler (`pdftotext`), OCRmyPDF, Tesseract
 - **ORM**: SQLAlchemy 2.0
 - **Migrations**: Alembic
 
@@ -27,6 +29,9 @@ Lightweight Enterprise Content Management with Full-Text Search.
 
 - Python 3.11+
 - PostgreSQL 16
+- Docker Desktop, if OpenSearch should run locally via `docker compose`
+- Optional but recommended OCR/PDF tooling:
+  - macOS: `brew install poppler tesseract tesseract-lang ocrmypdf`
 - GitHub CLI (for cloning/contributing)
 
 ### Setup
@@ -43,6 +48,9 @@ source venv/bin/activate
 # Install dependencies
 pip install -e ".[dev]"
 
+# Optional but recommended: start OpenSearch for full search indexing
+docker compose up -d opensearch
+
 # Configure
 cp config.example.yaml config.yaml
 # Edit config.yaml with your database settings
@@ -55,13 +63,9 @@ python -m archiva.database init
 
 # Start server
 python -m archiva.main
-
-# In a second shell, start preview worker
-python -m archiva.preview_worker
-
-# Or start both together
-bash dev/start_archiva_dev.sh
 ```
+
+The app starts an internal queue worker for preview rendering and indexing. OpenSearch is used when available; if it is not reachable, Archiva still updates the PostgreSQL fallback index so local development does not get stuck with pending jobs.
 
 API available at `http://localhost:8000`
 Docs at `http://localhost:8000/docs`
@@ -90,7 +94,27 @@ storage:
 search:
   max_results: 100
   highlight_fragment_size: 150
+  engine: "opensearch"
+  opensearch_url: "http://localhost:9200"
+  index_name: "archiva-documents-v1"
 ```
+
+## OCR / PDF extraction
+
+Archiva extracts text for indexing in this order:
+
+1. PDF text layer via `pypdf`
+2. PDF text via Poppler `pdftotext`
+3. Scan/OCR fallback via `ocrmypdf`
+4. Image OCR via `tesseract`
+
+On macOS install the system tools with:
+
+```bash
+brew install poppler tesseract tesseract-lang ocrmypdf
+```
+
+`pypdf` is pinned in `pyproject.toml` as a Python dependency. See `archiva/OCR_SETUP.md` for more detail.
 
 ## API Endpoints
 

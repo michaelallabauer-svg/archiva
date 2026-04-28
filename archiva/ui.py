@@ -789,7 +789,7 @@ async def ui_app_home(
     document_types = db.query(DocumentType).order_by(DocumentType.order, DocumentType.name).all()
     selected_document_type = _selected_document_type(selected_document_type_id, db)
     _resolve_archive_node._all_documents = all_documents
-    selected_node = _resolve_archive_node(node_kind, node_id, cabinets, document_types)
+    selected_node = _resolve_archive_node(node_kind, node_id, cabinets, document_types, cabinet_types)
     if selected_document_type is None:
         selected_document_type = _selected_document_type_for_node(selected_node, document_types, cabinets)
     form_values = _parse_json_dict(form_data)
@@ -3075,7 +3075,6 @@ def _render_app_page(
         selected_label = selected_node.get("label", "aktuelles Element")
         success_actions = (
             "<div class='success-actions'>"
-            f"<a class='chip' href='#quick-create'>Weiter Struktur anlegen</a>"
             f"<a class='chip' href='#intake-form'>Dokument in {_escape(selected_label)} erfassen</a>"
             f"<a class='chip' href='/ui/admin'>Admin öffnen</a>"
             "</div>"
@@ -3118,7 +3117,7 @@ def _render_app_page(
     body {{ margin: 0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), radial-gradient(circle at top right, rgba(79,140,255,0.08), transparent 28%), var(--bg); color: var(--text); }}
     a {{ color: var(--accent-2); text-decoration: none; }} a:hover {{ text-decoration: none; }}
     .page {{ max-width: 1760px; margin: 0 auto; padding: 14px 16px; }}
-    .hero {{ display:grid; grid-template-columns: minmax(0, 1.2fr) minmax(220px, 0.55fr) 320px; gap:12px; align-items:stretch; margin-bottom:12px; }}
+    .hero {{ display:grid; grid-template-columns: minmax(0, 4fr) minmax(260px, 1fr); gap:12px; align-items:stretch; margin-bottom:12px; }}
     .hero-card, .hero-status {{ position:relative; overflow:hidden; }}
     .hero-card::before, .hero-status::before {{ content:""; position:absolute; inset:0; background: linear-gradient(135deg, rgba(79,140,255,0.14), rgba(77,212,255,0.06) 45%, transparent 75%); pointer-events:none; }}
     .hero-brand {{ display:flex; gap:12px; align-items:center; margin-bottom:10px; position:relative; z-index:1; }}
@@ -3143,7 +3142,9 @@ def _render_app_page(
     .banner {{ border-radius:18px; padding:14px 16px; margin-bottom:20px; border:1px solid rgba(77,212,255,0.16); }} .success-banner {{ background:rgba(110,231,183,.10); border-color:rgba(110,231,183,.26); color:#d9ffec; box-shadow:0 0 0 4px rgba(110,231,183,0.10); }} .error-banner {{ background:rgba(255,120,120,.12); border-color:rgba(255,120,120,.28); color:#ffd0d0; }}
     .success-actions {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }}
     .main-grid {{ display:grid; grid-template-columns: 1.15fr 0.85fr; gap:16px; align-items:start; }}
-    .workspace-grid {{ display:grid; grid-template-columns: 260px minmax(0, 1fr) 420px; gap:12px; align-items:start; }}
+    .workspace-grid {{ display:grid; grid-template-columns: minmax(280px, 320px) minmax(0, 1fr) minmax(320px, 380px); gap:14px; align-items:start; }}
+    .admin-detail-column {{ min-width:0; display:block !important; }}
+    .workspace-grid > .panel, .workspace-grid > div {{ min-width:0; }}
     .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
     .compact-indexdata .field-grid {{ grid-template-columns: 1fr; gap:10px; }}
     .compact-indexdata .panel {{ margin:0; padding:0; border:none; box-shadow:none; background:transparent; }}
@@ -3216,7 +3217,7 @@ def _render_app_page(
     .meta-display-row:last-child {{ border-bottom:none; }}
     .meta-display-label {{ display:block; color:#7dd3fc; font-weight:700; letter-spacing:.02em; font-size:.82rem; padding-top:4px; }}
     .meta-display-value {{ display:block; color:var(--text); background:rgba(255,255,255,0.04); border:1px solid rgba(77,212,255,0.12); border-radius:10px; padding:8px 10px; line-height:1.35; word-break:break-word; box-shadow:none; font-size:.92rem; }}
-    @media (max-width: 1100px) {{ .main-grid, .hero, .workspace-grid {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 1200px) {{ .main-grid, .hero, .workspace-grid {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
@@ -4654,6 +4655,7 @@ def _resolve_archive_node(
     node_id: str | None,
     cabinets: list[Cabinet],
     document_types: list[DocumentType],
+    cabinet_types: list[CabinetType] | None = None,
 ) -> dict[str, Any] | None:
     if not node_kind or not node_id:
         return None
@@ -4667,6 +4669,9 @@ def _resolve_archive_node(
                 if str(register.id) == node_id:
                     return {"kind": "register", "id": str(register.id), "label": register.name}
     elif node_kind == "cabinet_type":
+        for cabinet_type in cabinet_types or []:
+            if str(cabinet_type.id) == node_id:
+                return {"kind": "cabinet_type", "id": str(cabinet_type.id), "label": cabinet_type.name}
         seen: set[str] = set()
         for cabinet in cabinets:
             cabinet_type = getattr(cabinet, "cabinet_type", None)
@@ -5145,6 +5150,20 @@ def _render_context_panel(selected_node: dict[str, Any] | None, cabinets: list[C
         selected_value=selected_cabinet_type_id or None,
         include_blank="Bitte wählen",
     ) or '<option value="">Bitte erst Cabinettyp im Admin anlegen</option>'
+    selected_register_type_options: list[tuple[str, str]] = []
+    selected_cabinet_for_register = next((cab for cab in cabinets if str(cab.id) == selected_cabinet_id), None)
+    if selected_cabinet_for_register and selected_cabinet_for_register.cabinet_type:
+        selected_register_type_options = [
+            (str(register_type.id), register_type.name)
+            for register_type in sorted(selected_cabinet_for_register.cabinet_type.register_types, key=lambda item: item.order)
+        ]
+    else:
+        selected_register_type_options = [
+            (str(register_type.id), f"{cabinet_type.name} → {register_type.name}")
+            for cabinet_type in (cabinet_types or [])
+            for register_type in sorted(cabinet_type.register_types, key=lambda item: item.order)
+        ]
+    register_type_options = _option_list(selected_register_type_options, include_blank="Optional")
 
     accordion_open = " open" if selected_kind in {"cabinet", "register", "document_type"} else ""
     register_cta_label = (
@@ -5337,15 +5356,42 @@ def _render_object_overview(
     return overview_html, summary_html, f'<div class="recent-grid">{recent_html}</div>'
 
 
-def _admin_document_type_options(cabinets: list[Cabinet], selected_document_type: DocumentType | None) -> str:
+def _admin_document_type_options(
+    cabinet_types: list[CabinetType],
+    cabinets: list[Cabinet],
+    selected_document_type: DocumentType | None,
+) -> str:
     items: list[tuple[str, str]] = []
+    seen: set[str] = set()
     selected_value = str(selected_document_type.id) if selected_document_type else None
+
+    def add_option(doc_type: DocumentType, label: str) -> None:
+        value = str(doc_type.id)
+        if value in seen:
+            return
+        seen.add(value)
+        items.append((value, label))
+
+    # Definitionsebene: Dokumenttypen hängen häufig direkt an Cabinettypen
+    # oder Registertypen. Genau diese fehlten bisher im Dropdown.
+    for cabinet_type in sorted(cabinet_types, key=lambda item: item.order):
+        for doc_type in sorted(cabinet_type.document_type_definitions, key=lambda item: item.order):
+            add_option(doc_type, f"{cabinet_type.name} → {doc_type.name}")
+        for register_type in sorted(cabinet_type.register_types, key=lambda item: item.order):
+            for doc_type in sorted(register_type.document_type_definitions, key=lambda item: item.order):
+                add_option(doc_type, f"{cabinet_type.name} → {register_type.name} → {doc_type.name}")
+
+    # Legacy/Instanzebene weiterhin unterstützen.
     for cabinet in cabinets:
         for register in sorted(cabinet.registers, key=lambda item: item.order):
             for doc_type in sorted(register.document_types, key=lambda item: item.order):
-                items.append((str(doc_type.id), f"{cabinet.name} → {register.name} → {doc_type.name}"))
+                add_option(doc_type, f"{cabinet.name} → {register.name} → {doc_type.name}")
         for doc_type in sorted(cabinet.document_types, key=lambda item: item.order):
-            items.append((str(doc_type.id), f"{cabinet.name} → {doc_type.name}"))
+            add_option(doc_type, f"{cabinet.name} → {doc_type.name}")
+
+    if selected_document_type and selected_value not in seen:
+        add_option(selected_document_type, selected_document_type.name)
+
     return _option_list(items, selected_value=selected_value, include_blank="Bitte wählen")
 
 
@@ -5376,7 +5422,7 @@ def _render_admin_create_panel(
         include_blank="Bitte wählen",
     )
     cabinet_type_options = _option_list([(str(cabinet_type.id), cabinet_type.name) for cabinet_type in cabinet_types], include_blank="Bitte wählen")
-    document_type_field_options = _admin_document_type_options(cabinets, selected_document_type)
+    document_type_field_options = _admin_document_type_options(cabinet_types, cabinets, selected_document_type)
     field_type_options = "".join(f'<option value="{value}">{value}</option>' for value in ["text", "number", "currency", "date", "datetime", "selection", "multi_selection", "boolean", "long_text", "url", "email", "phone"])
     width_options = "".join(f'<option value="{value}">{value}</option>' for value in ["full", "half", "third", "quarter"])
 
@@ -5443,13 +5489,62 @@ def _render_admin_create_panel(
 
         <form method="post" action="/ui/admin/register-types" class="panel admin-create-section" id="admin-form-register-type" style="display:none; margin-bottom:0;"><h3>Registertyp anlegen</h3><p class="muted">Definiere erlaubte Registertypen unter einem Cabinettyp.</p><div class="field-grid"><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id" required>{cabinet_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Registertyp speichern</button></div></form>
 
-        <form method="post" action="/ui/admin/document-types" class="panel admin-create-section" id="admin-form-document-type" style="display:none; margin-bottom:0;"><h3>Dokumenttyp anlegen</h3><p class="muted">Definiere Objekttypen auf der Definitionsebene, entweder direkt unter einem Cabinettyp oder unter einem Registertyp.</p><div class="field-grid"><div class="field"><label>Zieltyp</label><select name="target_kind"><option value="cabinet_type">Cabinettyp</option><option value="register_type">Registertyp</option></select></div><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id"><option value="">Bitte wählen</option>{cabinet_type_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Icon</label><input type="text" name="icon" placeholder="optional"></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Dokumenttyp speichern</button></div></form>
+        <form method="post" action="/ui/admin/document-types" class="panel admin-create-section" id="admin-form-document-type" style="display:none; margin-bottom:0;"><h3>Dokumenttyp anlegen</h3><p class="muted">Definiere Objekttypen auf der Definitionsebene, entweder direkt unter einem Cabinettyp oder unter einem Registertyp.</p><div class="field-grid"><div class="field"><label>Zieltyp</label><select name="target_kind"><option value="cabinet_type">Cabinettyp</option><option value="register_type">Registertyp</option></select></div><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id"><option value="">Bitte wählen</option>{cabinet_type_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Icon</label>
+    <select name="icon">
+        <option value="">-- Kein Icon --</option>
+        <option value="🧾">🧾 Rechnung</option>
+        <option value="📄">📄 Dokument</option>
+        <option value="📑">📑 Dokument mit Lasche</option>
+        <option value="📋">📋 Clipboard</option>
+        <option value="📎">📎 Büroklammer</option>
+        <option value="🖇️">🖇️ Gefaltete Büroklammern</option>
+        <option value="📁">📁 Ordner</option>
+        <option value="📂">📂 Offener Ordner</option>
+        <option value="🗄️">🗄️ Aktenschrank</option>
+        <option value="📚">📚 Bücher</option>
+        <option value="📓">📓 Notizbuch</option>
+        <option value="📒">📒 Ledger</option>
+        <option value="📙">📙 Orange Buch</option>
+        <option value="📘">📘 Blaues Buch</option>
+        <option value="📗">📗 Grünes Buch</option>
+        <option value="📕">📕 Rotes Buch</option>
+        <option value="📒">📒 Ledger</option>
+        <option value="🔖">🔖 Lesezeichen</option>
+        <option value="🏷️">🏷️ Etikett</option>
+        <option value="📌">📌 Stecknadel</option>
+        <option value="📍">📍 Rundes Stecknadel</option>
+        <option value="🖇️">🖇️ Verlinkt</option>
+        <option value="📎">📎 Eingeklemmt</option>
+        <option value="✂️">✂️ Schere</option>
+        <option value="🖊️">🖊️ Stift</option>
+        <option value="🖋️">🖋️ Füller</option>
+        <option value="🖌️">🖌️ Pinsel</option>
+        <option value="🖍️">🖍️ Kreide</option>
+        <option value="📝">📝 Notiz</option>
+        <option value="💼">💼 Aktentasche</option>
+        <option value="📇">📇 Visitenkarten</option>
+        <option value="📈">📈 Diagramm steigend</option>
+        <option value="📉">📉 Diagramm fallend</option>
+        <option value="📊">📊 Balkendiagramm</option>
+        <option value="📋">📋 Tabelle</option>
+        <option value="📌">📌 Geheftet</option>
+        <option value="🔚">🔚 END Pfeil</option>
+        <option value="🔙">🔙 Zurück Pfeil</option>
+        <option value="🔛">🔛 AN! Pfeil</option>
+        <option value="🔜">🔜 SOON Pfeil</option>
+        <option value="🔝">🔝 OBEN Pfeil</option>
+        <option value="🔖">🔖 Lesezeichen gestrichelt</option>
+        <option value="🔗">🔗 Link</option>
+        <option value="🖇️">🖇️ Kettenglied</option>
+    </select>
+    <p class="hint">Wähle ein Icon aus oder lasse leer für das Standard-Dokument-Icon (📄)</p>
+</div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Dokumenttyp speichern</button></div></form>
 
         <form method="post" action="/ui/admin/cabinets" class="panel admin-create-section" id="admin-form-cabinet" style="display:none; margin-bottom:0;"><h3>Cabinet anlegen</h3><p class="muted">Lege ein konkretes Cabinet innerhalb eines Cabinettyps an, z. B. 2025 oder 2026 unter ERB.</p><div class="field-grid"><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id" required>{cabinet_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Cabinet speichern</button></div></form>
 
         <form method="post" action="/ui/admin/registers" class="panel admin-create-section" id="admin-form-register" style="display:none; margin-bottom:0;"><h3>Register anlegen</h3><p class="muted">Lege konkrete Register in einem Cabinet an und ordne optional einen Registertyp zu.</p><div class="field-grid"><div class="field"><label>Cabinet</label><select name="cabinet_id" required>{cabinet_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Register speichern</button></div></form>
 
-        <form method="post" action="/ui/admin/metadata-fields" class="panel admin-create-section" id="admin-form-metadata-field" style="display:none; margin-bottom:0;"><h3>Metadatenfeld anlegen</h3><p class="muted">Lege strukturierte Felder für Cabinettyp, Registertyp, Cabinet, Register oder Dokumenttyp fest.</p><div class="field-grid"><div class="field"><label>Zieltyp</label><select name="target_kind"><option value="cabinet_type">Cabinettyp</option><option value="register_type">Registertyp</option><option value="document_type">Dokumenttyp</option><option value="cabinet">Cabinet</option><option value="register">Register</option></select></div><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id"><option value="">Bitte wählen</option>{cabinet_type_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Cabinet</label><select name="cabinet_id"><option value="">Bitte wählen</option>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id"><option value="">Bitte wählen</option>{register_options}</select></div><div class="field"><label>Dokumenttyp</label><select name="document_type_id"><option value="">Bitte wählen</option>{document_type_field_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Label</label><input type="text" name="label"></div><div class="field"><label>Feldtyp</label><select name="field_type">{field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder"></div><div class="field"><label>Default</label><input type="text" name="default_value"></div><div class="field"><label><input type="checkbox" name="is_required"> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique"> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Feld speichern</button></div></form>
+        <form method="post" action="/ui/admin/metadata-fields" class="panel admin-create-section" id="admin-form-metadata-field" style="display:none; margin-bottom:0;"><h3>Metadatenfeld anlegen</h3><p class="muted">Lege strukturierte Felder für Cabinettyp, Registertyp, Cabinet, Register oder Dokumenttyp fest.</p><div class="field-grid"><div class="field"><label>Zieltyp</label><select name="target_kind"><option value="cabinet_type">Cabinettyp</option><option value="register_type">Registertyp</option><option value="document_type">Dokumenttyp</option><option value="cabinet">Cabinet</option><option value="register">Register</option></select></div><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id"><option value="">Bitte wählen</option>{cabinet_type_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Cabinet</label><select name="cabinet_id"><option value="">Bitte wählen</option>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id"><option value="">Bitte wählen</option>{register_options}</select></div><div class="field"><label>Dokumenttyp</label><select name="document_type_id">{document_type_field_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Label</label><input type="text" name="label"></div><div class="field"><label>Feldtyp</label><select name="field_type">{field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder"></div><div class="field"><label>Default</label><input type="text" name="default_value"></div><div class="field"><label><input type="checkbox" name="is_required"> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique"> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Feld speichern</button></div></form>
         <form method="post" action="/ui/admin/metadata-fields/{selected_metadata_field.id if selected_metadata_field else ''}" class="panel admin-create-section" id="admin-form-metadata-field-edit" style="display:none; margin-bottom:0;"><h3>Metadatenfeld bearbeiten</h3><p class="muted">Änderungen wirken auf Darstellung und Validierung. Bestehende JSON-Werte werden nicht umgeschrieben oder gelöscht.</p><input type="hidden" name="selected_definition_kind" value="{_escape(selected_definition_kind or '')}"><input type="hidden" name="selected_definition_id" value="{_escape(selected_definition_id or '')}"><div class="field-grid"><div class="field"><label>Name</label><input type="text" name="name" value="{_escape(selected_metadata_field.name) if selected_metadata_field else ''}" required></div><div class="field"><label>Label</label><input type="text" name="label" value="{_escape(selected_metadata_field.label or '') if selected_metadata_field else ''}"></div><div class="field"><label>Feldtyp</label><select name="field_type">{edit_field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{edit_width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="{selected_metadata_field.order if selected_metadata_field else 0}"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder" value="{_escape(selected_metadata_field.placeholder or '') if selected_metadata_field else ''}"></div><div class="field"><label>Default</label><input type="text" name="default_value" value="{_escape(selected_metadata_field.default_value or '') if selected_metadata_field else ''}"></div><div class="field"><label><input type="checkbox" name="is_required" {'checked' if selected_metadata_field and selected_metadata_field.is_required else ''}> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique" {'checked' if selected_metadata_field and selected_metadata_field.is_unique else ''}> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description">{_escape(selected_metadata_field.description or '') if selected_metadata_field else ''}</textarea></div></div><div class="actions"><button class="primary" type="submit">Metadatenfeld speichern</button></div></form>
       </div>
     """

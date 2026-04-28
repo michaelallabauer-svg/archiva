@@ -15,8 +15,8 @@ Dafür verwendet Archiva freie Tools.
 ## Empfohlene Installation auf macOS mit Homebrew
 
 ```bash
-brew install tesseract ocrmypdf poppler
-pip install pypdf
+brew install poppler tesseract tesseract-lang ocrmypdf
+pip install -e .
 ```
 
 ### Warum diese Pakete
@@ -67,15 +67,15 @@ Dann funktioniert Archiva weiterhin, aber:
 
 ## Empfehlung
 
-Für den produktiven Einsatz sollten mindestens installiert sein:
+Für lokale Entwicklung und produktiven Einsatz sollten mindestens installiert sein:
 
 ```bash
-brew install tesseract ocrmypdf poppler
+brew install poppler tesseract tesseract-lang ocrmypdf
 ```
 
-und im Python-Umfeld:
+`pypdf` ist inzwischen als reguläre Python-Abhängigkeit in `pyproject.toml` verankert und kommt über:
 
 ```bash
 source venv/bin/activate
-pip install pypdf
+pip install -e .
 ```

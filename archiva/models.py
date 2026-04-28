@@ -790,6 +790,7 @@ preview_job_status_enum = PGEnum(
     PreviewJobStatus,
     name="previewjobstatus",
     create_type=False,
+    values_callable=lambda enum_cls: [item.value for item in enum_cls],
 )
 
 
