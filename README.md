@@ -261,6 +261,10 @@ search:
   index_name: "archiva-documents-v1"
 ```
 
+## Roadmap / Vision
+
+See [`TODO-VISION.md`](TODO-VISION.md) for the MVP plan around the Eingangsrechnungs-Workflow, PDFStampede integration, and the post-MVP concept for reference metadata/stammdaten links.
+
 ## UI surfaces
 
 - `/ui/admin` — structure, document types, and metadata model administration
