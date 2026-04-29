@@ -36,3 +36,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# uv-managed virtual environment
+.venv/

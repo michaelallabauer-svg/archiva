@@ -5,75 +5,237 @@ Lightweight Enterprise Content Management with Full-Text Search.
 ## Features
 
 - 📄 Document upload and storage
-- 🧩 Admin-managed document/object definitions (Cabinets, Registers, Document Types, Metadata Fields)
-- 📝 Dynamic capture flow: upload document + structured metadata in one step
+- 🧩 Admin-managed document/object definitions: Cabinet Types, Cabinets, Registers, Document Types, Metadata Fields
+- 📝 App workspace for daily ECM work: browse structure, capture documents, edit object metadata values
 - ✅ Server-side metadata validation driven by document type definitions
-- 🔍 Full-text search powered by PostgreSQL tsvector/tsquery
+- 🔍 Full-text search with OpenSearch when available and PostgreSQL fallback indexing
+- 🖼️ Preview/index queue worker started together with the app
 - 📁 Version tracking
 - 🏷️ Metadata and tagging
-- ⚙️ Fully configurable via YAML
-- 🐳 Docker-ready
+- ⚙️ Configurable via YAML
+- 🐳 Docker-ready for local OpenSearch
 
 ## Stack
 
-- **Backend**: Python 3.11+, FastAPI
-- **Database**: PostgreSQL 16 with native full-text search
-- **Search**: OpenSearch 2.x with PostgreSQL fallback
-- **OCR / PDF extraction**: pypdf, Poppler (`pdftotext`), OCRmyPDF, Tesseract
-- **ORM**: SQLAlchemy 2.0
-- **Migrations**: Alembic
+- **Backend:** Python 3.11+, FastAPI
+- **Database:** PostgreSQL 16
+- **Search:** OpenSearch 2.x with PostgreSQL fallback
+- **OCR / PDF extraction:** pypdf, Poppler (`pdftotext`), OCRmyPDF, Tesseract
+- **ORM:** SQLAlchemy 2.0
+- **Dependency manager:** `uv` recommended; `pip` also works
 
-## Quick Start
+## Installation
 
-### Prerequisites
+These steps reflect the current working setup and the dependency issues we hit during development.
 
-- Python 3.11+
-- PostgreSQL 16
-- Docker Desktop, if OpenSearch should run locally via `docker compose`
-- Optional but recommended OCR/PDF tooling:
-  - macOS: `brew install poppler tesseract tesseract-lang ocrmypdf`
-- GitHub CLI (for cloning/contributing)
+### 1. Prerequisites
 
-### Setup
+Install the system tools first.
+
+**macOS / Homebrew:**
 
 ```bash
-# Clone the repository
+brew install python@3.11 uv postgresql@16 poppler tesseract tesseract-lang ocrmypdf
+```
+
+Optional for local OpenSearch:
+
+```bash
+# Docker Desktop must be running
+docker --version
+```
+
+Notes:
+
+- Python **3.11+** is required. If several Python versions are installed, prefer `uv run ...` or an explicit Python binary.
+- Do **not** rely on an old local `venv/` unless you just recreated it. We repeatedly saw `ModuleNotFoundError: uvicorn` when starting Archiva with the wrong interpreter/venv.
+- `config.yaml` is local-only and ignored by git.
+
+### 2. Clone
+
+```bash
 gh repo clone michaelallabauer-svg/archiva
 cd archiva
+```
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
+If you do not use GitHub CLI:
 
-# Install dependencies
-pip install -e ".[dev]"
+```bash
+git clone https://github.com/michaelallabauer-svg/archiva.git
+cd archiva
+```
 
-# Optional but recommended: start OpenSearch for full search indexing
-docker compose up -d opensearch
+### 3. Install Python dependencies
 
-# Configure
-cp config.example.yaml config.yaml
-# Edit config.yaml with your database settings
+Recommended:
 
-# Create database
+```bash
+uv sync --dev
+```
+
+Then run all Archiva commands through `uv run`, e.g. `uv run python -m archiva.main`.
+
+Alternative with plain `venv`/`pip`:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+If `python -m archiva.main` fails with `No module named uvicorn`, you are using the wrong Python environment. Either activate the correct `.venv` or use `uv run python -m archiva.main`.
+
+### 4. PostgreSQL
+
+Start PostgreSQL and create the database/user expected by your config.
+
+Simple local default:
+
+```bash
 createdb archiva
+```
 
-# Run migrations / create tables
-python -m archiva.database init
+If PostgreSQL is managed by Homebrew:
 
-# Start server
+```bash
+brew services start postgresql@16
+createdb archiva
+```
+
+Default connection settings are:
+
+```yaml
+database:
+  host: "localhost"
+  port: 5432
+  name: "archiva"
+  user: "postgres"
+  password: "postgres"
+```
+
+Adjust `config.yaml` if your local PostgreSQL user/password differ.
+
+### 5. Configure Archiva
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+Edit `config.yaml` if needed. On startup Archiva now loads `config.yaml` automatically from the repository directory when present. If it is absent, built-in defaults are used.
+
+Important paths/ports:
+
+- API: `http://localhost:8000/docs`
+- Admin UI: `http://localhost:8000/ui/admin`
+- App UI: `http://localhost:8000/ui/app`
+- Workflow UI: `http://localhost:8000/ui/workflows`
+
+### 6. Optional: OpenSearch
+
+OpenSearch is optional for local development. If it is not reachable, Archiva still maintains the PostgreSQL fallback index so queue jobs do not stay permanently blocked.
+
+```bash
+docker compose up -d opensearch
+```
+
+Check it with:
+
+```bash
+curl http://localhost:9200
+```
+
+### 7. Start Archiva
+
+Recommended:
+
+```bash
+uv run python -m archiva.main
+```
+
+Alternative after activating `.venv`:
+
+```bash
 python -m archiva.main
 ```
 
-The app starts an internal queue worker for preview rendering and indexing. OpenSearch is used when available; if it is not reachable, Archiva still updates the PostgreSQL fallback index so local development does not get stuck with pending jobs.
+The app creates/updates required tables on startup, including compatibility columns such as:
 
-API available at `http://localhost:8000`
-Docs at `http://localhost:8000/docs`
-UI at `http://localhost:8000/ui`
+- `documents.cabinet_id`
+- `cabinets.metadata_json`
+- `registers.metadata_json`
+- indexing/status columns
+- definition-model columns for cabinet/register/document type metadata
 
-## Configuration
+No separate Alembic command is required for the current local setup.
 
-See `config.example.yaml` for all available options:
+### 8. Restart after code changes
+
+The main app on `:8000` may run without reload depending on `config.yaml` (`app.debug: false` by default). After changing server-rendered UI/code, restart the process:
+
+```bash
+# find the process
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+
+# stop it, then start again
+kill <PID>
+uv run python -m archiva.main
+```
+
+If the browser still shows old UI, hard-refresh with `Cmd+Shift+R`.
+
+## Common dependency problems and fixes
+
+### `ModuleNotFoundError: No module named 'uvicorn'`
+
+Cause: Archiva was started with a Python interpreter that does not have project dependencies installed.
+
+Fix:
+
+```bash
+uv sync --dev
+uv run python -m archiva.main
+```
+
+or recreate the venv:
+
+```bash
+rm -rf .venv
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m archiva.main
+```
+
+### OpenSearch not running
+
+Archiva can still run. Start OpenSearch only if you need the OpenSearch-backed search path:
+
+```bash
+docker compose up -d opensearch
+```
+
+### OCR/PDF extraction missing tools
+
+Install the system tools:
+
+```bash
+brew install poppler tesseract tesseract-lang ocrmypdf
+```
+
+Without these, text extraction may fall back or be incomplete for scanned PDFs/images.
+
+### Port `8000` already in use
+
+```bash
+lsof -nP -iTCP:8000 -sTCP:LISTEN
+kill <PID>
+uv run python -m archiva.main
+```
+
+## Configuration reference
+
+See `config.example.yaml`:
 
 ```yaml
 database:
@@ -99,22 +261,16 @@ search:
   index_name: "archiva-documents-v1"
 ```
 
-## OCR / PDF extraction
+## UI surfaces
 
-Archiva extracts text for indexing in this order:
+- `/ui/admin` — structure, document types, and metadata model administration
+- `/ui/app` — daily archive work: browse Cabinets/Register, capture documents, edit metadata values of the active object
+- `/ui/workflows` — workflow designer/placeholder surface
 
-1. PDF text layer via `pypdf`
-2. PDF text via Poppler `pdftotext`
-3. Scan/OCR fallback via `ocrmypdf`
-4. Image OCR via `tesseract`
+Important distinction:
 
-On macOS install the system tools with:
-
-```bash
-brew install poppler tesseract tesseract-lang ocrmypdf
-```
-
-`pypdf` is pinned in `pyproject.toml` as a Python dependency. See `archiva/OCR_SETUP.md` for more detail.
+- Metadata **field definitions** are maintained in Admin.
+- Metadata **values** for the selected Cabinet/Register are edited in the App workspace.
 
 ## API Endpoints
 
@@ -133,28 +289,16 @@ brew install poppler tesseract tesseract-lang ocrmypdf
 | DELETE | `/api/v1/documents/{id}` | Delete document |
 | GET | `/api/v1/search?q=` | Full-text search |
 
-### First built-in UI
+## Combined capture flow
 
-There is now a first server-rendered UI at `/ui` with separated surfaces:
-
-- `/ui/admin` for structure, document types, and metadata model administration
-- `/ui/app` for document intake and daily ECM usage
-- `/ui/workflows` as placeholder for future object workflow handling
-
-The app intake UI renders dynamic metadata fields directly as form controls instead of a raw JSON textarea.
-
-### Combined capture flow
-
-API upload to `/api/v1/documents` still uses `multipart/form-data` with:
+API upload to `/api/v1/documents` uses `multipart/form-data` with:
 
 - `file`: the binary upload
 - `document_type_id`: UUID of the admin-defined document/object type
 - `metadata`: JSON object as string, e.g. `{"invoice_number":"2026-001","amount":129.9}`
 - optional classic fields like `title`, `author`, `description`, `tags`
 
-The built-in UI at `/ui/app` now uses normal form fields for metadata and submits them as multipart form fields alongside the file upload. The server maps these form values back into the validated metadata object before saving.
-
-The backend validates the metadata against the configured `MetadataField` definitions before saving.
+The built-in UI at `/ui/app` uses normal form fields for metadata and submits them as multipart fields alongside the file upload. The server maps these form values back into the validated metadata object before saving.
 
 ## License
 

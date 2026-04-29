@@ -64,7 +64,13 @@ class Settings(BaseSettings):
 
 
 def load_settings(config_path: str | None = None) -> Settings:
-    """Load settings from config file or environment."""
-    if config_path and Path(config_path).exists():
-        return Settings.from_yaml(Path(config_path))
+    """Load settings from YAML config file or environment.
+
+    If no explicit path is provided, Archiva looks for ``config.yaml`` in the
+    current working directory. This keeps local installs predictable while still
+    allowing environment/default settings for quick demos.
+    """
+    resolved_path = Path(config_path) if config_path else Path("config.yaml")
+    if resolved_path.exists():
+        return Settings.from_yaml(resolved_path)
     return Settings()
