@@ -41,6 +41,7 @@ def create_tables() -> None:
         Base.metadata.create_all(bind=conn)
         _ensure_identity_tables(conn)
         _ensure_document_cabinet_column(conn)
+        _ensure_structure_metadata_value_columns(conn)
         _ensure_definition_model_columns(conn)
         _ensure_search_indexing_columns(conn)
 
@@ -305,6 +306,11 @@ def _ensure_document_cabinet_column(conn) -> None:
             )
         )
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_cabinet_id ON documents (cabinet_id)"))
+
+
+def _ensure_structure_metadata_value_columns(conn) -> None:
+    conn.execute(text("ALTER TABLE cabinets ADD COLUMN IF NOT EXISTS metadata_json TEXT NULL"))
+    conn.execute(text("ALTER TABLE registers ADD COLUMN IF NOT EXISTS metadata_json TEXT NULL"))
 
 
 def _ensure_search_indexing_columns(conn) -> None:

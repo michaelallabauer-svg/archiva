@@ -434,6 +434,199 @@ def _definition_fields_for_document_type(document_type: DocumentType | None) -> 
     return list(unique_by_name.values())
 
 
+def _document_type_fields_only(document_type: DocumentType | None) -> list[MetadataField]:
+    if not document_type:
+        return []
+    return sorted(document_type.fields or [], key=lambda item: (item.order, item.label or item.name, str(item.id)))
+
+
+def _metadata_width_class(width: str | None) -> str:
+    normalized = (width or "half").strip().lower()
+    if normalized in {"full", "half", "third", "quarter"}:
+        return f"width-{normalized}"
+    return "width-half"
+
+
+def _format_metadata_display_value(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if item not in (None, "")) or "—"
+    if isinstance(value, bool):
+        return "Ja" if value else "Nein"
+    if value in (None, ""):
+        return "—"
+    return str(value)
+
+
+def _render_metadata_display(
+    metadata: dict[str, Any],
+    fields: list[MetadataField] | None = None,
+    *,
+    empty_message: str = "Keine Metadaten vorhanden.",
+    include_unmodeled: bool = True,
+) -> str:
+    metadata = metadata or {}
+    fields = fields or []
+    cards: list[str] = []
+    seen: set[str] = set()
+
+    for field in sorted(fields, key=lambda item: (item.order, item.label or item.name, str(item.id))):
+        seen.add(field.name)
+        label = field.label or field.name
+        raw_value = metadata.get(field.name, field.default_value or "")
+        value = _format_metadata_display_value(raw_value)
+        empty_class = " is-empty" if value == "—" else ""
+        cards.append(
+            f'<div class="metadata-card {_metadata_width_class(field.width)}{empty_class}">'
+            f'<div class="metadata-label">{_escape(label)}</div>'
+            f'<div class="metadata-value">{_escape(value)}</div>'
+            f'</div>'
+        )
+
+    if include_unmodeled:
+        for key, raw_value in metadata.items():
+            if key in seen:
+                continue
+            value = _format_metadata_display_value(raw_value)
+            cards.append(
+                f'<div class="metadata-card width-half">'
+                f'<div class="metadata-label">{_escape(str(key))}</div>'
+                f'<div class="metadata-value">{_escape(value)}</div>'
+                f'</div>'
+            )
+
+    if not cards:
+        return f"<p class='muted'>{_escape(empty_message)}</p>"
+    return '<div class="metadata-display-grid">' + ''.join(cards) + '</div>'
+
+
+def _metadata_value_input(field: MetadataField, value: Any) -> str:
+    input_name = f"metadata_{field.name}"
+    safe_placeholder = _escape(field.placeholder or "")
+    required = "required" if field.is_required else ""
+    options = _parse_field_options(field)
+    if value is None:
+        value = field.default_value or ""
+    if field.field_type == "long_text":
+        control = f'<textarea name="{input_name}" placeholder="{safe_placeholder}" {required}>{_escape(str(value))}</textarea>'
+    elif field.field_type == "boolean":
+        checked = "checked" if str(value).lower() == "true" else ""
+        control = (
+            f'<label class="toggle"><input type="hidden" name="{input_name}" value="false">'
+            f'<input type="checkbox" name="{input_name}" value="true" {checked}>'
+            f'<span class="toggle-slider"></span><span class="toggle-label">Ja / Nein</span></label>'
+        )
+    elif field.field_type == "selection" and options:
+        option_html = "".join(f'<option value="{_escape(option)}" {"selected" if str(value) == option else ""}>{_escape(option)}</option>' for option in options)
+        control = f'<select name="{input_name}" {required}><option value="">Bitte wählen</option>{option_html}</select>'
+    elif field.field_type == "multi_selection" and options:
+        selected_values = value if isinstance(value, list) else [part.strip() for part in str(value).split(",") if part.strip()]
+        control = '<div class="checkbox-group">' + ''.join(
+            f'<label class="checkbox-item"><input type="checkbox" name="{input_name}" value="{_escape(option)}" {"checked" if option in selected_values else ""}> {_escape(option)}</label>'
+            for option in options
+        ) + '</div>'
+    elif field.field_type == "date":
+        control = f'<input type="date" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
+    elif field.field_type == "datetime":
+        control = f'<input type="datetime-local" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
+    elif field.field_type in ("number", "currency"):
+        control = f'<input type="number" step="any" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
+    elif field.field_type == "email":
+        control = f'<input type="email" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
+    elif field.field_type == "url":
+        control = f'<input type="url" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
+    elif field.field_type == "phone":
+        control = f'<input type="tel" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
+    else:
+        control = f'<input type="text" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
+    required_badge = ' <span class="required-badge">Pflicht</span>' if field.is_required else ''
+    description_html = f'<div class="muted field-help">{_escape(field.description)}</div>' if field.description else ""
+    return f'<div class="field {_metadata_width_class(field.width)}"><label>{_escape(field.label or field.name)}{required_badge}</label>{control}{description_html}</div>'
+
+
+def _metadata_fields_for_cabinet(cabinet: Cabinet) -> list[MetadataField]:
+    fields: list[MetadataField] = []
+    if cabinet.cabinet_type:
+        fields.extend(cabinet.cabinet_type.metadata_fields or [])
+    fields.extend(cabinet.metadata_fields or [])
+    unique: dict[str, MetadataField] = {}
+    for field in sorted(fields, key=lambda item: (item.order, item.name)):
+        unique[field.name] = field
+    return list(unique.values())
+
+
+def _metadata_fields_for_register(register: Register) -> list[MetadataField]:
+    fields: list[MetadataField] = []
+    if register.register_type:
+        fields.extend(register.register_type.metadata_fields or [])
+    fields.extend(register.metadata_fields or [])
+    unique: dict[str, MetadataField] = {}
+    for field in sorted(fields, key=lambda item: (item.order, item.name)):
+        unique[field.name] = field
+    return list(unique.values())
+
+
+def _collect_metadata_values(form: Any, fields: list[MetadataField], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    metadata: dict[str, Any] = dict(existing or {})
+    for field in fields:
+        input_name = f"metadata_{field.name}"
+        values = form.getlist(input_name)
+        cleaned_values = [value for value in values if value not in (None, "")]
+        if not cleaned_values:
+            # Safety: do not clear an existing value just because an edit form submitted blank.
+            # That avoids accidental data loss if a browser/rendering issue leaves a field empty.
+            continue
+        metadata[field.name] = cleaned_values if field.field_type == "multi_selection" else cleaned_values[-1]
+    return metadata
+
+
+def _metadata_initial_values_for_object(target: Any, fields: list[MetadataField]) -> dict[str, Any]:
+    values = metadata_from_json(getattr(target, "metadata_json", None)) or {}
+    object_name = str(getattr(target, "name", "") or "")
+    object_description = str(getattr(target, "description", "") or "")
+    for field in fields:
+        if field.name in values and values[field.name] not in (None, ""):
+            continue
+        normalized = _normalized_label(" ".join([field.name or "", field.label or ""]))
+        if object_name and any(token in normalized for token in ("name", "bezeichnung", "titel")):
+            values[field.name] = object_name
+        elif object_description and any(token in normalized for token in ("beschreibung", "description")):
+            values[field.name] = object_description
+        elif object_name and object_name.isdigit() and any(token in normalized for token in ("jahr", "year", "geschaftsjahr", "geschäftsjahr")):
+            values[field.name] = object_name
+    return values
+
+
+def _render_metadata_workspace(selected_node: dict[str, Any] | None, selected_cabinet: Cabinet | None, selected_register: Register | None) -> str:
+    if not selected_node:
+        return ""
+    node_kind = str(selected_node.get("kind") or "")
+    node_label = str(selected_node.get("label") or "Auswahl")
+    target = selected_cabinet if node_kind == "cabinet" else selected_register if node_kind == "register" else None
+    if target is None:
+        return ""
+    fields = _metadata_fields_for_cabinet(target) if node_kind == "cabinet" else _metadata_fields_for_register(target)
+    values = _metadata_initial_values_for_object(target, fields)
+    if fields:
+        field_inputs = "".join(_metadata_value_input(field, values.get(field.name)) for field in fields)
+    else:
+        field_inputs = "<p class='muted'>Für dieses Element sind noch keine Metadatenfelder definiert. Felddefinitionen legst du im Admin an.</p>"
+    action = f"/ui/app/{'cabinets' if node_kind == 'cabinet' else 'registers'}/{target.id}/metadata"
+    return f'''
+      <div class="panel dynamic-workbench" id="metadata-workbench" style="display:none; margin-bottom:16px;">
+        <div class="section-head" style="margin-bottom:10px;">
+          <div><div class="eyebrow">Arbeitsbereich</div><h2 style="margin:4px 0 0 0;">Metadaten bearbeiten</h2><div class="muted" style="margin-top:6px;">Werte für: {_escape(node_label)}</div></div>
+          <button type="button" class="chip" id="metadata-workbench-close">Zur Inhaltsansicht</button>
+        </div>
+        <form method="post" action="{action}" class="panel" style="padding:14px; margin:0;">
+          <input type="hidden" name="node_kind" value="{_escape(node_kind)}">
+          <input type="hidden" name="node_id" value="{target.id}">
+          <div class="field-grid">{field_inputs}</div>
+          <div class="actions"><button class="primary" type="submit" {'disabled' if not fields else ''}>Metadaten speichern</button></div>
+        </form>
+      </div>
+    '''
+
+
 def _resolved_document_cabinet(document: Document) -> Cabinet | None:
     if document.cabinet:
         return document.cabinet
@@ -872,6 +1065,44 @@ async def ui_app_document_update_metadata(
     return _ui_redirect_with_message(
         _document_detail_message_url(document_id, message="Metadaten erfolgreich aktualisiert")
     )
+
+
+@router.post("/app/cabinets/{cabinet_id}/metadata")
+async def ui_app_cabinet_update_metadata(
+    cabinet_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    cabinet = db.query(Cabinet).where(Cabinet.id == cabinet_id).first()
+    if not cabinet:
+        raise HTTPException(status_code=404, detail="Cabinet not found")
+    form = await request.form()
+    fields = _metadata_fields_for_cabinet(cabinet)
+    existing = metadata_from_json(getattr(cabinet, "metadata_json", None)) or {}
+    metadata = _collect_metadata_values(form, fields, existing)
+    cabinet.metadata_json = json.dumps(metadata, ensure_ascii=False)
+    db.add(cabinet)
+    db.commit()
+    return _ui_redirect_with_message(f"/ui/app?node_kind=cabinet&node_id={cabinet.id}&message={quote_plus('Metadaten gespeichert')}#metadata-workbench")
+
+
+@router.post("/app/registers/{register_id}/metadata")
+async def ui_app_register_update_metadata(
+    register_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    register = db.query(Register).where(Register.id == register_id).first()
+    if not register:
+        raise HTTPException(status_code=404, detail="Register not found")
+    form = await request.form()
+    fields = _metadata_fields_for_register(register)
+    existing = metadata_from_json(getattr(register, "metadata_json", None)) or {}
+    metadata = _collect_metadata_values(form, fields, existing)
+    register.metadata_json = json.dumps(metadata, ensure_ascii=False)
+    db.add(register)
+    db.commit()
+    return _ui_redirect_with_message(f"/ui/app?node_kind=register&node_id={register.id}&message={quote_plus('Metadaten gespeichert')}#metadata-workbench")
 
 
 @router.post("/app/documents/{document_id}/cabinet")
@@ -1666,6 +1897,9 @@ async def ui_create_cabinet_type(
     name: str = Form(...),
     description: str = Form(""),
     order: int = Form(0),
+    return_to: str = Form(""),
+    node_kind: str = Form(""),
+    node_id: str = Form(""),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
     cabinet_type = CabinetType(name=name.strip(), description=description.strip() or None, order=order)
@@ -2143,6 +2377,8 @@ async def ui_create_metadata_field(
     )
     db.add(field)
     db.commit()
+    if return_to == "app" and node_kind and node_id:
+        return _ui_redirect_with_message(f"/ui/app?node_kind={quote_plus(node_kind)}&node_id={quote_plus(node_id)}&message={quote_plus('Metadatenfeld angelegt')}#metadata-workbench")
     redirect_target = "/ui/admin"
     return RedirectResponse(url=redirect_target, status_code=303)
 
@@ -2211,6 +2447,9 @@ async def ui_delete_document_type(
 @router.post("/admin/metadata-fields/{metadata_field_id}/delete")
 async def ui_delete_metadata_field(
     metadata_field_id: UUID,
+    return_to: str = Form(""),
+    node_kind: str = Form(""),
+    node_id: str = Form(""),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
     field = db.query(MetadataField).where(MetadataField.id == metadata_field_id).first()
@@ -2220,6 +2459,8 @@ async def ui_delete_metadata_field(
     doc_type_id = field.document_type_id
     db.delete(field)
     db.commit()
+    if return_to == "app" and node_kind and node_id:
+        return _ui_redirect_with_message(f"/ui/app?node_kind={quote_plus(node_kind)}&node_id={quote_plus(node_id)}&message={quote_plus(f'Metadatenfeld {name} gelöscht')}#metadata-workbench")
     if doc_type_id:
         return _ui_redirect_with_message(f"/ui/admin/document-types/{doc_type_id}?message={quote_plus(f'Metadatenfeld {name} gelöscht')}")
     return _ui_redirect_with_message(f"/ui/admin?message={quote_plus(f'Metadatenfeld {name} gelöscht')}")
@@ -2240,6 +2481,9 @@ async def ui_update_metadata_field(
     order: int = Form(0),
     selected_definition_kind: str = Form(""),
     selected_definition_id: str = Form(""),
+    return_to: str = Form(""),
+    node_kind: str = Form(""),
+    node_id: str = Form(""),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
     field = db.query(MetadataField).where(MetadataField.id == metadata_field_id).first()
@@ -2258,6 +2502,8 @@ async def ui_update_metadata_field(
     field.order = order
     db.add(field)
     db.commit()
+    if return_to == "app" and node_kind and node_id:
+        return _ui_redirect_with_message(f"/ui/app?node_kind={quote_plus(node_kind)}&node_id={quote_plus(node_id)}&message={quote_plus('Metadatenfeld aktualisiert')}#metadata-workbench")
     redirect_url = "/ui/admin"
     if selected_definition_kind and selected_definition_id:
         redirect_url += (
@@ -2714,7 +2960,9 @@ def _render_admin_script() -> str:
       if (selectedMetadataFieldId) return;
       if (!selectedDefinitionKind || !selectedDefinitionId) return;
       if (selectedDefinitionKind === 'cabinet_type') {
+        const cabinetSelect = document.querySelector('#admin-form-cabinet select[name="cabinet_type_id"]');
         const registerTypeSelect = document.querySelector('#admin-form-register-type select[name="cabinet_type_id"]');
+        if (cabinetSelect) cabinetSelect.value = selectedDefinitionId;
         if (registerTypeSelect) registerTypeSelect.value = selectedDefinitionId;
         const documentTypeKind = document.querySelector('#admin-form-document-type select[name="target_kind"]');
         const documentTypeCabinetType = document.querySelector('#admin-form-document-type select[name="cabinet_type_id"]');
@@ -2742,7 +2990,12 @@ def _render_admin_script() -> str:
     };
 
     prefillAdminCreateForms();
-    if (defaultTarget) openAdminCreateSection(defaultTarget);
+    const hashTarget = (window.location.hash || '').replace('#', '');
+    if (hashTarget && document.getElementById(hashTarget)?.classList.contains('admin-create-section')) {
+      openAdminCreateSection(hashTarget);
+    } else if (defaultTarget) {
+      openAdminCreateSection(defaultTarget);
+    }
 
     document.querySelectorAll('.admin-create-toggle-inline').forEach((button) => {
       button.addEventListener('click', () => {
@@ -2961,6 +3214,24 @@ def _render_app_page(
         selected_value=str(selected_cabinet.id) if selected_cabinet else None,
         include_blank="Bitte wählen",
     )
+    selected_cabinet_type_id = ""
+    if selected_node and selected_node.get("kind") == "cabinet_type":
+        selected_cabinet_type_id = str(selected_node.get("id") or "")
+    elif selected_cabinet and selected_cabinet.cabinet_type_id:
+        selected_cabinet_type_id = str(selected_cabinet.cabinet_type_id)
+    cabinet_type_options = _option_list(
+        [(str(cabinet_type.id), cabinet_type.name) for cabinet_type in (cabinet_types or [])],
+        selected_value=selected_cabinet_type_id or None,
+        include_blank="Bitte wählen",
+    ) or '<option value="">Bitte erst Cabinettyp im Admin anlegen</option>'
+    register_type_options = _option_list(
+        [
+            (str(register_type.id), f"{cabinet_type.name} → {register_type.name}")
+            for cabinet_type in (cabinet_types or [])
+            for register_type in sorted(cabinet_type.register_types, key=lambda item: item.order)
+        ],
+        include_blank="Optional",
+    )
     register_candidates = selected_cabinet.registers if selected_cabinet else []
     register_options = _option_list(
         [(str(register.id), register.name) for register in register_candidates],
@@ -2979,28 +3250,31 @@ def _render_app_page(
     selected_document_preview_html = "<div class='muted'>Keine Vorschau verfügbar.</div>"
     if selected_node and selected_node.get("kind") == "cabinet":
         selected_cabinet_documents = [document for document in all_documents if _resolved_document_cabinet(document) and selected_cabinet and str(_resolved_document_cabinet(document).id) == str(selected_cabinet.id)]
+        cabinet_metadata = metadata_from_json(getattr(selected_cabinet, "metadata_json", None)) if selected_cabinet else {}
+        metadata_values_html = _render_metadata_display(cabinet_metadata or {}, _metadata_fields_for_cabinet(selected_cabinet), empty_message="Keine Metadatenwerte gepflegt.") if selected_cabinet else ""
         selected_document_metadata_html = (
             f"<div class='meta-display-row'><div class='meta-display-label'>Cabinet</div><div class='meta-display-value'>{_escape(selected_cabinet.name if selected_cabinet else '')}</div></div>"
             f"<div class='meta-display-row'><div class='meta-display-label'>Dokumente</div><div class='meta-display-value'>{len(selected_cabinet_documents)}</div></div>"
             f"<div class='meta-display-row'><div class='meta-display-label'>Register</div><div class='meta-display-value'>{len(selected_cabinet.registers) if selected_cabinet else 0}</div></div>"
+            f"{metadata_values_html}"
         )
     elif selected_node and selected_node.get("kind") == "register":
         selected_register_documents = [document for document in all_documents if document.document_type and document.document_type.register_id and selected_register and str(document.document_type.register_id) == str(selected_register.id)]
+        register_metadata = metadata_from_json(getattr(selected_register, "metadata_json", None)) if selected_register else {}
+        metadata_values_html = _render_metadata_display(register_metadata or {}, _metadata_fields_for_register(selected_register), empty_message="Keine Metadatenwerte gepflegt.") if selected_register else ""
         selected_document_metadata_html = (
             f"<div class='meta-display-row'><div class='meta-display-label'>Register</div><div class='meta-display-value'>{_escape(selected_register.name if selected_register else '')}</div></div>"
             f"<div class='meta-display-row'><div class='meta-display-label'>Dokumente</div><div class='meta-display-value'>{len(selected_register_documents)}</div></div>"
             f"<div class='meta-display-row'><div class='meta-display-label'>Dokumenttypen</div><div class='meta-display-value'>{len(selected_register.document_types) if selected_register else 0}</div></div>"
+            f"{metadata_values_html}"
         )
     elif selected_document:
         selected_document_metadata = metadata_from_json(selected_document.metadata_json) or {}
-        selected_document_field_map = {
-            field.name: (field.label or field.name)
-            for field in (selected_document.document_type.fields if selected_document.document_type else [])
-        }
-        metadata_rows = "".join(
-            f"<div class='meta-display-row'><div class='meta-display-label'>{_escape(str(selected_document_field_map.get(key, key)))}</div><div class='meta-display-value'>{_escape(', '.join(value) if isinstance(value, list) else str(value))}</div></div>"
-            for key, value in selected_document_metadata.items()
-        ) or "<div class='muted'>Dieses Dokument hat noch keine Metadaten.</div>"
+        metadata_rows = _render_metadata_display(
+            selected_document_metadata,
+            _document_type_fields_only(selected_document.document_type),
+            empty_message="Dieses Dokument hat noch keine Metadaten.",
+        )
         indexing_rows = (
             f"<div class='meta-display-row'><div class='meta-display-label'>Indexstatus</div><div class='meta-display-value'>{_escape(selected_document.index_status or 'unbekannt')}</div></div>"
             f"<div class='meta-display-row'><div class='meta-display-label'>Index-Engine</div><div class='meta-display-value'>{_escape(selected_document.index_engine or 'nicht protokolliert')}</div></div>"
@@ -3102,6 +3376,36 @@ def _render_app_page(
             f'<div id="duplicate-warning" class="panel" style="display:none; margin-top:12px; padding:12px 16px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.30); border-radius:12px;"><strong style="color:#ff7b7b;">⚠ Duplikat erkannt!</strong><div id="duplicate-info" style="margin-top:6px; color:var(--muted); font-size:.9rem;"></div></div>'
             f'<div class="actions"><button class="primary" type="submit" id="intake-submit-btn">Dokument speichern</button></div></form></div>'
         )
+
+    metadata_workspace_html = _render_metadata_workspace(selected_node, selected_cabinet, selected_register)
+
+    quick_create_panel_html = f'''
+      <div class="panel dynamic-workbench" id="quick-create" style="display:none; margin-bottom:16px;">
+        <div class="section-head" style="margin-bottom:10px;">
+          <div>
+            <div class="eyebrow">Arbeitsbereich</div>
+            <h2 style="margin:4px 0 0 0;">Struktur anlegen</h2>
+            <div class="muted" id="quick-create-context-hint" style="margin-top:6px;">Aktion aus dem Archivbaum wählen</div>
+          </div>
+          <button type="button" class="chip" id="quick-create-close">Zur Inhaltsansicht</button>
+        </div>
+        <input type="hidden" id="quick-create-mode" value="">
+        <input type="hidden" id="quick-create-node-kind" value="">
+        <input type="hidden" id="quick-create-node-id" value="">
+        <form method="post" action="/ui/admin/cabinets" id="quick-create-cabinet-form" class="panel" style="display:none; margin:14px 0 0 0; padding:14px;">
+          <h3 style="margin:0 0 10px 0;">Cabinet anlegen</h3>
+          <input type="hidden" name="return_to" value="app">
+          <div class="field-grid"><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id" required>{cabinet_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div>
+          <div class="actions"><button class="primary" type="submit">Cabinet speichern</button></div>
+        </form>
+        <form method="post" action="/ui/admin/registers" id="quick-create-register-form" class="panel" style="display:none; margin:14px 0 0 0; padding:14px;">
+          <h3 style="margin:0 0 10px 0;">Register anlegen</h3>
+          <input type="hidden" name="return_to" value="app">
+          <div class="field-grid"><div class="field"><label>Cabinet</label><select name="cabinet_id" required>{cabinet_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id">{register_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div>
+          <div class="actions"><button class="primary" type="submit">Register speichern</button></div>
+        </form>
+      </div>
+    '''
 
     return f"""
 <!doctype html>
@@ -3217,6 +3521,16 @@ def _render_app_page(
     .meta-display-row:last-child {{ border-bottom:none; }}
     .meta-display-label {{ display:block; color:#7dd3fc; font-weight:700; letter-spacing:.02em; font-size:.82rem; padding-top:4px; }}
     .meta-display-value {{ display:block; color:var(--text); background:rgba(255,255,255,0.04); border:1px solid rgba(77,212,255,0.12); border-radius:10px; padding:8px 10px; line-height:1.35; word-break:break-word; box-shadow:none; font-size:.92rem; }}
+    .metadata-display-grid {{ display:grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap:8px; align-items:start; }}
+    .metadata-card {{ grid-column: span 6; min-width:0; padding:9px 10px; border-radius:12px; border:1px solid rgba(77,212,255,0.12); background:rgba(255,255,255,0.045); }}
+    .metadata-card.width-full {{ grid-column: 1 / -1; }}
+    .metadata-card.width-half {{ grid-column: span 6; }}
+    .metadata-card.width-third {{ grid-column: span 4; }}
+    .metadata-card.width-quarter {{ grid-column: span 3; }}
+    .metadata-card.is-empty {{ opacity:.66; }}
+    .metadata-label {{ color:#7dd3fc; font-weight:750; letter-spacing:.08em; text-transform:uppercase; font-size:.68rem; margin-bottom:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .metadata-value {{ color:var(--text); line-height:1.28; font-size:.94rem; word-break:break-word; }}
+    .metadata-field-editor {{ padding:14px; border:1px solid rgba(77,212,255,0.10); border-radius:16px; background:rgba(255,255,255,0.025); margin-bottom:12px; }}
     @media (max-width: 1200px) {{ .main-grid, .hero, .workspace-grid {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -3266,11 +3580,15 @@ def _render_app_page(
           <div id="tree-context-menu" class="context-menu" aria-hidden="true"></div>
         </div>
         <div style="display:block;">
-          {node_header_html}
-          {intake_panel_html}
-          {node_results_html}
-          <div style="margin-top:20px;">{object_summary_html}</div>
-          {object_overview_html}
+          {quick_create_panel_html}
+          {metadata_workspace_html}
+          <div id="node-content-view">
+            {node_header_html}
+            {intake_panel_html}
+            {node_results_html}
+            <div style="margin-top:20px;">{object_summary_html}</div>
+            {object_overview_html}
+          </div>
         </div>
         <div class="admin-detail-column" style="display:block;">
           <div class="panel compact-indexdata" style="margin-bottom:12px;">
@@ -3294,8 +3612,12 @@ def _render_app_page(
     const treeContextMenu = document.getElementById('tree-context-menu');
 
     const openQuickCreate = (mode, nodeKind = '', nodeId = '', nodeLabel = '') => {{
-      const details = document.querySelector('#quick-create details');
-      if (details) details.open = true;
+      const workbench = document.getElementById('quick-create');
+      const metadataWorkbench = document.getElementById('metadata-workbench');
+      const contentView = document.getElementById('node-content-view');
+      if (workbench) workbench.style.display = 'block';
+      if (metadataWorkbench) metadataWorkbench.style.display = 'none';
+      if (contentView) contentView.style.display = 'none';
       const modeInput = document.getElementById('quick-create-mode');
       const nodeKindInput = document.getElementById('quick-create-node-kind');
       const nodeIdInput = document.getElementById('quick-create-node-id');
@@ -3310,14 +3632,8 @@ def _render_app_page(
       if (nodeIdInput) nodeIdInput.value = nodeId;
       if (hint) hint.textContent = nodeLabel ? `Kontext: ${{nodeLabel}}` : 'Kein Kontext gewählt';
 
-      if (cabinetForm) {{
-        cabinetForm.style.display = 'block';
-        cabinetForm.classList.toggle('is-muted', mode === 'register');
-      }}
-      if (registerForm) {{
-        registerForm.style.display = 'block';
-        registerForm.classList.toggle('is-muted', mode === 'cabinet');
-      }}
+      if (cabinetForm) cabinetForm.style.display = mode === 'cabinet' ? 'block' : 'none';
+      if (registerForm) registerForm.style.display = mode === 'register' ? 'block' : 'none';
 
       if (mode === 'cabinet' && cabinetTypeSelect) {{
         if (nodeKind === 'cabinet_type') cabinetTypeSelect.value = nodeId;
@@ -3340,6 +3656,55 @@ def _render_app_page(
 
       window.location.hash = 'quick-create';
     }};
+
+    const openMetadataWorkbench = () => {{
+      const workbench = document.getElementById('quick-create');
+      const metadataWorkbench = document.getElementById('metadata-workbench');
+      const contentView = document.getElementById('node-content-view');
+      if (!metadataWorkbench) return;
+      if (workbench) workbench.style.display = 'none';
+      metadataWorkbench.style.display = 'block';
+      if (contentView) contentView.style.display = 'none';
+      window.location.hash = 'metadata-workbench';
+      const firstInput = metadataWorkbench.querySelector('input[name="name"]');
+      if (firstInput) firstInput.focus();
+    }};
+
+    const quickCreateClose = document.getElementById('quick-create-close');
+    if (quickCreateClose) {{
+      quickCreateClose.addEventListener('click', () => {{
+        const workbench = document.getElementById('quick-create');
+        const contentView = document.getElementById('node-content-view');
+        const cabinetForm = document.getElementById('quick-create-cabinet-form');
+        const registerForm = document.getElementById('quick-create-register-form');
+        const metadataWorkbench = document.getElementById('metadata-workbench');
+        if (workbench) workbench.style.display = 'none';
+        if (metadataWorkbench) metadataWorkbench.style.display = 'none';
+        if (contentView) contentView.style.display = 'block';
+        if (cabinetForm) cabinetForm.style.display = 'none';
+        if (registerForm) registerForm.style.display = 'none';
+        const url = new URL(window.location.href);
+        if (url.hash === '#quick-create') {{
+          history.replaceState(null, '', url.pathname + url.search);
+        }}
+      }});
+    }}
+
+    const metadataWorkbenchClose = document.getElementById('metadata-workbench-close');
+    if (metadataWorkbenchClose) {{
+      metadataWorkbenchClose.addEventListener('click', () => {{
+        const metadataWorkbench = document.getElementById('metadata-workbench');
+        const contentView = document.getElementById('node-content-view');
+        if (metadataWorkbench) metadataWorkbench.style.display = 'none';
+        if (contentView) contentView.style.display = 'block';
+        const url = new URL(window.location.href);
+        if (url.hash === '#metadata-workbench') {{
+          history.replaceState(null, '', url.pathname + url.search);
+        }}
+      }});
+    }}
+
+    if (window.location.hash === '#metadata-workbench') openMetadataWorkbench();
 
     document.querySelectorAll('[data-menu]').forEach((node) => {{
       const trigger = node.querySelector('.tree-menu-button');
@@ -3391,10 +3756,7 @@ def _render_app_page(
         const documentTypeId = button.dataset.documentTypeId || '';
         if (action === 'new-cabinet') openQuickCreate('cabinet', kind, id, label);
         if (action === 'new-register') openQuickCreate('register', kind, id, label);
-        if (action === 'edit-metadata') {{
-          const url = new URL('/ui/admin', window.location.origin);
-          window.location.href = url.toString();
-        }}
+        if (action === 'edit-metadata') openMetadataWorkbench();
         if (action === 'delete-node') {{
           alert('Löschen im App-Kontext ist noch nicht verdrahtet. Bitte vorerst im Admin löschen.');
         }}
@@ -3515,10 +3877,8 @@ def _render_document_detail_page(
 ) -> str:
     metadata = metadata_from_json(document.metadata_json) or {}
     effective_form_values = form_values or metadata
-    metadata_rows = "".join(
-        f'<div class="detail-row"><div class="detail-key">{_escape(key)}</div><div class="detail-value">{_escape(", ".join(value) if isinstance(value, list) else value)}</div></div>'
-        for key, value in metadata.items()
-    ) or "<p class='muted'>Keine Metadaten vorhanden.</p>"
+    effective_document_fields = _document_type_fields_only(document.document_type)
+    metadata_rows = _render_metadata_display(metadata, effective_document_fields)
     document_type_label = document.document_type.name if document.document_type else "Ohne Dokumenttyp"
     move_resolution = _build_move_resolution(document, cabinets)
     current_cabinet = move_resolution["current_cabinet"]
@@ -3555,7 +3915,6 @@ def _render_document_detail_page(
     """
 
     edit_fields_html = "<p class='muted'>Keine bearbeitbaren Metadaten vorhanden.</p>"
-    effective_document_fields = _definition_fields_for_document_type(document.document_type)
     if document.document_type:
         field_html_parts: list[str] = []
         for field in effective_document_fields:
@@ -3609,7 +3968,7 @@ def _render_document_detail_page(
                 control = f'<input type="text" name="{input_name}" value="{_escape(value)}" placeholder="{safe_placeholder}" {required}>'
             description_html = f'<div class="muted field-help">{_escape(field.description)}</div>' if field.description else ""
             field_error_html = f'<div class="field-error">{_escape(error_message)}</div>' if error_field == field.name and error_message else ""
-            field_html_parts.append(f'<div class="field full{field_error_class}"><label>{safe_label}{required_badge}</label>{control}{description_html}{field_error_html}</div>')
+            field_html_parts.append(f'<div class="field {_metadata_width_class(field.width)}{field_error_class}"><label>{safe_label}{required_badge}</label>{control}{description_html}{field_error_html}</div>')
         edit_fields_html = ''.join(field_html_parts)
 
     return f"""
@@ -3648,9 +4007,21 @@ def _render_document_detail_page(
     .panel.compact-indexdata .detail-key {{ color:#7dd3fc; font-size:.72rem; letter-spacing:.12em; margin-bottom:8px; }}
     .detail-value {{ display:block; color:var(--text); word-break:break-word; font-size:1.02rem; line-height:1.5; background:rgba(255,255,255,0.03); border:1px solid rgba(77,212,255,0.10); border-radius:12px; padding:10px 12px; }}
     .panel.compact-indexdata .detail-value {{ background:rgba(255,255,255,0.06); border:1px solid rgba(77,212,255,0.16); border-radius:14px; padding:12px 14px; box-shadow:inset 0 1px 0 rgba(255,255,255,0.04); }}
-    .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; }}
-    .field {{ display:grid; gap:6px; }}
-    .field.full {{ grid-column: 1 / -1; }}
+    .field-grid {{ display:grid; grid-template-columns: repeat(12, minmax(0,1fr)); gap:10px; }}
+    .field {{ display:grid; gap:6px; grid-column: span 6; }}
+    .field.full, .field.width-full {{ grid-column: 1 / -1; }}
+    .field.width-half {{ grid-column: span 6; }}
+    .field.width-third {{ grid-column: span 4; }}
+    .field.width-quarter {{ grid-column: span 3; }}
+    .metadata-display-grid {{ display:grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap:8px; align-items:start; }}
+    .metadata-card {{ grid-column: span 6; min-width:0; padding:9px 10px; border-radius:12px; border:1px solid rgba(77,212,255,0.12); background:rgba(255,255,255,0.05); }}
+    .metadata-card.width-full {{ grid-column: 1 / -1; }}
+    .metadata-card.width-half {{ grid-column: span 6; }}
+    .metadata-card.width-third {{ grid-column: span 4; }}
+    .metadata-card.width-quarter {{ grid-column: span 3; }}
+    .metadata-card.is-empty {{ opacity:.66; }}
+    .metadata-label {{ color:#7dd3fc; font-weight:750; letter-spacing:.08em; text-transform:uppercase; font-size:.68rem; margin-bottom:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .metadata-value {{ color:var(--text); line-height:1.28; font-size:.94rem; word-break:break-word; }}
     .field.error label {{ color:#ff8f8f; }}
     .field.error input, .field.error textarea, .field.error select, .field.error .checkbox-group {{ border-color:#ff8f8f; box-shadow:0 0 0 1px rgba(255,143,143,.25) inset; }}
     label {{ font-weight:600; font-size:0.95rem; }}
@@ -3684,7 +4055,7 @@ def _render_document_detail_page(
     .service-badge {{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:rgba(110,231,183,0.10); border:1px solid rgba(110,231,183,0.18); color:#d6fff0; font-size:.85rem; }}
     .status-dot {{ width:10px; height:10px; border-radius:999px; background: var(--success); box-shadow: 0 0 12px rgba(110,231,183,0.5); }}
     pre {{ margin:0; white-space:pre-wrap; word-break:break-word; font:inherit; color:var(--text); }}
-    @media (max-width: 900px) {{ .hero, .detail-grid, .detail-row {{ display:block; }} .detail-row {{ padding:14px 0; }} .detail-key {{ margin-bottom:6px; }} .field-grid {{ grid-template-columns:1fr; }} .preview-frame {{ min-height:480px; }} }}
+    @media (max-width: 900px) {{ .hero, .detail-grid, .detail-row {{ display:block; }} .detail-row {{ padding:14px 0; }} .detail-key {{ margin-bottom:6px; }} .field-grid, .metadata-display-grid {{ grid-template-columns:1fr; }} .field, .field.width-half, .field.width-third, .field.width-quarter, .metadata-card, .metadata-card.width-half, .metadata-card.width-third, .metadata-card.width-quarter {{ grid-column:1 / -1; }} .preview-frame {{ min-height:480px; }} }}
   </style>
 </head>
 <body>
