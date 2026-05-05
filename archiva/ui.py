@@ -3777,6 +3777,25 @@ def _workflow_assignment_label(step: WorkflowStepDefinition | None) -> str:
     return target.label or target.description or str(target.target_type)
 
 
+def _workflow_status_label(status: str | None) -> str:
+    labels = {
+        "active": "Aktiv",
+        "completed": "Abgeschlossen",
+        "cancelled": "Abgebrochen",
+    }
+    return labels.get(status or "", status or "Unbekannt")
+
+
+def _workflow_event_type_label(event_type: str | None) -> str:
+    labels = {
+        "started": "Gestartet",
+        "transitioned": "Schritt gewechselt",
+        "completed": "Abgeschlossen",
+        "cancelled": "Abgebrochen",
+    }
+    return labels.get(event_type or "", event_type or "Ereignis")
+
+
 def _workflow_instance_label(instance: WorkflowInstance) -> str:
     workflow_name = instance.workflow_definition.name if instance.workflow_definition else (instance.title or "Workflow")
     step_name = instance.current_step.name if instance.current_step else "Ohne aktuellen Schritt"
@@ -3819,8 +3838,14 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
             f"""
             <form method="post" action="/ui/app/workflows/{instance.id}/transition" class="workflow-action-form">
               <input type="hidden" name="transition_id" value="{transition.id}">
+              <div class="workflow-transition-row">
+                <div>
+                  <strong>{_escape(transition.label)}</strong>
+                  <div class="muted">Nächster Schritt: {_escape(transition.to_step.name if transition.to_step else 'Ziel')}</div>
+                </div>
+                <button class="primary" type="submit">Ausführen</button>
+              </div>
               <textarea name="comment" rows="2" placeholder="Kommentar optional"></textarea>
-              <button class="primary" type="submit">{_escape(transition.label)} → {_escape(transition.to_step.name if transition.to_step else 'Ziel')}</button>
             </form>
             """
             for transition in outgoing
@@ -3833,18 +3858,25 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
             .all()
         )
         history_html = "".join(
-            f"<li><strong>{_escape(event.event_type)}</strong> <span class='muted'>{_escape(str(event.created_at))} · {_escape(event.actor_label or 'System')}</span>{f'<div>{_escape(event.comment)}</div>' if event.comment else ''}</li>"
+            f"<li><strong>{_escape(_workflow_event_type_label(event.event_type))}</strong> <span class='muted'>{_escape(str(event.created_at))} · {_escape(event.actor_label or 'System')}</span>{f'<div>{_escape(event.comment)}</div>' if event.comment else ''}</li>"
             for event in history_events
         ) or "<li class='muted'>Noch keine History.</li>"
+        current_step_name = instance.current_step.name if instance.current_step else "—"
+        assignment_label = _workflow_assignment_label(instance.current_step)
         instance_cards.append(
             f"""
             <div class="workflow-instance-card">
               <div class="section-head">
                 <div>
                   <h3 style="margin:0;">{_escape(instance.workflow_definition.name if instance.workflow_definition else instance.title or 'Workflow')}</h3>
-                  <p class="muted">Aktueller Schritt: <strong>{_escape(instance.current_step.name if instance.current_step else '—')}</strong> · Zuständig: {_escape(_workflow_assignment_label(instance.current_step))}</p>
+                  <p class="muted">Aktueller Schritt: <strong>{_escape(current_step_name)}</strong> · Zuständig: {_escape(assignment_label)}</p>
+                  <div class="workflow-chip-row">
+                    <span class="workflow-chip">Schritt: {_escape(current_step_name)}</span>
+                    <span class="workflow-chip">Zuständig: {_escape(assignment_label)}</span>
+                    <span class="workflow-chip">{len(outgoing)} mögliche Aktion{'en' if len(outgoing) != 1 else ''}</span>
+                  </div>
                 </div>
-                <span class="service-badge">{_escape(instance.status)}</span>
+                <span class="service-badge">{_escape(_workflow_status_label(instance.status))}</span>
               </div>
               <div class="workflow-action-grid">{transition_buttons}</div>
               <details class="workflow-danger-zone">
@@ -4267,9 +4299,13 @@ def _render_app_page(
     .workflow-hero-icon {{ display:grid; place-items:center; width:42px; height:42px; border-radius:16px; background:rgba(110,231,183,0.18); color:#d6fff0; font-size:1.4rem; }}
     .workflow-panel {{ scroll-margin-top:18px; }}
     .workflow-instance-card {{ margin-top:14px; padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.12); background:rgba(255,255,255,0.035); }}
+    .workflow-chip-row {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
+    .workflow-chip {{ display:inline-flex; align-items:center; gap:6px; padding:5px 9px; border-radius:999px; background:rgba(77,212,255,0.08); border:1px solid rgba(77,212,255,0.14); color:var(--muted); font-size:.82rem; }}
     .workflow-action-grid {{ display:grid; gap:10px; margin-top:12px; }}
     .workflow-action-form {{ display:grid; gap:8px; margin:0; }}
     .workflow-action-form textarea, .workflow-action-form select {{ width:100%; border-radius:12px; border:1px solid rgba(77,212,255,0.16); background:rgba(255,255,255,0.04); color:var(--text); padding:10px 12px; font:inherit; box-sizing:border-box; }}
+    .workflow-transition-row {{ display:flex; justify-content:space-between; gap:12px; align-items:center; padding:10px 12px; border-radius:14px; border:1px solid rgba(110,231,183,0.14); background:rgba(110,231,183,0.055); }}
+    .workflow-transition-row button {{ white-space:nowrap; }}
     .workflow-danger-zone {{ margin-top:12px; padding:10px 12px; border-radius:14px; border:1px solid rgba(255,123,123,0.16); background:rgba(255,123,123,0.04); }}
     .workflow-danger-zone summary {{ cursor:pointer; color:#ffcccc; }}
     .workflow-history-list {{ margin:8px 0 0; padding-left:18px; color:var(--text); }}
@@ -6289,7 +6325,7 @@ def _render_node_results(
                 structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=register&node_id={register.id}'><strong>📑 {_escape(register.name)}</strong><div class='muted'>{len(register.document_types)} Dokumenttypen · {len(register_documents)} Dokumente</div></a>")
             for doc_type in sorted(cabinet.document_types, key=lambda item: item.order):
                 matching_documents = [doc for doc in all_documents if doc.document_type_id and str(doc.document_type_id) == str(doc_type.id)]
-                structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=document_type&node_id={doc_type.id}'><strong>📄 {_escape(doc_type.name)}</strong><div class='muted'>Direkter Dokumenttyp · {len(matching_documents)} Dokumente</div></a>")
+                structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=document_type&node_id={doc_type.id}'><strong>📄 {_escape(doc_type.name)}</strong><div class='muted'>{len(matching_documents)} Dokumente</div></a>")
             cabinet_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id)]
             if structure_results:
                 results.append("<div class='panel' style='margin-bottom:12px;'><h3 style='margin:0;'>Struktur</h3></div>")
