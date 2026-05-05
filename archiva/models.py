@@ -677,6 +677,127 @@ class WorkflowTransitionDefinition(Base):
     )
 
 
+class WorkflowInstance(Base):
+    """Runtime instance of a workflow on a subject object.
+
+    MVP uses subject_kind='document'. The polymorphic subject fields keep the
+    runtime open for cabinet/register workflows later.
+    """
+
+    __tablename__ = "workflow_instances"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    workflow_definition_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_definitions.id"), nullable=False
+    )
+    subject_kind: Mapped[str] = mapped_column(String(50), nullable=False, default="document")
+    subject_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    current_step_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_step_definitions.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    workflow_definition: Mapped["WorkflowDefinition"] = relationship("WorkflowDefinition")
+    current_step: Mapped[Optional["WorkflowStepDefinition"]] = relationship("WorkflowStepDefinition")
+    tasks: Mapped[list["WorkflowTask"]] = relationship(
+        "WorkflowTask", back_populates="workflow_instance", cascade="all, delete-orphan"
+    )
+    history_events: Mapped[list["WorkflowHistoryEvent"]] = relationship(
+        "WorkflowHistoryEvent", back_populates="workflow_instance", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_workflow_instances_subject", "subject_kind", "subject_id"),
+        Index("ix_workflow_instances_status", "status"),
+        Index("ix_workflow_instances_workflow_definition_id", "workflow_definition_id"),
+        Index("ix_workflow_instances_current_step_id", "current_step_id"),
+    )
+
+
+class WorkflowTask(Base):
+    """Current responsibility snapshot for a workflow step."""
+
+    __tablename__ = "workflow_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    workflow_instance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_instances.id"), nullable=False
+    )
+    step_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_step_definitions.id"), nullable=False
+    )
+    assignment_target_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assignment_targets.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="open")
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    workflow_instance: Mapped["WorkflowInstance"] = relationship("WorkflowInstance", back_populates="tasks")
+    step: Mapped["WorkflowStepDefinition"] = relationship("WorkflowStepDefinition")
+    assignment_target: Mapped[Optional["AssignmentTarget"]] = relationship("AssignmentTarget")
+
+    __table_args__ = (
+        Index("ix_workflow_tasks_instance_id", "workflow_instance_id"),
+        Index("ix_workflow_tasks_step_id", "step_id"),
+        Index("ix_workflow_tasks_status", "status"),
+        Index("ix_workflow_tasks_assignment_target_id", "assignment_target_id"),
+    )
+
+
+class WorkflowHistoryEvent(Base):
+    """Audit/history event for workflow start, transitions, completion and cancellation."""
+
+    __tablename__ = "workflow_history_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    workflow_instance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_instances.id"), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    from_step_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_step_definitions.id"), nullable=True
+    )
+    to_step_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_step_definitions.id"), nullable=True
+    )
+    transition_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflow_transition_definitions.id"), nullable=True
+    )
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    workflow_instance: Mapped["WorkflowInstance"] = relationship("WorkflowInstance", back_populates="history_events")
+    from_step: Mapped[Optional["WorkflowStepDefinition"]] = relationship("WorkflowStepDefinition", foreign_keys=[from_step_id])
+    to_step: Mapped[Optional["WorkflowStepDefinition"]] = relationship("WorkflowStepDefinition", foreign_keys=[to_step_id])
+    transition: Mapped[Optional["WorkflowTransitionDefinition"]] = relationship("WorkflowTransitionDefinition")
+
+    __table_args__ = (
+        Index("ix_workflow_history_events_instance_id", "workflow_instance_id"),
+        Index("ix_workflow_history_events_event_type", "event_type"),
+        Index("ix_workflow_history_events_created_at", "created_at"),
+    )
+
+
 # --- Document Models ---
 
 class DocType(str, enum.Enum):

@@ -216,6 +216,74 @@ def _ensure_identity_tables(conn) -> None:
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_transition_definitions_from_step_id ON workflow_transition_definitions (from_step_id)"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_transition_definitions_to_step_id ON workflow_transition_definitions (to_step_id)"))
 
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_instances (
+                id UUID PRIMARY KEY,
+                workflow_definition_id UUID NOT NULL REFERENCES workflow_definitions(id),
+                subject_kind VARCHAR(50) NOT NULL DEFAULT 'document',
+                subject_id UUID NOT NULL,
+                current_step_id UUID NULL REFERENCES workflow_step_definitions(id),
+                status VARCHAR(50) NOT NULL DEFAULT 'active',
+                title VARCHAR(255) NULL,
+                started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMP NULL,
+                cancelled_at TIMESTAMP NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_instances_subject ON workflow_instances (subject_kind, subject_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_instances_status ON workflow_instances (status)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_instances_workflow_definition_id ON workflow_instances (workflow_definition_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_instances_current_step_id ON workflow_instances (current_step_id)"))
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_tasks (
+                id UUID PRIMARY KEY,
+                workflow_instance_id UUID NOT NULL REFERENCES workflow_instances(id),
+                step_id UUID NOT NULL REFERENCES workflow_step_definitions(id),
+                assignment_target_id UUID NULL REFERENCES assignment_targets(id),
+                status VARCHAR(50) NOT NULL DEFAULT 'open',
+                due_at TIMESTAMP NULL,
+                completed_at TIMESTAMP NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_tasks_instance_id ON workflow_tasks (workflow_instance_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_tasks_step_id ON workflow_tasks (step_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_tasks_status ON workflow_tasks (status)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_tasks_assignment_target_id ON workflow_tasks (assignment_target_id)"))
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_history_events (
+                id UUID PRIMARY KEY,
+                workflow_instance_id UUID NOT NULL REFERENCES workflow_instances(id),
+                event_type VARCHAR(50) NOT NULL,
+                from_step_id UUID NULL REFERENCES workflow_step_definitions(id),
+                to_step_id UUID NULL REFERENCES workflow_step_definitions(id),
+                transition_id UUID NULL REFERENCES workflow_transition_definitions(id),
+                comment TEXT NULL,
+                actor_label VARCHAR(255) NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_history_events_instance_id ON workflow_history_events (workflow_instance_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_history_events_event_type ON workflow_history_events (event_type)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_workflow_history_events_created_at ON workflow_history_events (created_at)"))
+
     advisory_lock_key = int(hashlib.sha1(b"archiva:seed:roles").hexdigest()[:15], 16)
     lock_acquired = conn.execute(
         text("SELECT pg_try_advisory_xact_lock(:key)"),

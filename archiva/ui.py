@@ -21,13 +21,14 @@ from sqlalchemy.exc import IntegrityError
 from archiva.database import get_db
 from archiva.config import load_settings
 from archiva.metadata_validation import metadata_from_json, validate_document_metadata, MetadataValidationError
-from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowStepDefinition, WorkflowTransitionDefinition
+from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowHistoryEvent, WorkflowInstance, WorkflowStepDefinition, WorkflowTransitionDefinition
 from archiva.preview_queue import enqueue_preview_job, get_latest_preview_artifact, get_latest_preview_job
 from archiva.indexer.dispatcher import enqueue_document_index
 from archiva.indexer.status import indexing_runtime_status
 from archiva.search.service import SearchService
 from archiva.search_legacy import update_document_vector
 from archiva.storage import StorageManager
+from archiva.workflow_runtime import WorkflowRuntimeError, active_instances_for_document, cancel_workflow, complete_workflow, start_workflow_for_document, transition_workflow
 
 router = APIRouter(tags=["ui"])
 
@@ -1109,6 +1110,7 @@ async def ui_app_home(
     form_data: str | None = None,
     q: str | None = None,
     filter_kind: str | None = None,
+    workflow_panel: str | None = None,
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     all_documents = _active_documents_query(db).order_by(Document.created_at.desc()).all()
@@ -1148,8 +1150,91 @@ async def ui_app_home(
             q or "",
             filter_kind or "all",
             cabinet_types,
+            db,
+            workflow_panel == "1",
         )
     )
+
+
+def _workflow_app_redirect(document_id: UUID, message: str | None = None) -> RedirectResponse:
+    parts = ["node_kind=document", f"node_id={quote_plus(str(document_id))}", "workflow_panel=1"]
+    if message:
+        parts.append(f"message={quote_plus(message)}")
+    return RedirectResponse(url=f"/ui/app?{'&'.join(parts)}#workflow-panel", status_code=303)
+
+
+@router.post("/app/documents/{document_id}/workflows/start")
+async def ui_app_start_document_workflow(
+    document_id: UUID,
+    request: Request,
+    workflow_definition_id: UUID = Form(...),
+    comment: str = Form(""),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    _actor_id, actor_label = _current_delete_actor(db, request)
+    try:
+        instance = start_workflow_for_document(db, document_id=document_id, workflow_definition_id=workflow_definition_id, actor_label=actor_label, comment=comment)
+    except WorkflowRuntimeError as exc:
+        return _workflow_app_redirect(document_id, str(exc))
+    return _workflow_app_redirect(document_id, f"Workflow {instance.title or 'Workflow'} gestartet")
+
+
+@router.post("/app/workflows/{instance_id}/transition")
+async def ui_app_transition_workflow(
+    instance_id: UUID,
+    request: Request,
+    transition_id: UUID = Form(...),
+    comment: str = Form(""),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    instance = db.query(WorkflowInstance).where(WorkflowInstance.id == instance_id).first()
+    document_id = instance.subject_id if instance and instance.subject_kind == "document" else None
+    try:
+        updated = transition_workflow(db, instance_id=instance_id, transition_id=transition_id, actor_label=_current_delete_actor(db, request)[1], comment=comment)
+        document_id = updated.subject_id
+    except WorkflowRuntimeError as exc:
+        if document_id:
+            return _workflow_app_redirect(document_id, str(exc))
+        return RedirectResponse(url=f"/ui/app?message={quote_plus(str(exc))}", status_code=303)
+    return _workflow_app_redirect(document_id, "Workflow-Schritt aktualisiert")
+
+
+@router.post("/app/workflows/{instance_id}/complete")
+async def ui_app_complete_workflow(
+    instance_id: UUID,
+    request: Request,
+    comment: str = Form(""),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    instance = db.query(WorkflowInstance).where(WorkflowInstance.id == instance_id).first()
+    document_id = instance.subject_id if instance and instance.subject_kind == "document" else None
+    try:
+        updated = complete_workflow(db, instance_id=instance_id, actor_label=_current_delete_actor(db, request)[1], comment=comment)
+        document_id = updated.subject_id
+    except WorkflowRuntimeError as exc:
+        if document_id:
+            return _workflow_app_redirect(document_id, str(exc))
+        return RedirectResponse(url=f"/ui/app?message={quote_plus(str(exc))}", status_code=303)
+    return _workflow_app_redirect(document_id, "Workflow abgeschlossen")
+
+
+@router.post("/app/workflows/{instance_id}/cancel")
+async def ui_app_cancel_workflow(
+    instance_id: UUID,
+    request: Request,
+    comment: str = Form(""),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    instance = db.query(WorkflowInstance).where(WorkflowInstance.id == instance_id).first()
+    document_id = instance.subject_id if instance and instance.subject_kind == "document" else None
+    try:
+        updated = cancel_workflow(db, instance_id=instance_id, actor_label=_current_delete_actor(db, request)[1], comment=comment)
+        document_id = updated.subject_id
+    except WorkflowRuntimeError as exc:
+        if document_id:
+            return _workflow_app_redirect(document_id, str(exc))
+        return RedirectResponse(url=f"/ui/app?message={quote_plus(str(exc))}", status_code=303)
+    return _workflow_app_redirect(document_id, "Workflow abgebrochen")
 
 
 @router.get("/app/documents/{document_id}", response_class=HTMLResponse)
@@ -3501,6 +3586,122 @@ def _render_search_results(documents: list[Document], search_query: str) -> tupl
     return f"<div class='object-list'>{results}</div>", header
 
 
+def _workflow_assignment_label(step: WorkflowStepDefinition | None) -> str:
+    target = step.assignment_target if step else None
+    if not target:
+        return "Nicht zugewiesen"
+    return target.label or target.description or str(target.target_type)
+
+
+def _workflow_instance_label(instance: WorkflowInstance) -> str:
+    workflow_name = instance.workflow_definition.name if instance.workflow_definition else (instance.title or "Workflow")
+    step_name = instance.current_step.name if instance.current_step else "Ohne aktuellen Schritt"
+    return f"{workflow_name} · {step_name}"
+
+
+def _render_workflow_hero(document: Document, active_instances: list[WorkflowInstance]) -> str:
+    if not active_instances:
+        return ""
+    count_label = "1 aktiver Workflow" if len(active_instances) == 1 else f"{len(active_instances)} aktive Workflows"
+    detail_label = _workflow_instance_label(active_instances[0])
+    return f"""
+      <a id="workflow-hero" class="workflow-hero" href="/ui/app?node_kind=document&node_id={_escape(str(document.id))}&workflow_panel=1#workflow-panel">
+        <div class="workflow-hero-icon">↝</div>
+        <div>
+          <div class="eyebrow">Workflow aktiv</div>
+          <strong>{_escape(count_label)}</strong>
+          <div class="muted">{_escape(detail_label)} · Maske öffnen</div>
+        </div>
+      </a>
+    """
+
+
+def _render_workflow_panel(document: Document, db: Session | None) -> str:
+    if db is None:
+        return "<div class='panel' id='workflow-panel'><h2>Workflow</h2><p class='muted'>Workflow Runtime ist nicht verfügbar.</p></div>"
+    active_instances = active_instances_for_document(db, document.id)
+    workflow_definitions = db.query(WorkflowDefinition).where(WorkflowDefinition.is_active.is_(True)).order_by(WorkflowDefinition.name).all()
+    instance_cards = []
+    for instance in active_instances:
+        outgoing = []
+        if instance.current_step_id:
+            outgoing = (
+                db.query(WorkflowTransitionDefinition)
+                .where(WorkflowTransitionDefinition.from_step_id == instance.current_step_id)
+                .order_by(WorkflowTransitionDefinition.is_default.desc(), WorkflowTransitionDefinition.label)
+                .all()
+            )
+        transition_buttons = "".join(
+            f"""
+            <form method="post" action="/ui/app/workflows/{instance.id}/transition" class="workflow-action-form">
+              <input type="hidden" name="transition_id" value="{transition.id}">
+              <textarea name="comment" rows="2" placeholder="Kommentar optional"></textarea>
+              <button class="primary" type="submit">{_escape(transition.label)} → {_escape(transition.to_step.name if transition.to_step else 'Ziel')}</button>
+            </form>
+            """
+            for transition in outgoing
+        ) or "<p class='muted'>Keine ausgehenden Transitionen. Workflow kann abgeschlossen oder abgebrochen werden.</p>"
+        history_events = (
+            db.query(WorkflowHistoryEvent)
+            .where(WorkflowHistoryEvent.workflow_instance_id == instance.id)
+            .order_by(WorkflowHistoryEvent.created_at.desc())
+            .limit(8)
+            .all()
+        )
+        history_html = "".join(
+            f"<li><strong>{_escape(event.event_type)}</strong> <span class='muted'>{_escape(str(event.created_at))} · {_escape(event.actor_label or 'System')}</span>{f'<div>{_escape(event.comment)}</div>' if event.comment else ''}</li>"
+            for event in history_events
+        ) or "<li class='muted'>Noch keine History.</li>"
+        instance_cards.append(
+            f"""
+            <div class="workflow-instance-card">
+              <div class="section-head">
+                <div>
+                  <h3 style="margin:0;">{_escape(instance.workflow_definition.name if instance.workflow_definition else instance.title or 'Workflow')}</h3>
+                  <p class="muted">Aktueller Schritt: <strong>{_escape(instance.current_step.name if instance.current_step else '—')}</strong> · Zuständig: {_escape(_workflow_assignment_label(instance.current_step))}</p>
+                </div>
+                <span class="service-badge">{_escape(instance.status)}</span>
+              </div>
+              <div class="workflow-action-grid">{transition_buttons}</div>
+              <details class="workflow-danger-zone">
+                <summary>Abschluss / Abbruch</summary>
+                <div class="workflow-action-grid">
+                  <form method="post" action="/ui/app/workflows/{instance.id}/complete" class="workflow-action-form"><textarea name="comment" rows="2" placeholder="Kommentar zum Abschluss optional"></textarea><button type="submit">Workflow abschließen</button></form>
+                  <form method="post" action="/ui/app/workflows/{instance.id}/cancel" class="workflow-action-form"><textarea name="comment" rows="2" placeholder="Grund für Abbruch optional"></textarea><button class="danger-action" type="submit">Workflow abbrechen</button></form>
+                </div>
+              </details>
+              <h4>Historie</h4>
+              <ul class="workflow-history-list">{history_html}</ul>
+            </div>
+            """
+        )
+    workflow_options = _option_list([(str(workflow.id), workflow.name) for workflow in workflow_definitions], include_blank="Workflow auswählen")
+    start_panel = f"""
+      <div class="workflow-instance-card">
+        <h3 style="margin-top:0;">Workflow starten</h3>
+        <form method="post" action="/ui/app/documents/{document.id}/workflows/start" class="workflow-action-form">
+          <select name="workflow_definition_id" required>{workflow_options or '<option value="">Keine aktiven Workflow-Vorlagen</option>'}</select>
+          <textarea name="comment" rows="2" placeholder="Startkommentar optional"></textarea>
+          <button class="primary" type="submit" {'disabled' if not workflow_definitions else ''}>Workflow starten</button>
+        </form>
+      </div>
+    """
+    active_html = "".join(instance_cards) or "<p class='muted'>Auf diesem Dokument läuft aktuell kein Workflow.</p>"
+    return f"""
+      <div class="panel workflow-panel" id="workflow-panel">
+        <div class="section-head">
+          <div>
+            <div class="eyebrow">Workflow Runtime</div>
+            <h2 style="margin:0;">Workflow-Maske</h2>
+            <p class="muted">{_escape(document.title or document.name)} · parallele Workflows erlaubt</p>
+          </div>
+          <a class="chip" href="/ui/app?node_kind=document&node_id={document.id}">Zur Objektansicht</a>
+        </div>
+        {active_html}
+        {start_panel}
+      </div>
+    """
+
 
 def _render_app_page(
     cabinets: list[Cabinet],
@@ -3516,6 +3717,8 @@ def _render_app_page(
     search_query: str,
     filter_kind: str,
     cabinet_types: list[CabinetType] | None = None,
+    db: Session | None = None,
+    workflow_panel_open: bool = False,
 ) -> str:
     recent_documents_html = _render_recent_documents(recent_documents)
     indexing_status = indexing_runtime_status()
@@ -3607,6 +3810,8 @@ def _render_app_page(
     capture_field_inputs = []
     selected_document_metadata_html = "<div class='muted'>Kein Objekt ausgewählt.</div>"
     selected_document_preview_html = "<div class='muted'>Keine Vorschau verfügbar.</div>"
+    workflow_hero_html = ""
+    workflow_panel_html = ""
     if selected_node and selected_node.get("kind") == "cabinet":
         selected_cabinet_documents = [document for document in all_documents if _resolved_document_cabinet(document) and selected_cabinet and str(_resolved_document_cabinet(document).id) == str(selected_cabinet.id)]
         cabinet_fields = _metadata_fields_for_cabinet(selected_cabinet) if selected_cabinet else []
@@ -3643,6 +3848,11 @@ def _render_app_page(
         )
         selected_document_metadata_html = metadata_rows + indexing_rows
         selected_document_preview_html = _render_document_preview(selected_document, f"/ui/app/documents/{selected_document.id}/download")
+        if db is not None:
+            active_workflows = active_instances_for_document(db, selected_document.id)
+            workflow_hero_html = _render_workflow_hero(selected_document, active_workflows)
+            if workflow_panel_open:
+                workflow_panel_html = _render_workflow_panel(selected_document, db)
     if selected_capture_document_type:
         for field in _definition_fields_for_document_type(selected_capture_document_type):
             capture_fields.append(f'{field.label or field.name}: {field.field_type}')
@@ -3868,6 +4078,18 @@ def _render_app_page(
     .mini-cta-row {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }}
     .mini-cta {{ display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:999px; background:rgba(77,212,255,0.10); border:1px solid rgba(77,212,255,0.18); color:var(--text); font-size:.92rem; }}
     .mini-cta:hover {{ text-decoration:none; border-color:rgba(77,212,255,.42); box-shadow:0 0 0 4px var(--glow); }}
+    .workflow-hero {{ display:flex; gap:12px; align-items:center; margin-bottom:12px; padding:14px; border-radius:18px; border:1px solid rgba(110,231,183,0.32); background:linear-gradient(135deg, rgba(110,231,183,0.14), rgba(77,212,255,0.08)); color:var(--text); box-shadow:0 16px 40px rgba(110,231,183,0.10); }}
+    .workflow-hero:hover {{ text-decoration:none; border-color:rgba(110,231,183,0.58); box-shadow:0 0 0 4px rgba(110,231,183,0.13), 0 18px 46px rgba(110,231,183,0.14); }}
+    .workflow-hero-icon {{ display:grid; place-items:center; width:42px; height:42px; border-radius:16px; background:rgba(110,231,183,0.18); color:#d6fff0; font-size:1.4rem; }}
+    .workflow-panel {{ scroll-margin-top:18px; }}
+    .workflow-instance-card {{ margin-top:14px; padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.12); background:rgba(255,255,255,0.035); }}
+    .workflow-action-grid {{ display:grid; gap:10px; margin-top:12px; }}
+    .workflow-action-form {{ display:grid; gap:8px; margin:0; }}
+    .workflow-action-form textarea, .workflow-action-form select {{ width:100%; border-radius:12px; border:1px solid rgba(77,212,255,0.16); background:rgba(255,255,255,0.04); color:var(--text); padding:10px 12px; font:inherit; box-sizing:border-box; }}
+    .workflow-danger-zone {{ margin-top:12px; padding:10px 12px; border-radius:14px; border:1px solid rgba(255,123,123,0.16); background:rgba(255,123,123,0.04); }}
+    .workflow-danger-zone summary {{ cursor:pointer; color:#ffcccc; }}
+    .workflow-history-list {{ margin:8px 0 0; padding-left:18px; color:var(--text); }}
+    .workflow-history-list li {{ margin:8px 0; }}
     .context-note {{ margin-top:10px; padding:10px 12px; border-radius:14px; background:rgba(255,255,255,0.03); border:1px solid rgba(77,212,255,0.10); color:var(--muted); font-size:.92rem; }}
     .service-card::before {{ content:""; position:absolute; inset:0; background: linear-gradient(135deg, rgba(79,140,255,0.10), rgba(77,212,255,0.03) 55%, transparent 80%); pointer-events:none; }}
     .service-header {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; position:relative; z-index:1; }}
@@ -3969,9 +4191,10 @@ def _render_app_page(
           {quick_create_panel_html}
           {metadata_workspace_html}
           <div id="node-content-view">
-            {node_header_html}
-            {intake_panel_html}
-            {node_results_html}
+            {workflow_panel_html}
+            {node_header_html if not workflow_panel_html else ''}
+            {intake_panel_html if not workflow_panel_html else ''}
+            {node_results_html if not workflow_panel_html else ''}
             <div style="margin-top:20px;">{object_summary_html}</div>
             {object_overview_html}
           </div>
@@ -3979,6 +4202,7 @@ def _render_app_page(
         <div class="admin-detail-column" style="display:block;">
           <div class="panel compact-indexdata" style="margin-bottom:12px;">
             <h2 style="margin-top:0;">Inhaltsvorschau</h2>
+            {workflow_hero_html}
             {selected_document_preview_html if selected_document else selected_document_metadata_html}
             {f'<div class="actions"><a class="chip" href="/ui/app/documents/{selected_document.id}">Dokument öffnen</a></div>' if selected_document else ''}
           </div>
