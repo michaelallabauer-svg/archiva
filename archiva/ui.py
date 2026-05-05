@@ -567,6 +567,120 @@ def _parse_field_options(field: MetadataField) -> list[str]:
     return [str(option) for option in parsed_options] if isinstance(parsed_options, list) else []
 
 
+def _identity_reference_options(db: Session | None, value: Any = None) -> str:
+    current = ""
+    if isinstance(value, dict):
+        current = f"{value.get('kind')}:{value.get('id')}"
+    elif value:
+        current = str(value)
+    if db is None:
+        return '<option value="">Benutzer/Team-Auswahl nicht geladen</option>'
+    users = db.query(User).where(User.status == "active").order_by(User.display_name, User.email).all()
+    teams = db.query(Team).order_by(Team.name).all()
+    parts = ['<option value="">Bitte wählen</option>']
+    if users:
+        parts.append('<optgroup label="Benutzer">')
+        for user in users:
+            option_value = f"user:{user.id}"
+            label = user.display_name or user.email
+            suffix = f" · {user.email}" if user.email and user.email != label else ""
+            parts.append(f'<option value="{_escape(option_value)}" {"selected" if current == option_value else ""}>{_escape(label + suffix)}</option>')
+        parts.append('</optgroup>')
+    if teams:
+        parts.append('<optgroup label="Teams">')
+        for team in teams:
+            option_value = f"team:{team.id}"
+            parts.append(f'<option value="{_escape(option_value)}" {"selected" if current == option_value else ""}>{_escape(team.name)}</option>')
+        parts.append('</optgroup>')
+    return "".join(parts)
+
+
+def _identity_reference_label(db: Session, raw_value: str) -> str:
+    kind, item_id = [part.strip() for part in raw_value.split(":", 1)]
+    try:
+        uid = UUID(item_id)
+    except ValueError:
+        return raw_value
+    if kind == "user":
+        user = db.query(User).where(User.id == uid).first()
+        return user.display_name or user.email if user else raw_value
+    if kind == "team":
+        team = db.query(Team).where(Team.id == uid).first()
+        return team.name if team else raw_value
+    return raw_value
+
+
+def _auto_id_template(field: MetadataField) -> str:
+    return (field.pattern or field.default_value or "{YYYY}-{####}").strip()
+
+
+def _render_auto_id(template: str, counter: int, now: datetime | None = None) -> str:
+    now = now or datetime.utcnow()
+    rendered = template
+    replacements = {
+        "{YYYY}": f"{now.year:04d}",
+        "{YY}": f"{now.year % 100:02d}",
+        "{MM}": f"{now.month:02d}",
+        "{DD}": f"{now.day:02d}",
+        "%JAHR%": f"{now.year:04d}",
+        "%JJ%": f"{now.year % 100:02d}",
+        "%MONAT%": f"{now.month:02d}",
+        "%TAG%": f"{now.day:02d}",
+    }
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    match = re.search(r"\{(#+)\}|#+", rendered)
+    if match:
+        width = len(match.group(1) or match.group(0))
+        rendered = rendered[:match.start()] + str(counter).zfill(width) + rendered[match.end():]
+    return rendered
+
+
+def _next_auto_id_value(db: Session, document_type: DocumentType, field: MetadataField) -> str:
+    template = _auto_id_template(field)
+    probe = _render_auto_id(template, 0)
+    hash_match = re.search(r"0+", probe)
+    width = len(hash_match.group(0)) if hash_match else 4
+    prefix = probe[:hash_match.start()] if hash_match else probe
+    suffix = probe[hash_match.end():] if hash_match else ""
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d{{{width},}}){re.escape(suffix)}$")
+    max_counter = 0
+    documents = db.query(Document).where(Document.document_type_id == document_type.id).all()
+    for document in documents:
+        metadata = metadata_from_json(document.metadata_json) or {}
+        raw = metadata.get(field.name)
+        value = str(raw or "")
+        match = pattern.match(value)
+        if match:
+            max_counter = max(max_counter, int(match.group(1)))
+    return _render_auto_id(template, max_counter + 1)
+
+
+def _apply_automatic_metadata(db: Session, document_type: DocumentType, metadata: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(metadata)
+    for field in _definition_fields_for_document_type(document_type):
+        if field.field_type != "auto_id":
+            continue
+        if enriched.get(field.name):
+            continue
+        enriched[field.name] = _next_auto_id_value(db, document_type, field)
+    return enriched
+
+
+def _resolve_identity_metadata_labels(db: Session, document_type: DocumentType, metadata: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(metadata)
+    for field in _definition_fields_for_document_type(document_type):
+        if field.field_type != "identity_reference":
+            continue
+        raw = enriched.get(field.name)
+        if not raw or isinstance(raw, dict) or ":" not in str(raw):
+            continue
+        kind, item_id = [part.strip() for part in str(raw).split(":", 1)]
+        label = _identity_reference_label(db, str(raw))
+        enriched[field.name] = {"kind": kind, "id": item_id, "label": label}
+    return enriched
+
+
 def _selected_document_type(selected_document_type_id: str | None, db: Session) -> DocumentType | None:
     if not selected_document_type_id:
         return None
@@ -655,6 +769,12 @@ def _metadata_width_class(width: str | None) -> str:
 
 
 def _format_metadata_display_value(value: Any) -> str:
+    if isinstance(value, dict):
+        label = str(value.get("label") or value.get("id") or "").strip()
+        kind = str(value.get("kind") or "").strip()
+        if label and kind in {"user", "team"}:
+            return f"{label} ({'Benutzer' if kind == 'user' else 'Team'})"
+        return label or "—"
     if isinstance(value, list):
         return ", ".join(str(item) for item in value if item not in (None, "")) or "—"
     if isinstance(value, bool):
@@ -706,7 +826,7 @@ def _render_metadata_display(
     return '<div class="metadata-display-grid">' + ''.join(cards) + '</div>'
 
 
-def _metadata_value_input(field: MetadataField, value: Any) -> str:
+def _metadata_value_input(field: MetadataField, value: Any, db: Session | None = None) -> str:
     input_name = f"metadata_{field.name}"
     safe_placeholder = _escape(field.placeholder or "")
     required = "required" if field.is_required else ""
@@ -731,6 +851,17 @@ def _metadata_value_input(field: MetadataField, value: Any) -> str:
             f'<label class="checkbox-item"><input type="checkbox" name="{input_name}" value="{_escape(option)}" {"checked" if option in selected_values else ""}> {_escape(option)}</label>'
             for option in options
         ) + '</div>'
+    elif field.field_type == "identity_reference":
+        control = f'<select name="{input_name}" {required}>{_identity_reference_options(db, value)}</select>'
+    elif field.field_type == "auto_id":
+        template = _escape(_auto_id_template(field))
+        display_value = _escape(str(value or "Wird beim Speichern automatisch vergeben"))
+        hidden_value = _escape(str(value or ""))
+        control = (
+            f'<input type="hidden" name="{input_name}" value="{hidden_value}">'
+            f'<input type="text" value="{display_value}" readonly class="readonly-input">'
+            f'<div class="muted field-help">Muster: {template}. Beispiel: ER-{{YYYY}}-{{####}} → ER-2026-0001.</div>'
+        )
     elif field.field_type == "date":
         control = f'<input type="date" name="{input_name}" value="{_escape(str(value))}" placeholder="{safe_placeholder}" {required}>'
     elif field.field_type == "datetime":
@@ -803,7 +934,7 @@ def _metadata_initial_values_for_object(target: Any, fields: list[MetadataField]
     return values
 
 
-def _render_metadata_workspace(selected_node: dict[str, Any] | None, selected_cabinet: Cabinet | None, selected_register: Register | None) -> str:
+def _render_metadata_workspace(selected_node: dict[str, Any] | None, selected_cabinet: Cabinet | None, selected_register: Register | None, db: Session | None = None) -> str:
     if not selected_node:
         return ""
     node_kind = str(selected_node.get("kind") or "")
@@ -814,7 +945,7 @@ def _render_metadata_workspace(selected_node: dict[str, Any] | None, selected_ca
     fields = _metadata_fields_for_cabinet(target) if node_kind == "cabinet" else _metadata_fields_for_register(target)
     values = _metadata_initial_values_for_object(target, fields)
     if fields:
-        field_inputs = "".join(_metadata_value_input(field, values.get(field.name)) for field in fields)
+        field_inputs = "".join(_metadata_value_input(field, values.get(field.name), db) for field in fields)
     else:
         field_inputs = "<p class='muted'>Für dieses Element sind noch keine Metadatenfelder definiert. Felddefinitionen legst du im Admin an.</p>"
     action = f"/ui/app/{'cabinets' if node_kind == 'cabinet' else 'registers'}/{target.id}/metadata"
@@ -1048,6 +1179,29 @@ def _invoice_default_fields(document_type_id: UUID) -> list[MetadataField]:
         if name == "invoice_status":
             field.options = json.dumps(["offen", "in Prüfung", "freigegeben", "bezahlt"], ensure_ascii=False)
         fields.append(field)
+    fields.insert(0, MetadataField(
+        document_type_id=document_type_id,
+        name="er_id",
+        label="Interne ER-ID",
+        field_type="auto_id",
+        description="Automatisch erzeugte interne Eingangsrechnungs-ID",
+        pattern="ER-{YYYY}-{####}",
+        is_required=True,
+        is_unique=True,
+        order=-2,
+        width="half",
+    ))
+    fields.insert(1, MetadataField(
+        document_type_id=document_type_id,
+        name="responsible_identity",
+        label="Zuständig",
+        field_type="identity_reference",
+        description="Benutzer oder Team, das fachlich für die Rechnung zuständig ist",
+        is_required=False,
+        is_unique=False,
+        order=-1,
+        width="half",
+    ))
     return fields
 
 
@@ -1664,7 +1818,7 @@ async def ui_app_document_detail(
         raise HTTPException(status_code=404, detail="Document not found")
     form_values = _parse_json_dict(form_data) if form_data else None
     cabinets = _active_cabinets_query(db).order_by(Cabinet.order).all()
-    return HTMLResponse(content=_render_document_detail_page(document, cabinets=cabinets, message=message, error_field=error_field, error_message=error_message, form_values=form_values))
+    return HTMLResponse(content=_render_document_detail_page(document, cabinets=cabinets, db=db, message=message, error_field=error_field, error_message=error_message, form_values=form_values))
 
 
 @router.post("/app/documents/{document_id}/metadata")
@@ -1681,6 +1835,9 @@ async def ui_app_document_update_metadata(
 
     form = await request.form()
     metadata = _collect_form_metadata(form, document.document_type)
+    metadata = {**(metadata_from_json(document.metadata_json) or {}), **metadata}
+    metadata = _apply_automatic_metadata(db, document.document_type, metadata)
+    metadata = _resolve_identity_metadata_labels(db, document.document_type, metadata)
 
     try:
         validation = validate_document_metadata(
@@ -2046,6 +2203,8 @@ async def ui_app_intake(
 
     form = await request.form()
     metadata = _collect_form_metadata(form, document_type)
+    metadata = _apply_automatic_metadata(db, document_type, metadata)
+    metadata = _resolve_identity_metadata_labels(db, document_type, metadata)
 
     try:
         validation = validate_document_metadata(db, document_type.id, metadata)
@@ -3084,10 +3243,14 @@ async def ui_create_metadata_field(
     description: str = Form(""),
     placeholder: str = Form(""),
     default_value: str = Form(""),
+    pattern: str = Form(""),
     width: str = Form("half"),
     is_required: str | None = Form(None),
     is_unique: str | None = Form(None),
     order: int = Form(0),
+    return_to: str = Form(""),
+    node_kind: str = Form(""),
+    node_id: str = Form(""),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
     resolved_document_type_id = UUID(document_type_id) if document_type_id else None
@@ -3134,6 +3297,7 @@ async def ui_create_metadata_field(
         description=description.strip() or None,
         placeholder=placeholder.strip() or None,
         default_value=default_value.strip() or None,
+        pattern=pattern.strip() or None,
         width=width,
         is_required=bool(is_required),
         is_unique=bool(is_unique),
@@ -3251,6 +3415,7 @@ async def ui_update_metadata_field(
     description: str = Form(""),
     placeholder: str = Form(""),
     default_value: str = Form(""),
+    pattern: str = Form(""),
     width: str = Form("half"),
     is_required: str | None = Form(None),
     is_unique: str | None = Form(None),
@@ -3272,6 +3437,7 @@ async def ui_update_metadata_field(
     field.description = description.strip() or None
     field.placeholder = placeholder.strip() or None
     field.default_value = default_value.strip() or None
+    field.pattern = pattern.strip() or None
     field.width = width
     field.is_required = bool(is_required)
     field.is_unique = bool(is_unique)
@@ -4479,6 +4645,17 @@ def _render_app_page(
                     f'<label class="checkbox-item"><input type="checkbox" name="{input_name}" value="{_escape(option)}" {"checked" if option in selected_values else ""}> {_escape(option)}</label>'
                     for option in options
                 ) + '</div>'
+            elif field.field_type == "identity_reference":
+                control = f'<select name="{input_name}" {required}>{_identity_reference_options(db, value)}</select>'
+            elif field.field_type == "auto_id":
+                template = _escape(_auto_id_template(field))
+                display_value = _escape(str(value or "Wird beim Speichern automatisch vergeben"))
+                hidden_value = _escape(str(value or ""))
+                control = (
+                    f'<input type="hidden" name="{input_name}" value="{hidden_value}">'
+                    f'<input type="text" value="{display_value}" readonly class="readonly-input">'
+                    f'<div class="muted field-help">Muster: {template}. Beispiel: ER-{{YYYY}}-{{####}} → ER-2026-0001.</div>'
+                )
             elif field.field_type == "date":
                 control = f'<input type="date" name="{input_name}" value="{_escape(value)}" placeholder="{safe_placeholder}" {required}>'
             elif field.field_type == "datetime":
@@ -4534,7 +4711,7 @@ def _render_app_page(
             f'<div class="actions"><button class="primary" type="submit" id="intake-submit-btn">Dokument speichern</button></div></form></div>'
         )
 
-    metadata_workspace_html = _render_metadata_workspace(selected_node, selected_cabinet, selected_register)
+    metadata_workspace_html = _render_metadata_workspace(selected_node, selected_cabinet, selected_register, db)
 
     quick_create_panel_html = f'''
       <div class="panel dynamic-workbench" id="quick-create" style="display:none; margin-bottom:16px;">
@@ -5146,6 +5323,7 @@ def _render_document_detail_page(
     document: Document,
     cabinets: list[Cabinet],
     *,
+    db: Session | None = None,
     message: str | None = None,
     error_field: str | None = None,
     error_message: str | None = None,
@@ -5228,6 +5406,17 @@ def _render_document_detail_page(
                     f'<label class="checkbox-item"><input type="checkbox" name="{input_name}" value="{_escape(option)}" {"checked" if option in selected_values else ""}> {_escape(option)}</label>'
                     for option in options
                 ) + '</div>'
+            elif field.field_type == "identity_reference":
+                control = f'<select name="{input_name}" {required}>{_identity_reference_options(db, value)}</select>'
+            elif field.field_type == "auto_id":
+                template = _escape(_auto_id_template(field))
+                display_value = _escape(str(value or "Wird beim Speichern automatisch vergeben"))
+                hidden_value = _escape(str(value or ""))
+                control = (
+                    f'<input type="hidden" name="{input_name}" value="{hidden_value}">'
+                    f'<input type="text" value="{display_value}" readonly class="readonly-input">'
+                    f'<div class="muted field-help">Muster: {template}. Beispiel: ER-{{YYYY}}-{{####}} → ER-2026-0001.</div>'
+                )
             elif field.field_type == "date":
                 control = f'<input type="date" name="{input_name}" value="{_escape(value)}" placeholder="{safe_placeholder}" {required}>'
             elif field.field_type == "datetime":
@@ -7235,7 +7424,7 @@ def _render_admin_create_panel(
     )
     cabinet_type_options = _option_list([(str(cabinet_type.id), cabinet_type.name) for cabinet_type in cabinet_types], include_blank="Bitte wählen")
     document_type_field_options = _admin_document_type_options(cabinet_types, cabinets, selected_document_type)
-    field_type_options = "".join(f'<option value="{value}">{value}</option>' for value in ["text", "number", "currency", "date", "datetime", "selection", "multi_selection", "boolean", "long_text", "url", "email", "phone"])
+    field_type_options = "".join(f'<option value="{value}">{value}</option>' for value in ["text", "number", "currency", "date", "datetime", "selection", "multi_selection", "identity_reference", "auto_id", "boolean", "long_text", "url", "email", "phone"])
     width_options = "".join(f'<option value="{value}">{value}</option>' for value in ["full", "half", "third", "quarter"])
 
     selected_cabinet_type = next((ct for ct in cabinet_types if str(ct.id) == selected_definition_id), None) if selected_definition_kind == "cabinet_type" else None
@@ -7271,7 +7460,7 @@ def _render_admin_create_panel(
         default_target = "admin-form-metadata-field-edit"
     edit_field_type_options = "".join(
         f'<option value="{value}" {"selected" if selected_metadata_field and selected_metadata_field.field_type == value else ""}>{value}</option>'
-        for value in ["text", "number", "currency", "date", "datetime", "selection", "multi_selection", "boolean", "long_text", "url", "email", "phone"]
+        for value in ["text", "number", "currency", "date", "datetime", "selection", "multi_selection", "identity_reference", "auto_id", "boolean", "long_text", "url", "email", "phone"]
     )
     edit_width_options = "".join(
         f'<option value="{value}" {"selected" if selected_metadata_field and selected_metadata_field.width == value else ""}>{value}</option>'
@@ -7356,8 +7545,8 @@ def _render_admin_create_panel(
 
         <form method="post" action="/ui/admin/registers" class="panel admin-create-section" id="admin-form-register" style="display:none; margin-bottom:0;"><h3>Register anlegen</h3><p class="muted">Lege konkrete Register in einem Cabinet an und ordne optional einen Registertyp zu.</p><div class="field-grid"><div class="field"><label>Cabinet</label><select name="cabinet_id" required>{cabinet_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Register speichern</button></div></form>
 
-        <form method="post" action="/ui/admin/metadata-fields" class="panel admin-create-section" id="admin-form-metadata-field" style="display:none; margin-bottom:0;"><h3>Metadatenfeld anlegen</h3><p class="muted">Lege strukturierte Felder für Cabinettyp, Registertyp, Cabinet, Register oder Dokumenttyp fest.</p><div class="field-grid"><div class="field"><label>Zieltyp</label><select name="target_kind"><option value="cabinet_type">Cabinettyp</option><option value="register_type">Registertyp</option><option value="document_type">Dokumenttyp</option><option value="cabinet">Cabinet</option><option value="register">Register</option></select></div><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id"><option value="">Bitte wählen</option>{cabinet_type_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Cabinet</label><select name="cabinet_id"><option value="">Bitte wählen</option>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id"><option value="">Bitte wählen</option>{register_options}</select></div><div class="field"><label>Dokumenttyp</label><select name="document_type_id">{document_type_field_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Label</label><input type="text" name="label"></div><div class="field"><label>Feldtyp</label><select name="field_type">{field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder"></div><div class="field"><label>Default</label><input type="text" name="default_value"></div><div class="field"><label><input type="checkbox" name="is_required"> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique"> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Feld speichern</button></div></form>
-        <form method="post" action="/ui/admin/metadata-fields/{selected_metadata_field.id if selected_metadata_field else ''}" class="panel admin-create-section" id="admin-form-metadata-field-edit" style="display:none; margin-bottom:0;"><h3>Metadatenfeld bearbeiten</h3><p class="muted">Änderungen wirken auf Darstellung und Validierung. Bestehende JSON-Werte werden nicht umgeschrieben oder gelöscht.</p><input type="hidden" name="selected_definition_kind" value="{_escape(selected_definition_kind or '')}"><input type="hidden" name="selected_definition_id" value="{_escape(selected_definition_id or '')}"><div class="field-grid"><div class="field"><label>Name</label><input type="text" name="name" value="{_escape(selected_metadata_field.name) if selected_metadata_field else ''}" required></div><div class="field"><label>Label</label><input type="text" name="label" value="{_escape(selected_metadata_field.label or '') if selected_metadata_field else ''}"></div><div class="field"><label>Feldtyp</label><select name="field_type">{edit_field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{edit_width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="{selected_metadata_field.order if selected_metadata_field else 0}"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder" value="{_escape(selected_metadata_field.placeholder or '') if selected_metadata_field else ''}"></div><div class="field"><label>Default</label><input type="text" name="default_value" value="{_escape(selected_metadata_field.default_value or '') if selected_metadata_field else ''}"></div><div class="field"><label><input type="checkbox" name="is_required" {'checked' if selected_metadata_field and selected_metadata_field.is_required else ''}> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique" {'checked' if selected_metadata_field and selected_metadata_field.is_unique else ''}> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description">{_escape(selected_metadata_field.description or '') if selected_metadata_field else ''}</textarea></div></div><div class="actions"><button class="primary" type="submit">Metadatenfeld speichern</button></div></form>
+        <form method="post" action="/ui/admin/metadata-fields" class="panel admin-create-section" id="admin-form-metadata-field" style="display:none; margin-bottom:0;"><h3>Metadatenfeld anlegen</h3><p class="muted">Lege strukturierte Felder für Cabinettyp, Registertyp, Cabinet, Register oder Dokumenttyp fest.</p><div class="field-grid"><div class="field"><label>Zieltyp</label><select name="target_kind"><option value="cabinet_type">Cabinettyp</option><option value="register_type">Registertyp</option><option value="document_type">Dokumenttyp</option><option value="cabinet">Cabinet</option><option value="register">Register</option></select></div><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id"><option value="">Bitte wählen</option>{cabinet_type_options}</select></div><div class="field"><label>Registertyp</label><select name="register_type_id"><option value="">Bitte wählen</option>{register_type_options}</select></div><div class="field"><label>Cabinet</label><select name="cabinet_id"><option value="">Bitte wählen</option>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id"><option value="">Bitte wählen</option>{register_options}</select></div><div class="field"><label>Dokumenttyp</label><select name="document_type_id">{document_type_field_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Label</label><input type="text" name="label"></div><div class="field"><label>Feldtyp</label><select name="field_type">{field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder"></div><div class="field"><label>Default</label><input type="text" name="default_value"></div><div class="field"><label>ID-Muster / Regex</label><input type="text" name="pattern" placeholder="ER-{{YYYY}}-{{####}}"></div><div class="field"><label><input type="checkbox" name="is_required"> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique"> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Feld speichern</button></div></form>
+        <form method="post" action="/ui/admin/metadata-fields/{selected_metadata_field.id if selected_metadata_field else ''}" class="panel admin-create-section" id="admin-form-metadata-field-edit" style="display:none; margin-bottom:0;"><h3>Metadatenfeld bearbeiten</h3><p class="muted">Änderungen wirken auf Darstellung und Validierung. Bestehende JSON-Werte werden nicht umgeschrieben oder gelöscht.</p><input type="hidden" name="selected_definition_kind" value="{_escape(selected_definition_kind or '')}"><input type="hidden" name="selected_definition_id" value="{_escape(selected_definition_id or '')}"><div class="field-grid"><div class="field"><label>Name</label><input type="text" name="name" value="{_escape(selected_metadata_field.name) if selected_metadata_field else ''}" required></div><div class="field"><label>Label</label><input type="text" name="label" value="{_escape(selected_metadata_field.label or '') if selected_metadata_field else ''}"></div><div class="field"><label>Feldtyp</label><select name="field_type">{edit_field_type_options}</select></div><div class="field"><label>Breite</label><select name="width">{edit_width_options}</select></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="{selected_metadata_field.order if selected_metadata_field else 0}"></div><div class="field"><label>Placeholder</label><input type="text" name="placeholder" value="{_escape(selected_metadata_field.placeholder or '') if selected_metadata_field else ''}"></div><div class="field"><label>Default</label><input type="text" name="default_value" value="{_escape(selected_metadata_field.default_value or '') if selected_metadata_field else ''}"></div><div class="field"><label>ID-Muster / Regex</label><input type="text" name="pattern" value="{_escape(selected_metadata_field.pattern or '') if selected_metadata_field else ''}" placeholder="ER-{{YYYY}}-{{####}}"></div><div class="field"><label><input type="checkbox" name="is_required" {'checked' if selected_metadata_field and selected_metadata_field.is_required else ''}> Pflichtfeld</label></div><div class="field"><label><input type="checkbox" name="is_unique" {'checked' if selected_metadata_field and selected_metadata_field.is_unique else ''}> Eindeutig</label></div><div class="field full"><label>Beschreibung</label><textarea name="description">{_escape(selected_metadata_field.description or '') if selected_metadata_field else ''}</textarea></div></div><div class="actions"><button class="primary" type="submit">Metadatenfeld speichern</button></div></form>
       </div>
     """
 

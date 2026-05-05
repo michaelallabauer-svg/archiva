@@ -294,6 +294,42 @@ Die Inbox listet offene Workflow-Aufgaben und führt per Klick zurück zum Dokum
 
 Für Passwort-Hashing nutzt Archiva `argon2-cffi`. Ältere lokale PBKDF2-Hashes werden beim Login weiterhin akzeptiert, neue Passwörter werden aber mit Argon2 geschrieben.
 
+
+## Neue Metadaten-Feldtypen für den MVP
+
+Archiva unterstützt zusätzlich zu Text/Zahl/Datum/Auswahl zwei MVP-Feldtypen:
+
+### `identity_reference` — Benutzer/Team-Auswahl
+
+Dieses Feld zeigt eine Auswahl aktiver Benutzer und vorhandener Teams aus **Admin → Identity & Rollen**. Gespeichert wird eine strukturierte Referenz mit Typ, ID und Anzeige-Label, z. B.:
+
+```json
+{"kind":"team","id":"...","label":"Buchhaltung"}
+```
+
+Damit können Indexdaten wie **Zuständig**, **Prüfer**, **Freigabe durch** oder **Team** direkt auf Archiva-Stammdaten verweisen.
+
+### `auto_id` — automatische IDs
+
+Dieses Feld wird beim Speichern automatisch erzeugt, wenn noch kein Wert vorhanden ist. Das Muster wird beim Metadatenfeld im Feld **ID-Muster / Regex** hinterlegt.
+
+Empfohlene Beschreibungssprache:
+
+- normaler Text bleibt gleich, z. B. `ER-`
+- `{YYYY}` oder `%JAHR%` = vierstelliges Jahr, z. B. `2026`
+- `{YY}` oder `%JJ%` = zweistelliges Jahr, z. B. `26`
+- `{MM}` oder `%MONAT%` = Monat, z. B. `05`
+- `{DD}` oder `%TAG%` = Tag, z. B. `05`
+- `#` definiert den Zähler und seine Stellenanzahl
+
+Beispiele:
+
+- `ER-{YYYY}-{####}` → `ER-2026-0001`
+- `ER-%JAHR%-####` → `ER-2026-0001`
+- `VERTRAG-{YY}-{###}` → `VERTRAG-26-001`
+
+Der Zähler wird pro Dokumenttyp und Feld aus den bereits vorhandenen Dokument-Metadaten ermittelt und zählt hoch. Für das Eingangsrechnungs-MVP erzeugt der Seed jetzt zusätzlich `Interne ER-ID` mit `ER-{YYYY}-{####}` und `Zuständig` als Benutzer-/Team-Referenz.
+
 ## 13. Änderungslog Ergänzung 2026-05-05
 
 Ergänzt und umgesetzt:

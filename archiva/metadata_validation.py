@@ -135,6 +135,14 @@ def _normalize_value(field: MetadataField, raw_value: Any) -> Any:
         _validate_options(field, values)
         return values
 
+    if field_type == "identity_reference":
+        return _normalize_identity_reference(field, raw_value)
+
+    if field_type == "auto_id":
+        value = str(raw_value).strip()
+        _validate_string_constraints(field, value)
+        return value
+
     value = str(raw_value).strip()
     _validate_string_constraints(field, value)
     return value
@@ -191,6 +199,29 @@ def _normalize_multi_selection(raw_value: Any) -> list[str]:
     if not values:
         raise ValueError("Select at least one option")
     return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _normalize_identity_reference(field: MetadataField, raw_value: Any) -> dict[str, str]:
+    if isinstance(raw_value, dict):
+        kind = str(raw_value.get("kind") or "").strip().lower()
+        item_id = str(raw_value.get("id") or "").strip()
+        label = str(raw_value.get("label") or "").strip()
+    else:
+        raw = str(raw_value).strip()
+        if ":" not in raw:
+            raise ValueError("Bitte Benutzer oder Team auswählen")
+        kind, item_id = [part.strip() for part in raw.split(":", 1)]
+        kind = kind.lower()
+        label = ""
+    if kind not in {"user", "team"}:
+        raise ValueError("Bitte Benutzer oder Team auswählen")
+    try:
+        UUID(item_id)
+    except ValueError as exc:
+        raise ValueError("Ungültige Benutzer-/Team-ID") from exc
+    if not label:
+        label = item_id
+    return {"kind": kind, "id": item_id, "label": label}
 
 
 def _validate_string_constraints(field: MetadataField, value: str) -> None:
