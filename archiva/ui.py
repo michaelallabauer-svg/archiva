@@ -515,6 +515,56 @@ def _document_type_fields_only(document_type: DocumentType | None) -> list[Metad
     return sorted(document_type.fields or [], key=lambda item: (item.order, item.label or item.name, str(item.id)))
 
 
+def _collect_index_search_filters(request: Request) -> dict[str, list[str]]:
+    filters: dict[str, list[str]] = {}
+    for key in request.query_params.keys():
+        if not key.startswith("idx_"):
+            continue
+        field_name = key[4:]
+        values = [value.strip() for value in request.query_params.getlist(key) if value.strip()]
+        if field_name and values:
+            filters[field_name] = values
+    return filters
+
+
+def _metadata_value_matches_filter(raw_value: Any, expected_values: list[str], field: MetadataField | None = None) -> bool:
+    if not expected_values:
+        return True
+    normalized_expected = [value.strip().lower() for value in expected_values if value.strip()]
+    if not normalized_expected:
+        return True
+    if isinstance(raw_value, list):
+        actual_values = [str(value).strip().lower() for value in raw_value if str(value).strip()]
+        if field and field.field_type == "multi_selection":
+            return all(expected in actual_values for expected in normalized_expected)
+        return any(expected in actual for expected in normalized_expected for actual in actual_values)
+    actual = "" if raw_value is None else str(raw_value).strip().lower()
+    if field and field.field_type in {"boolean", "selection", "date", "datetime"}:
+        return actual in normalized_expected
+    return all(expected in actual for expected in normalized_expected)
+
+
+def _filter_documents_by_index_search(
+    documents: list[Document],
+    document_type: DocumentType | None,
+    filters: dict[str, list[str]],
+) -> list[Document]:
+    if not document_type or not filters:
+        return documents
+    fields_by_name = {field.name: field for field in _definition_fields_for_document_type(document_type)}
+    filtered_documents: list[Document] = []
+    for document in documents:
+        if not document.document_type_id or str(document.document_type_id) != str(document_type.id):
+            continue
+        metadata = metadata_from_json(document.metadata_json) or {}
+        if all(
+            _metadata_value_matches_filter(metadata.get(field_name), expected_values, fields_by_name.get(field_name))
+            for field_name, expected_values in filters.items()
+        ):
+            filtered_documents.append(document)
+    return filtered_documents
+
+
 def _metadata_width_class(width: str | None) -> str:
     normalized = (width or "half").strip().lower()
     if normalized in {"full", "half", "third", "quarter"}:
@@ -1268,6 +1318,7 @@ async def ui_app_home(
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     all_documents = _active_documents_query(db).order_by(Document.created_at.desc()).all()
+    index_search_filters = _collect_index_search_filters(request)
     search_payload: dict[str, Any] | None = None
     if (q or "").strip():
         search_payload = SearchService(db).search(
@@ -1281,13 +1332,16 @@ async def ui_app_home(
         hit_ids = [str(hit.get("document_id")) for hit in search_payload.get("hits", []) if hit.get("document_id")]
         documents_by_id = {str(document.id): document for document in all_documents}
         all_documents = [documents_by_id[hit_id] for hit_id in hit_ids if hit_id in documents_by_id]
-    recent_documents = all_documents[:10]
     cabinets, cabinet_type_model_ready = _safe_load_cabinets(db)
     cabinet_types = db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
     document_types = db.query(DocumentType).order_by(DocumentType.order, DocumentType.name).all()
     selected_document_type = _selected_document_type(selected_document_type_id, db)
     _resolve_archive_node._all_documents = all_documents
     selected_node = _resolve_archive_node(node_kind, node_id, cabinets, document_types, cabinet_types)
+    if selected_node and selected_node.get("kind") == "document_type" and index_search_filters:
+        document_type_for_search = next((doc_type for doc_type in document_types if str(doc_type.id) == str(selected_node.get("id"))), None)
+        all_documents = _filter_documents_by_index_search(all_documents, document_type_for_search, index_search_filters)
+    recent_documents = all_documents[:10]
     form_values = _parse_json_dict(form_data)
     return HTMLResponse(
         content=_render_app_page(
@@ -1303,6 +1357,7 @@ async def ui_app_home(
             all_documents,
             q or "",
             filter_kind or "all",
+            index_search_filters,
             cabinet_types,
             db,
             workflow_panel == "1",
@@ -3932,6 +3987,7 @@ def _render_app_page(
     all_documents: list[Document],
     search_query: str,
     filter_kind: str,
+    index_search_filters: dict[str, list[str]] | None = None,
     cabinet_types: list[CabinetType] | None = None,
     db: Session | None = None,
     workflow_panel_open: bool = False,
@@ -3953,7 +4009,7 @@ def _render_app_page(
     if search_query.strip():
         node_results_html, node_header_html = _render_search_results(all_documents, search_query)
     else:
-        node_results_html, node_header_html = _render_node_results(cabinets, all_documents, selected_node, search_query)
+        node_results_html, node_header_html = _render_node_results(cabinets, all_documents, selected_node, search_query, index_search_filters or {}, document_types)
     context_panel_html = _render_context_panel(selected_node, cabinets, cabinet_types)
     selected_document = None
     if selected_node and selected_node.get("kind") == "document":
@@ -4359,6 +4415,10 @@ def _render_app_page(
     .metadata-label {{ color:#7dd3fc; font-weight:750; letter-spacing:.08em; text-transform:uppercase; font-size:.68rem; margin-bottom:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
     .metadata-value {{ color:var(--text); line-height:1.28; font-size:.94rem; word-break:break-word; }}
     .metadata-field-editor {{ padding:14px; border:1px solid rgba(77,212,255,0.10); border-radius:16px; background:rgba(255,255,255,0.025); margin-bottom:12px; }}
+    .index-search-panel {{ border-color:rgba(110,231,183,0.18); background:linear-gradient(180deg, rgba(18,25,51,0.98), rgba(12,28,42,0.96)); }}
+    .index-search-form .field-grid {{ margin-top:12px; }}
+    .compact-checkbox-group {{ padding:10px; gap:6px; }}
+    .compact-checkbox-group .checkbox-item {{ padding:6px 8px; }}
     @media (max-width: 1200px) {{ .main-grid, .hero, .workspace-grid {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
@@ -6251,11 +6311,91 @@ def _render_document_object_card(document: Document, href: str) -> str:
     )
 
 
+def _render_index_search_input(field: MetadataField, selected_values: list[str]) -> str:
+    input_name = f"idx_{field.name}"
+    label = field.label or field.name
+    selected = selected_values or []
+    selected_first = selected[0] if selected else ""
+    options = _parse_field_options(field)
+    description_html = f'<div class="muted field-help">{_escape(field.description)}</div>' if field.description else ""
+    if field.field_type == "boolean":
+        control = (
+            f'<select name="{_escape(input_name)}">'
+            f'<option value="">Alle</option>'
+            f'<option value="true" {"selected" if selected_first.lower() == "true" else ""}>Ja</option>'
+            f'<option value="false" {"selected" if selected_first.lower() == "false" else ""}>Nein</option>'
+            f'</select>'
+        )
+    elif field.field_type == "selection" and options:
+        option_html = "".join(
+            f'<option value="{_escape(option)}" {"selected" if option in selected else ""}>{_escape(option)}</option>'
+            for option in options
+        )
+        control = f'<select name="{_escape(input_name)}"><option value="">Alle</option>{option_html}</select>'
+    elif field.field_type == "multi_selection" and options:
+        control = '<div class="checkbox-group compact-checkbox-group">' + ''.join(
+            f'<label class="checkbox-item"><input type="checkbox" name="{_escape(input_name)}" value="{_escape(option)}" {"checked" if option in selected else ""}> {_escape(option)}</label>'
+            for option in options
+        ) + '</div>'
+    elif field.field_type == "date":
+        control = f'<input type="date" name="{_escape(input_name)}" value="{_escape(selected_first)}">'
+    elif field.field_type == "datetime":
+        control = f'<input type="datetime-local" name="{_escape(input_name)}" value="{_escape(selected_first)}">'
+    elif field.field_type in ("number", "currency"):
+        control = f'<input type="number" step="any" name="{_escape(input_name)}" value="{_escape(selected_first)}" placeholder="Wert suchen">'
+    else:
+        control = f'<input type="search" name="{_escape(input_name)}" value="{_escape(selected_first)}" placeholder="{_escape(label)} suchen">'
+    return f'<div class="field {_metadata_width_class(field.width)}"><label>{_escape(label)}</label>{control}{description_html}</div>'
+
+
+def _render_document_type_index_search(
+    document_type: DocumentType,
+    index_search_filters: dict[str, list[str]],
+    *,
+    result_count: int,
+    search_query: str = "",
+) -> str:
+    fields = _definition_fields_for_document_type(document_type)
+    if not fields:
+        return ""
+    field_inputs = "".join(
+        _render_index_search_input(field, index_search_filters.get(field.name, []))
+        for field in fields
+    )
+    active_filter_count = sum(1 for values in index_search_filters.values() if values)
+    reset_url = f"/ui/app?node_kind=document_type&node_id={document_type.id}"
+    return f"""
+      <div class="panel index-search-panel" id="index-search">
+        <div class="section-head">
+          <div>
+            <div class="eyebrow">Indexdaten-Suche</div>
+            <h2 style="margin:0;">{_escape(document_type.name)} suchen</h2>
+            <p class="muted" style="margin:6px 0 0;">Indexdaten eingeben und passende Dokumente dieses Typs filtern. {result_count} Treffer aktuell.</p>
+          </div>
+          <a class="chip" href="{_escape(reset_url)}">Zurücksetzen</a>
+        </div>
+        <form method="get" action="/ui/app" class="index-search-form">
+          <input type="hidden" name="node_kind" value="document_type">
+          <input type="hidden" name="node_id" value="{_escape(str(document_type.id))}">
+          <input type="hidden" name="q" value="{_escape(search_query)}">
+          <div class="field-grid metadata-display-grid">{field_inputs}</div>
+          <div class="actions">
+            <button class="primary" type="submit">Suchen</button>
+            <a class="chip" href="{_escape(reset_url)}">Filter löschen</a>
+            <span class="muted">{active_filter_count} aktive Indexfilter</span>
+          </div>
+        </form>
+      </div>
+    """
+
+
 def _render_node_results(
     cabinets: list[Cabinet],
     all_documents: list[Document],
     selected_node: dict[str, Any] | None,
     search_query: str,
+    index_search_filters: dict[str, list[str]] | None = None,
+    document_types: list[DocumentType] | None = None,
 ) -> tuple[str, str]:
     normalized_query = (search_query or "").strip().lower()
     if normalized_query:
@@ -6355,7 +6495,24 @@ def _render_node_results(
                 results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
     elif selected_kind == "document_type":
         matching_documents = [doc for doc in all_documents if doc.document_type_id and str(doc.document_type_id) == selected_id]
+        selected_document_type_for_search = next(
+            (doc_type for doc_type in _available_document_types_for_node(selected_node, cabinets) if str(doc_type.id) == selected_id),
+            None,
+        )
+        if not selected_document_type_for_search:
+            selected_document_type_for_search = next((doc.document_type for doc in matching_documents if doc.document_type), None)
+        if not selected_document_type_for_search:
+            selected_document_type_for_search = next((doc_type for doc_type in (document_types or []) if str(doc_type.id) == selected_id), None)
         subtitle = f"{len(matching_documents)} Dokumente dieses Dokumenttyps"
+        if selected_document_type_for_search:
+            results.append(
+                _render_document_type_index_search(
+                    selected_document_type_for_search,
+                    index_search_filters or {},
+                    result_count=len(matching_documents),
+                    search_query=search_query,
+                )
+            )
         for document in matching_documents[:30]:
             results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
     elif selected_kind == "document":
