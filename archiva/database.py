@@ -42,6 +42,7 @@ def create_tables() -> None:
         _ensure_identity_tables(conn)
         _ensure_document_cabinet_column(conn)
         _ensure_structure_metadata_value_columns(conn)
+        _ensure_soft_delete_columns(conn)
         _ensure_definition_model_columns(conn)
         _ensure_search_indexing_columns(conn)
 
@@ -311,6 +312,32 @@ def _ensure_document_cabinet_column(conn) -> None:
 def _ensure_structure_metadata_value_columns(conn) -> None:
     conn.execute(text("ALTER TABLE cabinets ADD COLUMN IF NOT EXISTS metadata_json TEXT NULL"))
     conn.execute(text("ALTER TABLE registers ADD COLUMN IF NOT EXISTS metadata_json TEXT NULL"))
+
+
+def _ensure_soft_delete_columns(conn) -> None:
+    for table_name in ("cabinets", "registers", "documents"):
+        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL"))
+        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS deleted_by_user_id UUID NULL"))
+        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS deleted_by_label VARCHAR(255) NULL"))
+        fk_name = f"fk_{table_name}_deleted_by_user_id"
+        fk_exists = conn.execute(
+            text(
+                """
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_name = :constraint_name
+                  AND table_name = :table_name
+                """
+            ),
+            {"constraint_name": fk_name, "table_name": table_name},
+        ).first()
+        if not fk_exists:
+            conn.execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD CONSTRAINT {fk_name} FOREIGN KEY (deleted_by_user_id) REFERENCES users(id)"
+                )
+            )
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_deleted_at ON {table_name} (deleted_at)"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table_name}_deleted_by_user_id ON {table_name} (deleted_by_user_id)"))
 
 
 def _ensure_search_indexing_columns(conn) -> None:

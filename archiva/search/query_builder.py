@@ -21,7 +21,7 @@ def build_search_response(
     page: int,
     page_size: int,
 ) -> dict:
-    documents = db.query(Document).all()
+    documents = db.query(Document).where(Document.deleted_at.is_(None)).all()
     normalized_q = (q or "").strip().lower()
 
     hits: list[dict] = []
@@ -35,6 +35,8 @@ def build_search_response(
             resolved_cabinet_type_id = str(resolved_cabinet.cabinet_type_id) if resolved_cabinet and resolved_cabinet.cabinet_type_id else ""
             if resolved_cabinet_type_id != cabinet_type_id:
                 continue
+        if document.cabinet and document.cabinet.deleted_at is not None:
+            continue
 
         metadata = metadata_from_json(document.metadata_json) or {}
         fallback_haystack = " ".join(

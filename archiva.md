@@ -1,5 +1,48 @@
 # Archiva Projektmemory
 
+## Stand 2026-05-05 09:35
+
+### Wiederaufnahme nach Modellwechsel
+- Archiva-Memory wurde geladen und Projektstand reaktiviert.
+- Hauptinstanz auf `http://localhost:8000` lief zunächst nicht; neu gestartet mit:
+  ```bash
+  cd ~/.openclaw/workspace/archiva
+  nohup venv/bin/python3.11 -m archiva.main > server.log 2>&1 &
+  ```
+- Health Check ist grün: `GET /api/v1/health` → `200 {"status":"healthy","service":"archiva"}`.
+- OpenSearch läuft weiter auf `localhost:9200`.
+- Workflow Designer auf `:8000` liefert HTTP 200.
+- Runtime-Routen auf `:8000` verifiziert:
+  - Workflow duplizieren funktioniert.
+  - Neue Workflow-Version anlegen funktioniert.
+  - Schritt mit ausgehender Transition wird beim Löschen korrekt blockiert.
+  - Schritt ohne Transitionen wird korrekt gelöscht.
+- Testsuche über Archiva API weiterhin grün:
+  - `GET /api/search?q=Allabauer&page=1&page_size=5` findet `Lebenslauf`.
+- FastAPI-Deprecation-Warnung für `@app.on_event` in `archiva/main.py` wurde behoben:
+  - Queue-Worker-Start/Shutdown läuft jetzt über einen `lifespan`-Handler.
+  - Danach: `py_compile` grün und Neustart ohne `on_event`-Deprecation-Warnung.
+
+### Diff-Review / Bereinigung 2026-05-05
+- Arbeitsbaum wurde reviewed und die halb verdrahtete Soft-Delete-Arbeit gebündelt:
+  - Soft-Delete-Felder für `cabinets`, `registers`, `documents` in Models + DB-Bootstrap konsistent.
+  - App blendet soft-gelöschte Dokumente/Cabinets/Register aus.
+  - Admin-Papierkorb zeigt jetzt Dokumente, Cabinets und Register.
+  - Restore-Routen für alle drei Typen ergänzt.
+  - Search-Fallback und OpenSearch-Merge filtern soft-gelöschte Dokumente aus.
+  - Alembic-Setup auf lokale Settings-DB-URL umgestellt; Soft-Delete-Migration umfasst alle drei Tabellen.
+- Verifiziert:
+  - `py_compile` für App-, Search- und Alembic-Dateien grün.
+  - Health `:8000` grün.
+  - Workflow Designer HTTP 200.
+  - Admin-Papierkorb HTTP 200.
+  - Runtime-Test Soft-Delete/Trash/Restore für synthetisches Cabinet, Register und Dokument grün; Testdaten bereinigt.
+  - Runtime-Test Workflow Duplicate/Version/Step-Delete weiterhin grün; Testdaten bereinigt.
+- Hinweis: `ruff` ist in `venv/bin` aktuell nicht installiert, daher kein Ruff-Gate gelaufen.
+- Auffälligkeit beim Review: Das bestehende Testdokument `Lebenslauf.pdf` hat `deleted_at` gesetzt und liegt damit fachlich im Papierkorb; dadurch wird es von der bereinigten Suche nun korrekt ausgefiltert.
+
+---
+
 ## Stand 2026-04-28 23:10
 
 ### Lokale Runtime

@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -56,10 +57,23 @@ def create_app() -> FastAPI:
 
     storage = StorageManager(settings.storage.base_path)
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.queue_worker_task = asyncio.create_task(_queue_worker_loop(settings))
+        try:
+            yield
+        finally:
+            task = getattr(app.state, "queue_worker_task", None)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
     app = FastAPI(
         title="Archiva",
         description="Lightweight Enterprise Content Management with Full-Text Search",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -77,19 +91,6 @@ def create_app() -> FastAPI:
     app.include_router(admin_router)
     app.include_router(search_router)
     app.include_router(internal_index_router)
-
-    @app.on_event("startup")
-    async def start_queue_worker() -> None:
-        app.state.queue_worker_task = asyncio.create_task(_queue_worker_loop(settings))
-
-    @app.on_event("shutdown")
-    async def stop_queue_worker() -> None:
-        task = getattr(app.state, "queue_worker_task", None)
-        if task is None:
-            return
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
 
     return app
 

@@ -135,8 +135,14 @@ class Cabinet(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deleted_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    deleted_by_label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     cabinet_type: Mapped["CabinetType"] = relationship("CabinetType", back_populates="cabinets")
+    deleted_by_user: Mapped[Optional["User"]] = relationship("User")
     registers: Mapped[list["Register"]] = relationship(
         "Register", back_populates="cabinet", cascade="all, delete-orphan"
     )
@@ -150,6 +156,7 @@ class Cabinet(Base):
     __table_args__ = (
         Index("ix_cabinets_order", "order"),
         Index("ix_cabinets_cabinet_type_id", "cabinet_type_id"),
+        Index("ix_cabinets_deleted_at", "deleted_at"),
     )
 
 
@@ -177,8 +184,14 @@ class Register(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deleted_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    deleted_by_label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     cabinet: Mapped["Cabinet"] = relationship("Cabinet", back_populates="registers")
+    deleted_by_user: Mapped[Optional["User"]] = relationship("User")
     register_type: Mapped[Optional["RegisterType"]] = relationship("RegisterType", back_populates="registers")
     document_types: Mapped[list["DocumentType"]] = relationship(
         "DocumentType", back_populates="register", cascade="all, delete-orphan"
@@ -190,6 +203,7 @@ class Register(Base):
     __table_args__ = (
         Index("ix_registers_cabinet_id", "cabinet_id"),
         Index("ix_registers_register_type_id", "register_type_id"),
+        Index("ix_registers_deleted_at", "deleted_at"),
     )
 
 
@@ -717,6 +731,11 @@ class Document(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
     indexed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deleted_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    deleted_by_label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     index_status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
     index_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     content_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -733,6 +752,7 @@ class Document(Base):
         "DocumentType", back_populates="documents"
     )
     cabinet: Mapped[Optional["Cabinet"]] = relationship("Cabinet")
+    deleted_by_user: Mapped[Optional["User"]] = relationship("User")
     versions: Mapped[list["DocumentVersion"]] = relationship(
         "DocumentVersion", back_populates="document", cascade="all, delete-orphan"
     )
@@ -742,8 +762,11 @@ class Document(Base):
         Index("ix_documents_name", "name"),
         Index("ix_documents_doc_type", "doc_type"),
         Index("ix_documents_created_at", "created_at"),
+        Index("ix_documents_deleted_at", "deleted_at"),
+        Index("ix_documents_deleted_by_user_id", "deleted_by_user_id"),
         Index("ix_documents_document_type_id", "document_type_id"),
         Index("ix_documents_cabinet_id", "cabinet_id"),
+        Index("ix_documents_file_hash", "file_hash"),
     )
 
 

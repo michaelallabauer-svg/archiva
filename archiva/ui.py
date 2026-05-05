@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from html import escape
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -13,7 +14,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from pydantic import BaseModel
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from urllib.parse import quote_plus
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -29,6 +30,61 @@ from archiva.search_legacy import update_document_vector
 from archiva.storage import StorageManager
 
 router = APIRouter(tags=["ui"])
+
+
+def _active_documents_query(db: Session):
+    return (
+        db.query(Document)
+        .outerjoin(Cabinet, Document.cabinet_id == Cabinet.id)
+        .where(
+            Document.deleted_at.is_(None),
+            or_(Document.cabinet_id.is_(None), Cabinet.deleted_at.is_(None)),
+        )
+    )
+
+
+def _deleted_documents_query(db: Session):
+    return db.query(Document).where(Document.deleted_at.is_not(None))
+
+
+def _active_cabinets_query(db: Session):
+    return db.query(Cabinet).where(Cabinet.deleted_at.is_(None))
+
+
+def _deleted_cabinets_query(db: Session):
+    return db.query(Cabinet).where(Cabinet.deleted_at.is_not(None))
+
+
+def _active_registers_query(db: Session):
+    return db.query(Register).where(Register.deleted_at.is_(None))
+
+
+def _deleted_registers_query(db: Session):
+    return db.query(Register).where(Register.deleted_at.is_not(None))
+
+
+def _active_registers_for_cabinet(cabinet: Cabinet | None) -> list[Register]:
+    if not cabinet:
+        return []
+    return [register for register in (cabinet.registers or []) if register.deleted_at is None]
+
+
+def _current_delete_actor(db: Session, request: Request) -> tuple[UUID | None, str]:
+    raw_user_id = request.headers.get("x-archiva-user-id") or request.cookies.get("archiva_user_id")
+    if raw_user_id:
+        try:
+            user = db.query(User).where(User.id == UUID(raw_user_id)).first()
+            if user:
+                return user.id, user.display_name or user.email
+        except ValueError:
+            pass
+    return None, "Archiva App (nicht angemeldet)"
+
+
+def _restore_soft_deleted_object(item: Any) -> None:
+    item.deleted_at = None
+    item.deleted_by_user_id = None
+    item.deleted_by_label = None
 
 
 def _admin_identity_redirect(*, identity_tab: str = "users", selected_user_id: str | None = None, selected_role_id: str | None = None, message: str | None = None) -> RedirectResponse:
@@ -232,7 +288,7 @@ def _has_column(db: Session, table_name: str, column_name: str) -> bool:
 
 def _safe_load_cabinets(db: Session) -> tuple[list[Cabinet], bool]:
     if _has_column(db, "cabinets", "cabinet_type_id"):
-        return db.query(Cabinet).order_by(Cabinet.order).all(), True
+        return _active_cabinets_query(db).order_by(Cabinet.order).all(), True
     legacy_cabinets = db.execute(
         text(
             'SELECT id, name, description, "order", created_at, updated_at FROM cabinets ORDER BY "order"'
@@ -649,14 +705,14 @@ def _available_document_types_for_node(selected_node: dict[str, Any] | None, cab
             for doc_type in cabinet.document_types:
                 if str(doc_type.id) == str(node_id):
                     return [doc_type]
-            for register in cabinet.registers:
+            for register in _active_registers_for_cabinet(cabinet):
                 for doc_type in register.document_types:
                     if str(doc_type.id) == str(node_id):
                         return [doc_type]
         return []
     if node_kind == "register":
         for cabinet in cabinets:
-            for register in cabinet.registers:
+            for register in _active_registers_for_cabinet(cabinet):
                 if str(register.id) == str(node_id):
                     if register.register_type:
                         available.extend(register.register_type.document_type_definitions or [])
@@ -689,23 +745,43 @@ def _selected_document_type_for_node(selected_node: dict[str, Any] | None, docum
     node_id = selected_node.get("id")
     if node_kind == "document_type":
         return next((doc_type for doc_type in document_types if str(doc_type.id) == str(node_id)), None)
+
+    def first_document_type(candidates: list[DocumentType]) -> DocumentType | None:
+        unique_by_id: dict[str, DocumentType] = {}
+        for doc_type in candidates:
+            unique_by_id[str(doc_type.id)] = doc_type
+        ordered = sorted(unique_by_id.values(), key=lambda item: (item.order, item.name or ""))
+        return ordered[0] if ordered else None
+
     if node_kind == "register":
         for cabinet in cabinets:
-            for register in cabinet.registers:
+            for register in _active_registers_for_cabinet(cabinet):
                 if str(register.id) == str(node_id):
-                    register_types = sorted(register.document_types, key=lambda item: (item.order, item.name or ""))
-                    return register_types[0] if register_types else None
+                    candidates: list[DocumentType] = []
+                    if register.register_type:
+                        candidates.extend(register.register_type.document_type_definitions or [])
+                    candidates.extend(register.document_types or [])
+                    return first_document_type(candidates)
     if node_kind == "cabinet":
         for cabinet in cabinets:
             if str(cabinet.id) != str(node_id):
                 continue
-            direct_types = sorted(cabinet.document_types, key=lambda item: (item.order, item.name or ""))
-            if direct_types:
-                return direct_types[0]
-            for register in sorted(cabinet.registers, key=lambda item: (item.order, item.name or "")):
-                register_types = sorted(register.document_types, key=lambda item: (item.order, item.name or ""))
-                if register_types:
-                    return register_types[0]
+            candidates: list[DocumentType] = []
+            if cabinet.cabinet_type:
+                candidates.extend(cabinet.cabinet_type.document_type_definitions or [])
+                for register_type in cabinet.cabinet_type.register_types or []:
+                    candidates.extend(register_type.document_type_definitions or [])
+            candidates.extend(cabinet.document_types or [])
+            if candidates:
+                return first_document_type(candidates)
+            for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: (item.order, item.name or "")):
+                register_candidates: list[DocumentType] = []
+                if register.register_type:
+                    register_candidates.extend(register.register_type.document_type_definitions or [])
+                register_candidates.extend(register.document_types or [])
+                selected = first_document_type(register_candidates)
+                if selected:
+                    return selected
     return None
 
 
@@ -829,9 +905,9 @@ async def ui_admin_home(
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     cabinet_types = db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
-    cabinets = db.query(Cabinet).order_by(Cabinet.order).all()
+    cabinets = _active_cabinets_query(db).order_by(Cabinet.order).all()
     document_types = db.query(DocumentType).order_by(DocumentType.name).all()
-    recent_documents = db.query(Document).order_by(Document.created_at.desc()).limit(10).all()
+    recent_documents = _active_documents_query(db).order_by(Document.created_at.desc()).limit(10).all()
     preview_jobs = db.query(PreviewJob).order_by(PreviewJob.created_at.desc()).limit(12).all()
     index_jobs = db.query(IndexJob).order_by(IndexJob.created_at.desc()).limit(12).all()
     selected_document_type = document_types[0] if document_types else None
@@ -865,9 +941,9 @@ async def ui_admin_document_type_detail(
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
     cabinet_types = db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
-    cabinets = db.query(Cabinet).order_by(Cabinet.order).all()
+    cabinets = _active_cabinets_query(db).order_by(Cabinet.order).all()
     document_types = db.query(DocumentType).order_by(DocumentType.name).all()
-    recent_documents = db.query(Document).order_by(Document.created_at.desc()).limit(10).all()
+    recent_documents = _active_documents_query(db).order_by(Document.created_at.desc()).limit(10).all()
     preview_jobs = db.query(PreviewJob).order_by(PreviewJob.created_at.desc()).limit(12).all()
     index_jobs = db.query(IndexJob).order_by(IndexJob.created_at.desc()).limit(12).all()
     selected_document_type = db.query(DocumentType).where(DocumentType.id == document_type_id).first()
@@ -895,6 +971,61 @@ async def ui_admin_queues(
     preview_jobs = db.query(PreviewJob).order_by(PreviewJob.created_at.desc()).limit(40).all()
     index_jobs = db.query(IndexJob).order_by(IndexJob.created_at.desc()).limit(40).all()
     return HTMLResponse(content=_render_admin_queues_page(preview_jobs=preview_jobs, index_jobs=index_jobs))
+
+
+@router.get("/admin/trash", response_class=HTMLResponse)
+async def ui_admin_trash(
+    request: Request,
+    message: str | None = None,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    deleted_documents = _deleted_documents_query(db).order_by(Document.deleted_at.desc()).all()
+    deleted_cabinets = _deleted_cabinets_query(db).order_by(Cabinet.deleted_at.desc()).all()
+    deleted_registers = _deleted_registers_query(db).order_by(Register.deleted_at.desc()).all()
+    return HTMLResponse(content=_render_admin_trash_page(deleted_documents=deleted_documents, deleted_cabinets=deleted_cabinets, deleted_registers=deleted_registers, message=message))
+
+
+@router.post("/admin/trash/documents/{document_id}/restore")
+async def ui_admin_restore_document(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    document = _deleted_documents_query(db).where(Document.id == document_id).first()
+    if not document:
+        return _ui_redirect_with_message("/ui/admin/trash?message=Dokument+nicht+im+Papierkorb+gefunden")
+    title = document.title or document.name
+    _restore_soft_deleted_object(document)
+    db.add(document)
+    db.commit()
+    return _ui_redirect_with_message(f"/ui/admin/trash?message={quote_plus(f'Dokument {title} wiederhergestellt')}")
+
+
+@router.post("/admin/trash/cabinets/{cabinet_id}/restore")
+async def ui_admin_restore_cabinet(
+    cabinet_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    cabinet = _deleted_cabinets_query(db).where(Cabinet.id == cabinet_id).first()
+    if not cabinet:
+        return _ui_redirect_with_message("/ui/admin/trash?message=Cabinet+nicht+im+Papierkorb+gefunden")
+    _restore_soft_deleted_object(cabinet)
+    db.add(cabinet)
+    db.commit()
+    return _ui_redirect_with_message(f"/ui/admin/trash?message={quote_plus(f'Cabinet {cabinet.name} wiederhergestellt')}")
+
+
+@router.post("/admin/trash/registers/{register_id}/restore")
+async def ui_admin_restore_register(
+    register_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    register = _deleted_registers_query(db).where(Register.id == register_id).first()
+    if not register:
+        return _ui_redirect_with_message("/ui/admin/trash?message=Register+nicht+im+Papierkorb+gefunden")
+    _restore_soft_deleted_object(register)
+    db.add(register)
+    db.commit()
+    return _ui_redirect_with_message(f"/ui/admin/trash?message={quote_plus(f'Register {register.name} wiederhergestellt')}")
 
 
 @router.get("/admin/identity", response_class=HTMLResponse)
@@ -929,7 +1060,7 @@ async def ui_admin_reindex_document(
     document_id: UUID,
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         return _ui_redirect_with_message("/ui/admin/queues?message=Dokument+nicht+gefunden")
     enqueue_document_index(db, document=document, reason="manual_reindex_ui")
@@ -941,7 +1072,7 @@ async def ui_admin_document_extracted_text(
     document_id: UUID,
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         return HTMLResponse(content="<h1>Dokument nicht gefunden</h1>", status_code=404)
     preview = _escape(document.extracted_text_preview or "Kein extrahierter Text gespeichert.")
@@ -962,7 +1093,7 @@ async def ui_app_home(
     filter_kind: str | None = None,
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
-    all_documents = db.query(Document).order_by(Document.created_at.desc()).all()
+    all_documents = _active_documents_query(db).order_by(Document.created_at.desc()).all()
     search_payload: dict[str, Any] | None = None
     if (q or "").strip():
         search_payload = SearchService(db).search(
@@ -983,8 +1114,6 @@ async def ui_app_home(
     selected_document_type = _selected_document_type(selected_document_type_id, db)
     _resolve_archive_node._all_documents = all_documents
     selected_node = _resolve_archive_node(node_kind, node_id, cabinets, document_types, cabinet_types)
-    if selected_document_type is None:
-        selected_document_type = _selected_document_type_for_node(selected_node, document_types, cabinets)
     form_values = _parse_json_dict(form_data)
     return HTMLResponse(
         content=_render_app_page(
@@ -1015,11 +1144,11 @@ async def ui_app_document_detail(
     form_data: str | None = None,
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
     form_values = _parse_json_dict(form_data) if form_data else None
-    cabinets = db.query(Cabinet).order_by(Cabinet.order).all()
+    cabinets = _active_cabinets_query(db).order_by(Cabinet.order).all()
     return HTMLResponse(content=_render_document_detail_page(document, cabinets=cabinets, message=message, error_field=error_field, error_message=error_message, form_values=form_values))
 
 
@@ -1029,7 +1158,7 @@ async def ui_app_document_update_metadata(
     request: Request,
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
     if not document.document_type_id or not document.document_type:
@@ -1067,13 +1196,52 @@ async def ui_app_document_update_metadata(
     )
 
 
+@router.post("/app/documents/{document_id}/delete")
+async def ui_app_document_soft_delete(
+    document_id: UUID,
+    request: Request,
+    return_to: str = Form("/ui/app"),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    document = _active_documents_query(db).where(Document.id == document_id).first()
+    if not document:
+        return _ui_redirect_with_message("/ui/app?message=Dokument+nicht+gefunden")
+    deleted_by_user_id, deleted_by_label = _current_delete_actor(db, request)
+    document.deleted_at = datetime.utcnow()
+    document.deleted_by_user_id = deleted_by_user_id
+    document.deleted_by_label = deleted_by_label
+    title = document.title or document.name
+    db.add(document)
+    db.commit()
+    target = return_to if return_to.startswith("/ui/app") and "/documents/" not in return_to else "/ui/app"
+    separator = "&" if "?" in target else "?"
+    return _ui_redirect_with_message(f"{target}{separator}message={quote_plus(f'Dokument {title} in den Papierkorb verschoben')}")
+
+
+@router.get("/app/documents/{document_id}/delete", response_class=HTMLResponse)
+async def ui_app_document_delete_confirm(
+    document_id: UUID,
+    request: Request,
+    return_to: str = "/ui/app",
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    document = _active_documents_query(db).where(Document.id == document_id).first()
+    if not document:
+        return HTMLResponse(content="<h1>Dokument nicht gefunden</h1>", status_code=404)
+    safe_return_to = return_to if return_to.startswith("/ui/app") and "/documents/" not in return_to else "/ui/app"
+    return HTMLResponse(content=f"""<!doctype html>
+<html lang='de'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Dokument löschen</title><style>:root{{color-scheme:dark;--bg:#0b1020;--panel:#121933;--text:#eef2ff;--muted:#a8b2d1;--accent:#4dd4ff}}body{{margin:0;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:var(--bg);color:var(--text)}}.page{{max-width:760px;margin:0 auto;padding:24px}}.panel{{background:var(--panel);border:1px solid rgba(77,212,255,.16);border-radius:18px;padding:20px}}.muted{{color:var(--muted)}}.actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}}button,a{{border-radius:999px;padding:10px 14px;font:inherit;text-decoration:none;border:1px solid rgba(77,212,255,.18);color:var(--text);background:rgba(255,255,255,.04);cursor:pointer}}.danger{{background:rgba(255,123,123,.16);border-color:rgba(255,123,123,.34);color:#ffd0d0}}</style></head>
+<body><div class='page'><div class='panel'><h1>Dokument in Papierkorb verschieben?</h1><p><strong>{_escape(document.title or document.name)}</strong></p><p class='muted'>{_escape(document.name)}</p><p class='muted'>Das Dokument wird nicht endgültig gelöscht. Es landet im Admin-Papierkorb und kann dort wiederhergestellt werden.</p><div class='actions'><form method='post' action='/ui/app/documents/{document.id}/delete'><input type='hidden' name='return_to' value='{_escape(safe_return_to)}'><button class='danger' type='submit'>In Papierkorb verschieben</button></form><a href='{_escape(safe_return_to)}'>Abbrechen</a></div></div></div></body></html>""")
+
+
 @router.post("/app/cabinets/{cabinet_id}/metadata")
 async def ui_app_cabinet_update_metadata(
     cabinet_id: UUID,
     request: Request,
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
-    cabinet = db.query(Cabinet).where(Cabinet.id == cabinet_id).first()
+    cabinet = _active_cabinets_query(db).where(Cabinet.id == cabinet_id).first()
     if not cabinet:
         raise HTTPException(status_code=404, detail="Cabinet not found")
     form = await request.form()
@@ -1092,7 +1260,7 @@ async def ui_app_register_update_metadata(
     request: Request,
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
-    register = db.query(Register).where(Register.id == register_id).first()
+    register = _active_registers_query(db).where(Register.id == register_id).first()
     if not register:
         raise HTTPException(status_code=404, detail="Register not found")
     form = await request.form()
@@ -1105,25 +1273,101 @@ async def ui_app_register_update_metadata(
     return _ui_redirect_with_message(f"/ui/app?node_kind=register&node_id={register.id}&message={quote_plus('Metadaten gespeichert')}#metadata-workbench")
 
 
+@router.get("/app/cabinets/{cabinet_id}/delete", response_class=HTMLResponse)
+async def ui_app_cabinet_delete_confirm(
+    cabinet_id: UUID,
+    request: Request,
+    return_to: str = "/ui/app",
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    cabinet = db.query(Cabinet).where(Cabinet.id == cabinet_id, Cabinet.deleted_at.is_(None)).first()
+    if not cabinet:
+        return HTMLResponse(content="<h1>Cabinet nicht gefunden</h1>", status_code=404)
+    safe_return_to = return_to if return_to.startswith("/ui/app") and "/cabinets/" not in return_to else "/ui/app"
+    return HTMLResponse(content=f"""<!doctype html>
+<html lang='de'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Cabinet löschen</title><style>:root{{color-scheme:dark;--bg:#0b1020;--panel:#121933;--text:#eef2ff;--muted:#a8b2d1;--accent:#4dd4ff}}body{{margin:0;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:var(--bg);color:var(--text)}}.page{{max-width:760px;margin:0 auto;padding:24px}}.panel{{background:var(--panel);border:1px solid rgba(77,212,255,.16);border-radius:18px;padding:20px}}.muted{{color:var(--muted)}}.actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}}button,a{{border-radius:999px;padding:10px 14px;font:inherit;text-decoration:none;border:1px solid rgba(77,212,255,.18);color:var(--text);background:rgba(255,255,255,.04);cursor:pointer}}.danger{{background:rgba(255,123,123,.16);border-color:rgba(255,123,123,.34);color:#ffd0d0}}</style></head>
+<body><div class='page'><div class='panel'><h1>Cabinet in Papierkorb verschieben?</h1><p><strong>{_escape(cabinet.name)}</strong></p><p class='muted'>Das Cabinet wird nicht endgültig gelöscht. Es landet im Admin-Papierkorb und kann dort wiederhergestellt werden.</p><div class='actions'><form method='post' action='/ui/app/cabinets/{cabinet.id}/delete'><input type='hidden' name='return_to' value='{_escape(safe_return_to)}'><button class='danger' type='submit'>In Papierkorb verschieben</button></form><a href='{_escape(safe_return_to)}'>Abbrechen</a></div></div></div></body></html>""")
+
+
+@router.post("/app/cabinets/{cabinet_id}/delete")
+async def ui_app_cabinet_soft_delete(
+    cabinet_id: UUID,
+    request: Request,
+    return_to: str = Form("/ui/app"),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    cabinet = db.query(Cabinet).where(Cabinet.id == cabinet_id, Cabinet.deleted_at.is_(None)).first()
+    if not cabinet:
+        return _ui_redirect_with_message("/ui/app?message=Cabinet+nicht+gefunden")
+    deleted_by_user_id, deleted_by_label = _current_delete_actor(db, request)
+    cabinet.deleted_at = datetime.utcnow()
+    cabinet.deleted_by_user_id = deleted_by_user_id
+    cabinet.deleted_by_label = deleted_by_label
+    db.add(cabinet)
+    db.commit()
+    target = return_to if return_to.startswith("/ui/app") and "/cabinets/" not in return_to else "/ui/app"
+    separator = "&" if "?" in target else "?"
+    return _ui_redirect_with_message(f"{target}{separator}message={quote_plus(f'Cabinet {cabinet.name} in den Papierkorb verschoben')}")
+
+
+@router.get("/app/registers/{register_id}/delete", response_class=HTMLResponse)
+async def ui_app_register_delete_confirm(
+    register_id: UUID,
+    request: Request,
+    return_to: str = "/ui/app",
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    register = db.query(Register).where(Register.id == register_id, Register.deleted_at.is_(None)).first()
+    if not register:
+        return HTMLResponse(content="<h1>Register nicht gefunden</h1>", status_code=404)
+    safe_return_to = return_to if return_to.startswith("/ui/app") and "/registers/" not in return_to else "/ui/app"
+    return HTMLResponse(content=f"""<!doctype html>
+<html lang='de'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Register löschen</title><style>:root{{color-scheme:dark;--bg:#0b1020;--panel:#121933;--text:#eef2ff;--muted:#a8b2d1;--accent:#4dd4ff}}body{{margin:0;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:var(--bg);color:var(--text)}}.page{{max-width:760px;margin:0 auto;padding:24px}}.panel{{background:var(--panel);border:1px solid rgba(77,212,255,.16);border-radius:18px;padding:20px}}.muted{{color:var(--muted)}}.actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}}button,a{{border-radius:999px;padding:10px 14px;font:inherit;text-decoration:none;border:1px solid rgba(77,212,255,.18);color:var(--text);background:rgba(255,255,255,.04);cursor:pointer}}.danger{{background:rgba(255,123,123,.16);border-color:rgba(255,123,123,.34);color:#ffd0d0}}</style></head>
+<body><div class='page'><div class='panel'><h1>Register in Papierkorb verschieben?</h1><p><strong>{_escape(register.name)}</strong></p><p class='muted'>Das Register wird nicht endgültig gelöscht. Es landet im Admin-Papierkorb und kann dort wiederhergestellt werden.</p><div class='actions'><form method='post' action='/ui/app/registers/{register.id}/delete'><input type='hidden' name='return_to' value='{_escape(safe_return_to)}'><button class='danger' type='submit'>In Papierkorb verschieben</button></form><a href='{_escape(safe_return_to)}'>Abbrechen</a></div></div></div></body></html>""")
+
+
+@router.post("/app/registers/{register_id}/delete")
+async def ui_app_register_soft_delete(
+    register_id: UUID,
+    request: Request,
+    return_to: str = Form("/ui/app"),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    register = db.query(Register).where(Register.id == register_id, Register.deleted_at.is_(None)).first()
+    if not register:
+        return _ui_redirect_with_message("/ui/app?message=Register+nicht+gefunden")
+    deleted_by_user_id, deleted_by_label = _current_delete_actor(db, request)
+    register.deleted_at = datetime.utcnow()
+    register.deleted_by_user_id = deleted_by_user_id
+    register.deleted_by_label = deleted_by_label
+    db.add(register)
+    db.commit()
+    target = return_to if return_to.startswith("/ui/app") and "/registers/" not in return_to else "/ui/app"
+    separator = "&" if "?" in target else "?"
+    return _ui_redirect_with_message(f"{target}{separator}message={quote_plus(f'Register {register.name} in den Papierkorb verschoben')}")
+
+
 @router.post("/app/documents/{document_id}/cabinet")
 async def ui_app_document_update_cabinet(
     document_id: UUID,
     cabinet_id: str = Form(...),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
     resolved_cabinet: Cabinet | None = None
     try:
         resolved_uuid = UUID(cabinet_id)
-        resolved_cabinet = db.query(Cabinet).where(Cabinet.id == resolved_uuid).first()
+        resolved_cabinet = _active_cabinets_query(db).where(Cabinet.id == resolved_uuid).first()
     except ValueError:
         resolved_uuid = None
 
     if not resolved_cabinet and resolved_uuid:
-        cabinets = db.query(Cabinet).order_by(Cabinet.order).all()
+        cabinets = _active_cabinets_query(db).order_by(Cabinet.order).all()
         move_resolution = _build_move_resolution(document, cabinets)
         legacy_match = next(
             (item for item in move_resolution["legacy_candidate_cabinets"] if item.get("id") == resolved_uuid),
@@ -1131,7 +1375,7 @@ async def ui_app_document_update_cabinet(
         )
         candidate_type_name = move_resolution.get("candidate_type_name")
         if legacy_match and candidate_type_name:
-            resolved_cabinet = db.query(Cabinet).join(CabinetType).where(
+            resolved_cabinet = _active_cabinets_query(db).join(CabinetType).where(
                 Cabinet.name == legacy_match.get("name"),
                 CabinetType.name == candidate_type_name,
             ).first()
@@ -1152,7 +1396,7 @@ async def ui_app_document_download(
     document_id: UUID,
     db: Session = Depends(get_db),
 ) -> FileResponse:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -1170,7 +1414,7 @@ async def ui_preview_document_status(
     document_id: UUID,
     db: Session = Depends(get_db),
 ) -> PreviewStatusResponse:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -1204,7 +1448,7 @@ async def ui_preview_document(
     document_id: UUID,
     db: Session = Depends(get_db),
 ) -> Response:
-    document = db.query(Document).where(Document.id == document_id).first()
+    document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
@@ -1241,7 +1485,7 @@ async def api_duplicate_check(
         if doc_type and not doc_type.md5_duplicate_check:
             return {"enabled": False, "duplicate": False}
 
-    existing = db.query(Document).where(Document.file_hash == hash).first()
+    existing = _active_documents_query(db).where(Document.file_hash == hash).first()
     if existing:
         return {
             "enabled": True,
@@ -1274,7 +1518,7 @@ async def ui_app_intake(
     doc_type_check = document_type.md5_duplicate_check if document_type else True
 
     if global_check and doc_type_check and hash:
-        existing = db.query(Document).where(Document.file_hash == hash).first()
+        existing = _active_documents_query(db).where(Document.file_hash == hash).first()
         if existing:
             return _ui_redirect_with_message(
                 _app_message_url(
@@ -1329,12 +1573,12 @@ async def ui_app_intake(
     resolved_cabinet = None
     if cabinet_id_raw:
         try:
-            resolved_cabinet = db.query(Cabinet).where(Cabinet.id == UUID(cabinet_id_raw)).first()
+            resolved_cabinet = _active_cabinets_query(db).where(Cabinet.id == UUID(cabinet_id_raw)).first()
         except ValueError:
             resolved_cabinet = None
     if not resolved_cabinet and register_id_raw:
         try:
-            resolved_register = db.query(Register).where(Register.id == UUID(register_id_raw)).first()
+            resolved_register = _active_registers_query(db).where(Register.id == UUID(register_id_raw)).first()
             if resolved_register and resolved_register.cabinet:
                 resolved_cabinet = resolved_register.cabinet
         except ValueError:
@@ -2615,6 +2859,7 @@ def _render_admin_queues_page(*, preview_jobs: list[PreviewJob], index_jobs: lis
       <p>Die letzten Preview- und Indexjobs, kompakt und ruhig dargestellt, mit Reindex und Textprüfung direkt am jeweiligen Eintrag.</p>
       <div class="pillbar">
         <a class="pill" href="/ui/admin">Zurück zum Admin</a>
+        <a class="pill" href="/ui/admin/trash">Papierkorb</a>
         <a class="pill" href="/ui/app">Zur ECM-App</a>
       </div>
     </section>
@@ -2622,6 +2867,101 @@ def _render_admin_queues_page(*, preview_jobs: list[PreviewJob], index_jobs: lis
       {preview_queue_html}
       {index_queue_html}
     </section>
+  </div>
+</body>
+</html>
+"""
+
+
+def _render_admin_trash_page(
+    *,
+    deleted_documents: list[Document],
+    deleted_cabinets: list[Cabinet],
+    deleted_registers: list[Register],
+    message: str | None = None,
+) -> str:
+    def deleted_by_label(item: Any) -> str:
+        user = getattr(item, "deleted_by_user", None)
+        return getattr(item, "deleted_by_label", None) or (user.display_name if user else "Unbekannt")
+
+    def trash_item(*, label: str, title: str, subtitle: str, deleted_at: Any, deleted_by: str, restore_url: str) -> str:
+        return (
+            "<div class='trash-item'>"
+            f"<div><strong>{_escape(label)} {_escape(title)}</strong>"
+            f"<div class='trash-meta'>{_escape(subtitle)} · Gelöscht: {_escape(str(deleted_at or ''))} · Von: {_escape(deleted_by)}</div></div>"
+            f"<form method='post' action='{_escape(restore_url)}'><button class='pill primary' type='submit'>Wiederherstellen</button></form>"
+            "</div>"
+        )
+
+    rows: list[str] = []
+    for cabinet in deleted_cabinets:
+        rows.append(
+            trash_item(
+                label="🗄️ Cabinet",
+                title=cabinet.name,
+                subtitle=cabinet.description or "Cabinet",
+                deleted_at=cabinet.deleted_at,
+                deleted_by=deleted_by_label(cabinet),
+                restore_url=f"/ui/admin/trash/cabinets/{cabinet.id}/restore",
+            )
+        )
+    for register in deleted_registers:
+        rows.append(
+            trash_item(
+                label="📁 Register",
+                title=register.name,
+                subtitle=register.description or (register.cabinet.name if register.cabinet else "Register"),
+                deleted_at=register.deleted_at,
+                deleted_by=deleted_by_label(register),
+                restore_url=f"/ui/admin/trash/registers/{register.id}/restore",
+            )
+        )
+    for document in deleted_documents:
+        rows.append(
+            trash_item(
+                label="📄 Dokument",
+                title=document.title or document.name,
+                subtitle=f"Datei: {document.name}",
+                deleted_at=document.deleted_at,
+                deleted_by=deleted_by_label(document),
+                restore_url=f"/ui/admin/trash/documents/{document.id}/restore",
+            )
+        )
+
+    if rows:
+        trash_html = "<div class='trash-list'>" + "".join(rows) + "</div>"
+    else:
+        trash_html = "<div class='panel'><p class='muted'>Der Papierkorb ist leer.</p></div>"
+    message_html = f"<div class='message'>{_escape(message)}</div>" if message else ""
+    total_count = len(rows)
+    return f"""
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archiva Papierkorb</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+  <style>
+    :root {{ color-scheme: dark; --bg:#0b1020; --panel:#121933; --text:#eef2ff; --muted:#a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; --shadow:0 18px 48px rgba(0,0,0,.28); }}
+    * {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, sans-serif; background:radial-gradient(circle at top left, rgba(77,212,255,.08), transparent 30%), var(--bg); color:var(--text); }}
+    a {{ color:var(--accent-2); text-decoration:none; }} .page {{ padding:14px 16px; max-width:1200px; margin:0 auto; }}
+    .panel, .trash-item, .message {{ background:linear-gradient(180deg, rgba(18,25,51,.96), rgba(15,22,48,.96)); border:1px solid rgba(77,212,255,.10); border-radius:18px; padding:16px; box-shadow:var(--shadow); }}
+    .hero {{ margin-bottom:16px; }} .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color:var(--accent-2); font-weight:700; }} h1 {{ margin:4px 0 6px; }} .muted, .trash-meta {{ color:var(--muted); }}
+    .pillbar, .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }} .pill {{ display:inline-flex; align-items:center; border-radius:999px; padding:8px 12px; background:rgba(255,255,255,.04); border:1px solid rgba(77,212,255,.12); color:var(--text); font:inherit; cursor:pointer; }} .primary {{ background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:white; }}
+    .trash-list {{ display:grid; gap:12px; }} .trash-item {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }} .trash-meta {{ margin-top:8px; line-height:1.45; font-size:.9rem; }} .message {{ margin-bottom:16px; color:#d9ffec; border-color:rgba(110,231,183,.28); background:rgba(110,231,183,.10); }}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="panel hero">
+      <div class="eyebrow">Admin</div>
+      <h1>Papierkorb</h1>
+      <p class="muted">Soft-gelöschte Cabinets, Register und Dokumente bleiben hier erhalten und können wiederhergestellt werden.</p>
+      <div class="pillbar"><span class="pill">{total_count} Einträge</span><a class="pill" href="/ui/admin">Zurück zum Admin</a><a class="pill" href="/ui/app">Zur ECM-App</a></div>
+    </section>
+    {message_html}
+    {trash_html}
   </div>
 </body>
 </html>
@@ -2894,6 +3234,7 @@ def _render_admin_page(
           <span class="pill">Metadatenmodell</span>
           <a class="pill" href="/ui/app">Zur ECM-App</a>
           <a class="pill" href="/ui/admin/queues">Queues & Logs</a>
+          <a class="pill" href="/ui/admin/trash">Papierkorb</a>
           <a class="pill" href="/ui/admin/identity">Identity & Rollen</a>
           <a class="pill" href="/ui/workflow-designer">Workflow Designer</a>
         </div>
@@ -3135,7 +3476,7 @@ def _render_search_results(documents: list[Document], search_query: str) -> tupl
             f"<div class=\"panel\" style=\"margin-bottom:16px;\"><h2 style=\"margin-top:0;\">Suchtreffer</h2><p class=\"muted\">Volltextsuche nach: {_escape(search_query)}</p></div>",
         )
     results = ''.join(
-        f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')} · {_escape(document.name)}</div></a>"
+        _render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}")
         for document in documents
     )
     header = f"<div class=\"panel\" style=\"margin-bottom:16px;\"><h2 style=\"margin-top:0;\">Suchtreffer</h2><p class=\"muted\">Volltextsuche nach: {_escape(search_query)} · {len(documents)} Treffer</p></div>"
@@ -3183,7 +3524,7 @@ def _render_app_page(
     selected_cabinet = None
     selected_register = None
     selected_capture_document_type = selected_document_type or _selected_document_type_for_node(selected_node, document_types, cabinets)
-    show_intake_panel = bool(selected_capture_document_type)
+    show_intake_panel = bool(selected_document_type)
     if selected_node:
         selected_kind = selected_node.get("kind")
         selected_id = str(selected_node.get("id") or "")
@@ -3197,7 +3538,7 @@ def _render_app_page(
                     selected_cabinet = resolved_document_cabinet
         elif selected_kind == "register":
             for cabinet in cabinets:
-                register_match = next((register for register in cabinet.registers if str(register.id) == selected_id), None)
+                register_match = next((register for register in _active_registers_for_cabinet(cabinet) if str(register.id) == selected_id), None)
                 if register_match:
                     selected_register = register_match
                     selected_cabinet = cabinet
@@ -3232,7 +3573,7 @@ def _render_app_page(
         ],
         include_blank="Optional",
     )
-    register_candidates = selected_cabinet.registers if selected_cabinet else []
+    register_candidates = _active_registers_for_cabinet(selected_cabinet) if selected_cabinet else []
     register_options = _option_list(
         [(str(register.id), register.name) for register in register_candidates],
         selected_value=str(selected_register.id) if selected_register else None,
@@ -3250,18 +3591,20 @@ def _render_app_page(
     selected_document_preview_html = "<div class='muted'>Keine Vorschau verfügbar.</div>"
     if selected_node and selected_node.get("kind") == "cabinet":
         selected_cabinet_documents = [document for document in all_documents if _resolved_document_cabinet(document) and selected_cabinet and str(_resolved_document_cabinet(document).id) == str(selected_cabinet.id)]
-        cabinet_metadata = metadata_from_json(getattr(selected_cabinet, "metadata_json", None)) if selected_cabinet else {}
-        metadata_values_html = _render_metadata_display(cabinet_metadata or {}, _metadata_fields_for_cabinet(selected_cabinet), empty_message="Keine Metadatenwerte gepflegt.") if selected_cabinet else ""
+        cabinet_fields = _metadata_fields_for_cabinet(selected_cabinet) if selected_cabinet else []
+        cabinet_metadata = _metadata_initial_values_for_object(selected_cabinet, cabinet_fields) if selected_cabinet else {}
+        metadata_values_html = _render_metadata_display(cabinet_metadata or {}, cabinet_fields, empty_message="Keine Metadatenwerte gepflegt.") if selected_cabinet else ""
         selected_document_metadata_html = (
             f"<div class='meta-display-row'><div class='meta-display-label'>Cabinet</div><div class='meta-display-value'>{_escape(selected_cabinet.name if selected_cabinet else '')}</div></div>"
             f"<div class='meta-display-row'><div class='meta-display-label'>Dokumente</div><div class='meta-display-value'>{len(selected_cabinet_documents)}</div></div>"
-            f"<div class='meta-display-row'><div class='meta-display-label'>Register</div><div class='meta-display-value'>{len(selected_cabinet.registers) if selected_cabinet else 0}</div></div>"
+            f"<div class='meta-display-row'><div class='meta-display-label'>Register</div><div class='meta-display-value'>{len(_active_registers_for_cabinet(selected_cabinet)) if selected_cabinet else 0}</div></div>"
             f"{metadata_values_html}"
         )
     elif selected_node and selected_node.get("kind") == "register":
         selected_register_documents = [document for document in all_documents if document.document_type and document.document_type.register_id and selected_register and str(document.document_type.register_id) == str(selected_register.id)]
-        register_metadata = metadata_from_json(getattr(selected_register, "metadata_json", None)) if selected_register else {}
-        metadata_values_html = _render_metadata_display(register_metadata or {}, _metadata_fields_for_register(selected_register), empty_message="Keine Metadatenwerte gepflegt.") if selected_register else ""
+        register_fields = _metadata_fields_for_register(selected_register) if selected_register else []
+        register_metadata = _metadata_initial_values_for_object(selected_register, register_fields) if selected_register else {}
+        metadata_values_html = _render_metadata_display(register_metadata or {}, register_fields, empty_message="Keine Metadatenwerte gepflegt.") if selected_register else ""
         selected_document_metadata_html = (
             f"<div class='meta-display-row'><div class='meta-display-label'>Register</div><div class='meta-display-value'>{_escape(selected_register.name if selected_register else '')}</div></div>"
             f"<div class='meta-display-row'><div class='meta-display-label'>Dokumente</div><div class='meta-display-value'>{len(selected_register_documents)}</div></div>"
@@ -3283,7 +3626,7 @@ def _render_app_page(
         selected_document_metadata_html = metadata_rows + indexing_rows
         selected_document_preview_html = _render_document_preview(selected_document, f"/ui/app/documents/{selected_document.id}/download")
     if selected_capture_document_type:
-        for field in sorted(selected_capture_document_type.fields or [], key=lambda item: (item.order, (item.name or '').lower())):
+        for field in _definition_fields_for_document_type(selected_capture_document_type):
             capture_fields.append(f'{field.label or field.name}: {field.field_type}')
             input_name = f"metadata_{field.name}"
             label = field.label or field.name
@@ -3354,11 +3697,12 @@ def _render_app_page(
             "</div>"
         )
     message_html = f'<div class="{banner_class}"><strong>{_escape(message)}</strong>{success_actions}</div>' if message else ""
-    clear_filter_link = f"/ui/app?selected_document_type_id={selected_capture_document_type.id}" if selected_capture_document_type else "/ui/app"
-    all_filter_link = f"/ui/app?filter_kind=all&q={quote_plus(search_query or '')}{f'&selected_document_type_id={selected_capture_document_type.id}' if selected_capture_document_type else ''}"
-    typed_filter_link = f"/ui/app?filter_kind=typed&q={quote_plus(search_query or '')}{f'&selected_document_type_id={selected_capture_document_type.id}' if selected_capture_document_type else ''}"
-    untyped_filter_link = f"/ui/app?filter_kind=untyped&q={quote_plus(search_query or '')}{f'&selected_document_type_id={selected_capture_document_type.id}' if selected_capture_document_type else ''}"
-    recent_filter_link = f"/ui/app?filter_kind=recent&q={quote_plus(search_query or '')}{f'&selected_document_type_id={selected_capture_document_type.id}' if selected_capture_document_type else ''}"
+    explicit_document_type_query = f"&selected_document_type_id={selected_document_type.id}" if selected_document_type else ""
+    clear_filter_link = f"/ui/app?selected_document_type_id={selected_document_type.id}" if selected_document_type else "/ui/app"
+    all_filter_link = f"/ui/app?filter_kind=all&q={quote_plus(search_query or '')}{explicit_document_type_query}"
+    typed_filter_link = f"/ui/app?filter_kind=typed&q={quote_plus(search_query or '')}{explicit_document_type_query}"
+    untyped_filter_link = f"/ui/app?filter_kind=untyped&q={quote_plus(search_query or '')}{explicit_document_type_query}"
+    recent_filter_link = f"/ui/app?filter_kind=recent&q={quote_plus(search_query or '')}{explicit_document_type_query}"
     capture_empty_hint_html = f'<div class="muted" style="margin-top:10px;">{capture_preview}</div>' if not capture_field_inputs else ""
     intake_panel_html = ""
     if show_intake_panel:
@@ -3479,8 +3823,18 @@ def _render_app_page(
     .stat-card strong {{ display:block; font-size:1.55rem; margin-top:6px; }}
     .object-list {{ display:grid; gap:14px; }}
     .object-card {{ display:block; padding:18px; border:1px solid rgba(77,212,255,0.10); border-radius:18px; background:linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02)); color:var(--text); position:relative; overflow:hidden; }}
-    .object-card::after {{ content:""; position:absolute; inset:auto -40px -40px auto; width:140px; height:140px; background: radial-gradient(circle, rgba(77,212,255,0.14), transparent 65%); }}
+    .object-card::after {{ content:""; position:absolute; inset:auto -40px -40px auto; width:140px; height:140px; background: radial-gradient(circle, rgba(77,212,255,0.14), transparent 65%); pointer-events:none; }}
     .object-card:hover {{ border-color:rgba(77,212,255,.38); box-shadow: 0 0 0 4px var(--glow); text-decoration:none; transform: translateY(-1px); }}
+    .document-card {{ overflow:visible; }}
+    .document-card-main {{ display:block; color:inherit; position:relative; z-index:1; }}
+    .document-card-main:hover {{ text-decoration:none; }}
+    .document-card-actions {{ display:grid; gap:8px; justify-items:end; position:relative; z-index:5; }}
+    .document-action-menu-button {{ border:none; border-radius:999px; padding:6px 10px; background:rgba(255,255,255,0.03); color:var(--accent-2); cursor:pointer; font-size:.9rem; }}
+    .document-action-menu-button:hover {{ background:rgba(77,212,255,0.10); }}
+    .document-action-menu {{ right:0; top:calc(100% + 6px); }}
+    .context-menu .danger-action {{ color:#ffb4b4; }}
+    .context-menu .danger-action:hover {{ background:rgba(255,123,123,0.12); }}
+    .context-menu .danger-action.is-working {{ color:#ffd0d0; background:rgba(255,123,123,0.18); cursor:wait; }}
     .object-top {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:8px; position:relative; z-index:1; }}
     .meta-row {{ display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; position:relative; z-index:1; }}
     .meta-pill {{ padding:4px 10px; border-radius:999px; background:rgba(255,255,255,0.04); border:1px solid rgba(77,212,255,0.10); color:var(--muted); font-size:.85rem; }}
@@ -3508,6 +3862,7 @@ def _render_app_page(
     .tree-menu-button:hover {{ background:rgba(77,212,255,0.10); }}
     .context-menu {{ position:absolute; z-index:1000; min-width:220px; padding:8px; border-radius:16px; border:1px solid rgba(77,212,255,0.32); background:#111a36; box-shadow:0 18px 48px rgba(0,0,0,0.45); display:none; pointer-events:auto; }}
     .context-menu.open {{ display:block; }}
+    .context-menu form {{ margin:0; }}
     .context-menu button, .context-menu a {{ width:100%; display:flex; align-items:center; justify-content:flex-start; text-align:left; background:rgba(255,255,255,0.02); color:var(--text); border:none; border-radius:12px; padding:10px 12px; cursor:pointer; font:inherit; }}
     .context-menu button:hover, .context-menu a:hover {{ background:rgba(77,212,255,0.10); text-decoration:none; }}
     .tree-node.active {{ border-color:rgba(77,212,255,0.42); box-shadow:0 0 0 4px var(--glow); background:rgba(77,212,255,0.08); }}
@@ -3551,7 +3906,7 @@ def _render_app_page(
         <form method="get" action="/ui/app" class="overview-toolbar" id="search-form" style="margin-top:18px; position:relative; z-index:1;">
           {f'<input type="hidden" name="node_kind" value="{_escape(selected_node["kind"])}">' if selected_node else ''}
           {f'<input type="hidden" name="node_id" value="{_escape(selected_node["id"])}">' if selected_node else ''}
-          {f'<input type="hidden" name="selected_document_type_id" value="{_escape(str(selected_capture_document_type.id))}">' if selected_capture_document_type else ''}
+          {f'<input type="hidden" name="selected_document_type_id" value="{_escape(str(selected_document_type.id))}">' if selected_document_type else ''}
           <div class="search-row">
             <input type="search" name="q" value="{_escape(search_query)}" placeholder="Volltextsuche in Archiva, z. B. Titel, Metadaten, Tags, Typen">
             <button class="primary" type="submit">Suchen</button>
@@ -3611,7 +3966,73 @@ def _render_app_page(
     const dropzoneHint = document.getElementById('dropzone-hint');
     const treeContextMenu = document.getElementById('tree-context-menu');
 
+    const closeDocumentActionMenus = () => {{
+      document.querySelectorAll('.document-action-menu.open').forEach((menu) => {{
+        menu.classList.remove('open');
+        menu.setAttribute('aria-hidden', 'true');
+      }});
+    }};
+
+    document.querySelectorAll('.document-action-menu-button').forEach((button) => {{
+      button.addEventListener('click', (event) => {{
+        event.preventDefault();
+        event.stopPropagation();
+        const menu = button.parentElement?.querySelector('.document-action-menu');
+        const wasOpen = menu?.classList.contains('open');
+        closeDocumentActionMenus();
+        if (menu && !wasOpen) {{
+          menu.classList.add('open');
+          menu.setAttribute('aria-hidden', 'false');
+        }}
+      }});
+    }});
+
+    const prepareDocumentDeleteForm = (form, button) => {{
+      form.method = 'post';
+      form.action = `/ui/app/documents/${{button.dataset.documentId}}/delete`;
+      let returnInput = form.querySelector('input[name="return_to"]');
+      if (!returnInput) {{
+        returnInput = document.createElement('input');
+        returnInput.type = 'hidden';
+        returnInput.name = 'return_to';
+        form.appendChild(returnInput);
+      }}
+      returnInput.value = window.location.pathname + window.location.search;
+      button.disabled = true;
+      button.classList.add('is-working');
+      button.textContent = 'Wird in den Papierkorb verschoben…';
+    }};
+
+    const submitDocumentDeleteForm = (form, button) => {{
+      prepareDocumentDeleteForm(form, button);
+      window.setTimeout(() => form.submit(), 0);
+    }};
+
+
+    document.querySelectorAll('form[data-document-delete-form]').forEach((form) => {{
+      form.addEventListener('submit', (event) => {{
+        event.preventDefault();
+        const button = form.querySelector('[data-document-action="delete"]');
+        if (button) submitDocumentDeleteForm(form, button);
+      }});
+    }});
+
+    document.addEventListener('click', (event) => {{
+      const button = event.target.closest('[data-document-action="delete"]');
+      if (!button) return;
+      const form = button.closest('form');
+      if (form) {{
+        event.preventDefault();
+        submitDocumentDeleteForm(form, button);
+      }} else {{
+        // bare link — navigate to delete confirmation page
+        event.preventDefault();
+        window.location.href = button.href;
+      }}
+    }});
+
     const openQuickCreate = (mode, nodeKind = '', nodeId = '', nodeLabel = '') => {{
+
       const workbench = document.getElementById('quick-create');
       const metadataWorkbench = document.getElementById('metadata-workbench');
       const contentView = document.getElementById('node-content-view');
@@ -3738,6 +4159,9 @@ def _render_app_page(
     }});
 
     document.addEventListener('click', (event) => {{
+      if (!event.target.closest('.document-card-actions')) {{
+        closeDocumentActionMenus();
+      }}
       if (!treeContextMenu) return;
       if (!treeContextMenu.contains(event.target)) {{
         treeContextMenu.classList.remove('open');
@@ -3758,7 +4182,8 @@ def _render_app_page(
         if (action === 'new-register') openQuickCreate('register', kind, id, label);
         if (action === 'edit-metadata') openMetadataWorkbench();
         if (action === 'delete-node') {{
-          alert('Löschen im App-Kontext ist noch nicht verdrahtet. Bitte vorerst im Admin löschen.');
+          const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
+          window.location.href = `/ui/app/${{kind}}s/${{id}}/delete?return_to=${{returnTo}}`;
         }}
         if (action === 'new-document') {{
           const url = new URL(window.location.href);
@@ -4732,9 +5157,9 @@ def _render_structure(cabinets: list[Cabinet]) -> str:
             if cabinet_doc_types:
                 chunks.append("<div class='small' style='margin-top:6px;'>Direkte Dokumenttypen</div>")
                 chunks.append(render_doc_type_list(cabinet_doc_types))
-            if cabinet.registers:
+            if _active_registers_for_cabinet(cabinet):
                 chunks.append("<ul>")
-                for register in sorted(cabinet.registers, key=lambda item: item.order):
+                for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order):
                     register_meta_count = len(register.metadata_fields)
                     chunks.append(
                         f"<li>📑 {register.name} <span class='small'>({register_meta_count} Register-Felder)</span>{render_field_badges(register.metadata_fields)}"
@@ -5036,7 +5461,7 @@ def _resolve_archive_node(
                 return {"kind": "cabinet", "id": str(cabinet.id), "label": cabinet.name}
     elif node_kind == "register":
         for cabinet in cabinets:
-            for register in cabinet.registers:
+            for register in _active_registers_for_cabinet(cabinet):
                 if str(register.id) == node_id:
                     return {"kind": "register", "id": str(register.id), "label": register.name}
     elif node_kind == "cabinet_type":
@@ -5256,7 +5681,7 @@ def _render_archive_tree(
         for cabinet in typed_cabinets:
             cabinet_menu = _creation_actions_for_node(node_kind="cabinet", node_id=str(cabinet.id), node_label=cabinet.name, cabinet=cabinet)
             chunks.append(node_link("cabinet", str(cabinet.id), f"🗂️ {cabinet.name}", 1, cabinet_menu))
-            for register in sorted(cabinet.registers, key=lambda item: item.order):
+            for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order):
                 child_menu = _creation_actions_for_node(node_kind="register", node_id=str(register.id), node_label=register.name, register=register)
                 chunks.append(node_link("register", str(register.id), f"📑 {register.name}", 2, child_menu))
                 for doc_type in sorted(register.document_types, key=lambda item: item.order):
@@ -5278,6 +5703,49 @@ def _render_archive_tree(
 
     chunks.append("</div>")
     return "".join(chunks)
+
+
+def _render_document_object_card(document: Document, href: str) -> str:
+    metadata = metadata_from_json(document.metadata_json)
+    metadata_items = []
+    for key, value in list((metadata or {}).items())[:4]:
+        pretty_value = ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
+        metadata_items.append(f"{_escape(str(key))}: {_escape(pretty_value)}")
+    metadata_preview = " · ".join(metadata_items)
+    metadata_preview_html = f'<div class="metadata-preview">{metadata_preview}</div>' if metadata_preview else ""
+    type_label = document.document_type.name if document.document_type else "Ohne Dokumenttyp"
+    status_label = "Klassifiziert" if document.document_type else "Offen"
+    status_icon = "●" if document.document_type else "○"
+    doc_type_value = str(getattr(document.doc_type, "value", document.doc_type)).lower()
+    type_icon = "🧾" if doc_type_value == "pdf" else ("🖼️" if doc_type_value == "image" else ("📝" if doc_type_value == "text" else "📄"))
+    safe_href = _escape(href)
+    safe_title = _escape(document.title or document.name)
+    safe_name = _escape(document.name)
+    safe_document_id = _escape(str(document.id))
+    return (
+        f'<div class="object-card document-card">'
+        f'<div class="object-top">'
+        f'<a class="document-card-main" href="{safe_href}"><strong>{type_icon} {safe_title}</strong><div class="muted">{safe_name}</div></a>'
+        f'<div class="document-card-actions">'
+        f'<div class="meta-pill">{_escape(status_icon)} {_escape(status_label)}</div>'
+        f'<button type="button" class="document-action-menu-button" data-document-id="{safe_document_id}" data-document-title="{safe_title}" aria-label="Aktionen für {safe_title}">Aktionen ⋯</button>'
+        f'<div class="context-menu document-action-menu" aria-hidden="true">'
+        f'<a class="danger-action" href="/ui/app/documents/{safe_document_id}/delete?return_to={quote_plus(href)}">Löschen</a>'
+        f'<a href="{safe_href}">Öffnen</a>'
+        f'<a href="/ui/app/documents/{safe_document_id}">Details öffnen</a>'
+        f'</div>'
+        f'</div>'
+        f'</div>'
+        f'<a class="document-card-main" href="{safe_href}">'
+        f'{metadata_preview_html}'
+        f'<div class="meta-row">'
+        f'<span class="meta-pill">{_escape(type_label)}</span>'
+        f'<span class="meta-pill">{_escape(str(document.created_at))}</span>'
+        f'<span class="meta-pill">{_escape(type_icon)} {_escape(doc_type_value.upper())}</span>'
+        f'</div>'
+        f'</a>'
+        f'</div>'
+    )
 
 
 def _render_node_results(
@@ -5306,9 +5774,7 @@ def _render_node_results(
 
         result_cards = []
         for document in matching_documents[:30]:
-            result_cards.append(
-                f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>🔎 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')}</div></a>"
-            )
+            result_cards.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
         header = f"""
         <div class=\"panel\" style=\"margin-bottom:16px;\">
           <h2 style=\"margin-top:0;\">Suchtreffer</h2>
@@ -5340,7 +5806,7 @@ def _render_node_results(
         typed_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and _resolved_document_cabinet(doc).cabinet_type and str(_resolved_document_cabinet(doc).cabinet_type.id) == selected_id]
         subtitle = f"{len(typed_cabinets)} Cabinets · {len(typed_documents)} Dokumente in diesem Cabinettyp"
         for cabinet in sorted(typed_cabinets, key=lambda item: item.order):
-            register_count = len(cabinet.registers or [])
+            register_count = len(_active_registers_for_cabinet(cabinet))
             doc_type_count = len(cabinet.document_types or [])
             cabinet_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id)]
             results.append(
@@ -5352,7 +5818,7 @@ def _render_node_results(
             subtitle = "Inhalt dieses Cabinets"
             structure_results: list[str] = []
             document_results: list[str] = []
-            for register in sorted(cabinet.registers, key=lambda item: item.order):
+            for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order):
                 register_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id) and doc.document_type and doc.document_type.register_id and str(doc.document_type.register_id) == str(register.id)]
                 structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=register&node_id={register.id}'><strong>📑 {_escape(register.name)}</strong><div class='muted'>{len(register.document_types)} Dokumenttypen · {len(register_documents)} Dokumente</div></a>")
             for doc_type in sorted(cabinet.document_types, key=lambda item: item.order):
@@ -5363,13 +5829,13 @@ def _render_node_results(
                 results.append("<div class='panel' style='margin-bottom:12px;'><h3 style='margin:0;'>Struktur</h3></div>")
                 results.extend(structure_results)
             for document in cabinet_documents[:20]:
-                document_results.append(f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')} · {_escape(str(document.created_at))}</div></a>")
+                document_results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
             results.extend(document_results)
     elif selected_kind == "register":
         register = None
         parent_cabinet = None
         for cabinet in cabinets:
-            for candidate in cabinet.registers:
+            for candidate in _active_registers_for_cabinet(cabinet):
                 if str(candidate.id) == selected_id:
                     register = candidate
                     parent_cabinet = cabinet
@@ -5383,12 +5849,12 @@ def _render_node_results(
                 doc_type_documents = [doc for doc in matching_documents if doc.document_type_id and str(doc.document_type_id) == str(doc_type.id)]
                 results.append(f"<a class='object-card' href='/ui/app?node_kind=document_type&node_id={doc_type.id}'><strong>📄 {_escape(doc_type.name)}</strong><div class='muted'>Dokumenttyp in {_escape(register.name)} · {len(doc_type_documents)} Dokumente</div></a>")
             for document in matching_documents[:20]:
-                results.append(f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(parent_cabinet.name if parent_cabinet else '')}</div></a>")
+                results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
     elif selected_kind == "document_type":
         matching_documents = [doc for doc in all_documents if doc.document_type_id and str(doc.document_type_id) == selected_id]
         subtitle = f"{len(matching_documents)} Dokumente dieses Dokumenttyps"
         for document in matching_documents[:30]:
-            results.append(f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.name)}</div></a>")
+            results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
     elif selected_kind == "document":
         document = next((doc for doc in all_documents if str(doc.id) == str(selected_id)), None)
         if document:
@@ -5397,7 +5863,8 @@ def _render_node_results(
             subtitle = f"{len(matching_documents)} Dokumente dieses Dokumenttyps"
             for candidate in matching_documents[:30]:
                 active_class = " active" if str(candidate.id) == str(document.id) else ""
-                results.append(f"<a class='object-card{active_class}' href='/ui/app?node_kind=document&node_id={candidate.id}'><strong>📄 {_escape(candidate.title or candidate.name)}</strong><div class='muted'>{_escape(candidate.name)}</div></a>")
+                card = _render_document_object_card(candidate, f"/ui/app?node_kind=document&node_id={candidate.id}")
+                results.append(card.replace('class="object-card document-card"', f'class="object-card{active_class} document-card"', 1))
 
     if search_query.strip():
         subtitle = (subtitle + " · " if subtitle else "") + f"Suche aktiv: {_escape(search_query)}"
@@ -5413,7 +5880,7 @@ def _render_node_results(
         if search_documents:
             subtitle = f"{len(search_documents)} Suchtreffer"
             results = [
-                f"<a class='object-card' href='/ui/app?node_kind=document&node_id={document.id}'><strong>📄 {_escape(document.title or document.name)}</strong><div class='muted'>{_escape(document.document_type.name if document.document_type else 'Ohne Dokumenttyp')} · {_escape(document.name)}</div></a>"
+                _render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}")
                 for document in search_documents[:30]
             ]
 
@@ -5465,7 +5932,7 @@ def _render_context_panel(selected_node: dict[str, Any] | None, cabinets: list[C
     elif selected_kind == "register" and selected_id:
         selected_register_id = selected_id
         for cabinet in cabinets:
-            for register in sorted(cabinet.registers, key=lambda item: item.order):
+            for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order):
                 if str(register.id) == selected_id:
                     selected_cabinet_id = str(cabinet.id)
                     selected_cabinet_label = cabinet.name
@@ -5478,7 +5945,7 @@ def _render_context_panel(selected_node: dict[str, Any] | None, cabinets: list[C
                 break
     elif selected_kind == "document_type" and selected_id:
         for cabinet in cabinets:
-            for register in sorted(cabinet.registers, key=lambda item: item.order):
+            for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order):
                 for doc_type in sorted(register.document_types, key=lambda item: item.order):
                     if str(doc_type.id) == selected_id:
                         selected_cabinet_id = str(cabinet.id)
@@ -5685,32 +6152,10 @@ def _render_object_overview(
     if not filtered_documents:
         list_html = "<div class='muted'>Keine Objekte für diese Suche oder Filter gefunden.</div>"
     else:
-        cards: list[str] = []
-        for document in filtered_documents:
-            metadata = metadata_from_json(document.metadata_json)
-            metadata_items = []
-            for key, value in list(metadata.items())[:4]:
-                pretty_value = ", ".join(value) if isinstance(value, list) else value
-                metadata_items.append(f"{_escape(key)}: {_escape(pretty_value)}")
-            metadata_preview = " · ".join(metadata_items)
-            metadata_preview_html = f'<div class="metadata-preview">{metadata_preview}</div>' if metadata_preview else ""
-            type_label = document.document_type.name if document.document_type else "Ohne Dokumenttyp"
-            status_label = "Klassifiziert" if document.document_type else "Offen"
-            status_icon = "●" if document.document_type else "○"
-            doc_type_value = str(getattr(document.doc_type, "value", document.doc_type)).lower()
-            type_icon = "🧾" if doc_type_value == "pdf" else ("🖼️" if doc_type_value == "image" else ("📝" if doc_type_value == "text" else "📄"))
-            cards.append(
-                f'<a class="object-card" href="/ui/app/documents/{document.id}">'
-                f'<div class="object-top"><div><strong>{type_icon} {_escape(document.title or document.name)}</strong><div class="muted">{_escape(document.name)}</div></div>'
-                f'<div class="meta-pill">{_escape(status_icon)} {_escape(status_label)}</div></div>'
-                f'<div class="meta-row">'
-                f'<span class="meta-pill">{_escape(type_label)}</span>'
-                f'<span class="meta-pill">{_escape(str(document.created_at))}</span>'
-                f'<span class="meta-pill">{_escape(type_icon)} {_escape(doc_type_value.upper())}</span>'
-                f'</div>'
-                f'{metadata_preview_html}'
-                f'</a>'
-            )
+        cards = [
+            _render_document_object_card(document, f"/ui/app/documents/{document.id}")
+            for document in filtered_documents
+        ]
         list_html = '<div class="object-list">' + ''.join(cards) + '</div>'
 
     recent_links = []
@@ -5754,7 +6199,7 @@ def _admin_document_type_options(
 
     # Legacy/Instanzebene weiterhin unterstützen.
     for cabinet in cabinets:
-        for register in sorted(cabinet.registers, key=lambda item: item.order):
+        for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order):
             for doc_type in sorted(register.document_types, key=lambda item: item.order):
                 add_option(doc_type, f"{cabinet.name} → {register.name} → {doc_type.name}")
         for doc_type in sorted(cabinet.document_types, key=lambda item: item.order):
@@ -5788,7 +6233,7 @@ def _render_admin_create_panel(
         [
             (str(register.id), f"{cabinet.name} → {register.name}")
             for cabinet in cabinets
-            for register in sorted(cabinet.registers, key=lambda item: item.order)
+            for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order)
         ],
         include_blank="Bitte wählen",
     )

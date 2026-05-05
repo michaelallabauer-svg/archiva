@@ -3,6 +3,7 @@
 from sqlalchemy.orm import Session
 
 from archiva.indexer.opensearch_client import OpenSearchClient
+from archiva.models import Document
 from archiva.search.query_builder import build_search_response
 
 
@@ -10,6 +11,22 @@ class SearchService:
     def __init__(self, db: Session):
         self.db = db
         self.client = OpenSearchClient()
+
+    def _filter_active_hits(self, hits: list[dict]) -> list[dict]:
+        document_ids = [hit.get("document_id") for hit in hits if hit.get("document_id")]
+        if not document_ids:
+            return []
+        active_documents = (
+            self.db.query(Document)
+            .where(Document.id.in_(document_ids), Document.deleted_at.is_(None))
+            .all()
+        )
+        active_ids = {
+            str(document.id)
+            for document in active_documents
+            if document.cabinet is None or document.cabinet.deleted_at is None
+        }
+        return [hit for hit in hits if str(hit.get("document_id")) in active_ids]
 
     def search(
         self,
@@ -70,6 +87,7 @@ class SearchService:
                         continue
                     seen.add(doc_id)
                     merged_hits.append(hit)
+                merged_hits = self._filter_active_hits(merged_hits)
                 parsed["hits"] = merged_hits
                 parsed["total"] = len(merged_hits)
                 return parsed
