@@ -659,7 +659,7 @@ def _next_auto_id_value(db: Session, document_type: DocumentType, field: Metadat
 
 def _apply_automatic_metadata(db: Session, document_type: DocumentType, metadata: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(metadata)
-    for field in _definition_fields_for_document_type(document_type):
+    for field in _document_type_fields_only(document_type):
         if field.field_type != "auto_id":
             continue
         if enriched.get(field.name):
@@ -670,7 +670,7 @@ def _apply_automatic_metadata(db: Session, document_type: DocumentType, metadata
 
 def _resolve_identity_metadata_labels(db: Session, document_type: DocumentType, metadata: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(metadata)
-    for field in _definition_fields_for_document_type(document_type):
+    for field in _document_type_fields_only(document_type):
         if field.field_type != "identity_reference":
             continue
         raw = enriched.get(field.name)
@@ -706,10 +706,39 @@ def _definition_fields_for_document_type(document_type: DocumentType | None) -> 
     return list(unique_by_name.values())
 
 
+def _unique_metadata_fields(fields: list[MetadataField]) -> list[MetadataField]:
+    unique_by_key: dict[str, MetadataField] = {}
+    for field in sorted(fields, key=lambda item: (_metadata_field_priority(item), item.order, item.label or item.name, str(item.id))):
+        unique_by_key.setdefault(_metadata_field_semantic_key(field), field)
+    return sorted(unique_by_key.values(), key=lambda item: (item.order, item.label or item.name, str(item.id)))
+
+
+def _metadata_field_semantic_key(field: MetadataField) -> str:
+    name = _normalized_label(field.name or "")
+    label = _normalized_label(field.label or "")
+    field_type = (field.field_type or "").strip().lower()
+    if name in {"supplier_name", "lieferant"} or label == "lieferant":
+        return "invoice_supplier"
+    if name in {"invoice_date", "datum", "rechnungsdatum"} or label in {"datum", "rechnungsdatum"}:
+        return "invoice_date"
+    if name in {"er_id", "re_nummer", "re-nummer", "interne_er_id"} or (field_type == "auto_id" and label in {"nummer", "interne_er_id", "interne_er-id"}):
+        return "internal_invoice_id"
+    return name or label or str(field.id)
+
+
+def _metadata_field_priority(field: MetadataField) -> int:
+    name = _normalized_label(field.name or "")
+    if name in {"er_id", "invoice_number", "invoice_date", "supplier_name"}:
+        return 0
+    if field.field_type == "auto_id":
+        return 1
+    return 10
+
+
 def _document_type_fields_only(document_type: DocumentType | None) -> list[MetadataField]:
     if not document_type:
         return []
-    return sorted(document_type.fields or [], key=lambda item: (item.order, item.label or item.name, str(item.id)))
+    return _unique_metadata_fields(list(document_type.fields or []))
 
 
 def _collect_index_search_filters(request: Request) -> dict[str, list[str]]:
@@ -1083,7 +1112,7 @@ def _selected_document_type_for_node(selected_node: dict[str, Any] | None, docum
 
 def _collect_form_metadata(form: Any, document_type: DocumentType) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
-    for field in _definition_fields_for_document_type(document_type):
+    for field in _document_type_fields_only(document_type):
         input_name = f"metadata_{field.name}"
         values = form.getlist(input_name)
         cleaned_values = [value for value in values if value not in (None, "")]
@@ -4606,7 +4635,7 @@ def _render_app_page(
             if workflow_panel_open:
                 workflow_panel_html = _render_workflow_panel(selected_document, db)
     if selected_capture_document_type:
-        for field in _definition_fields_for_document_type(selected_capture_document_type):
+        for field in _document_type_fields_only(selected_capture_document_type):
             capture_fields.append(f'{field.label or field.name}: {field.field_type}')
             input_name = f"metadata_{field.name}"
             label = field.label or field.name

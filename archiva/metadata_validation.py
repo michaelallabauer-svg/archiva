@@ -48,7 +48,7 @@ def validate_document_metadata(
     if not document_type:
         raise MetadataNotFoundError(document_type_id)
 
-    fields = sorted(document_type.fields, key=lambda field: field.order)
+    fields = _unique_fields_by_name(sorted(document_type.fields, key=lambda field: (field.order, field.label or field.name, str(field.id))))
     metadata = metadata or {}
     errors: list[dict[str, str]] = []
     normalized: dict[str, Any] = {}
@@ -105,6 +105,39 @@ def metadata_from_json(raw: str | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _unique_fields_by_name(fields: list[MetadataField]) -> list[MetadataField]:
+    unique: dict[str, MetadataField] = {}
+    for field in sorted(fields, key=lambda item: (_field_priority(item), item.order, item.label or item.name, str(item.id))):
+        unique.setdefault(_field_semantic_key(field), field)
+    return sorted(unique.values(), key=lambda item: (item.order, item.label or item.name, str(item.id)))
+
+
+def _normalized_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _field_semantic_key(field: MetadataField) -> str:
+    name = _normalized_label(field.name or "")
+    label = _normalized_label(field.label or "")
+    field_type = (field.field_type or "").strip().lower()
+    if name in {"supplier_name", "lieferant"} or label == "lieferant":
+        return "invoice_supplier"
+    if name in {"invoice_date", "datum", "rechnungsdatum"} or label in {"datum", "rechnungsdatum"}:
+        return "invoice_date"
+    if name in {"er_id", "re_nummer", "re-nummer", "interne_er_id"} or (field_type == "auto_id" and label in {"nummer", "interne_er_id", "interne_er-id"}):
+        return "internal_invoice_id"
+    return name or label or str(field.id)
+
+
+def _field_priority(field: MetadataField) -> int:
+    name = _normalized_label(field.name or "")
+    if name in {"er_id", "invoice_number", "invoice_date", "supplier_name"}:
+        return 0
+    if field.field_type == "auto_id":
+        return 1
+    return 10
+
+
 def _normalize_value(field: MetadataField, raw_value: Any) -> Any:
     field_type = field.field_type
 
@@ -139,9 +172,7 @@ def _normalize_value(field: MetadataField, raw_value: Any) -> Any:
         return _normalize_identity_reference(field, raw_value)
 
     if field_type == "auto_id":
-        value = str(raw_value).strip()
-        _validate_string_constraints(field, value)
-        return value
+        return str(raw_value).strip()
 
     value = str(raw_value).strip()
     _validate_string_constraints(field, value)
