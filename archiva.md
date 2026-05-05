@@ -248,3 +248,24 @@
 - UI-Idee: Wenn auf einem Dokument ein aktiver Workflow läuft, zeigt die App einen prominenten Workflow-Hero/Button am Dokument.
 - Klick auf den Workflow-Hero öffnet die Workflow-Maske im mittleren Bereich der App.
 - Konsequenz fürs Datenmodell: Workflow-Instanz sollte polymorph auf ein Zielobjekt zeigen, z.B. `subject_kind` + `subject_id`, statt hart nur `document_id`; MVP validiert/nutzt zunächst `subject_kind=document`.
+
+## Workflow Runtime MVP umgesetzt 2026-05-05 10:45
+- Commit `ef6b7cd Add workflow runtime MVP` ergänzt erste echte Workflow Runtime.
+- Neue Runtime-Tabellen/Modelle:
+  - `workflow_instances` mit polymorphem `subject_kind`/`subject_id` für spätere Cabinet/Register-Workflows; MVP nutzt `document`.
+  - `workflow_tasks` als aktueller Zuständigkeits-/Schritt-Snapshot.
+  - `workflow_history_events` für `started`, `transitioned`, `completed`, `cancelled`.
+- Neuer Service `archiva/workflow_runtime.py`:
+  - Workflow auf Dokument starten.
+  - Transition ausführen.
+  - Workflow abschließen.
+  - Workflow abbrechen.
+  - Parallel aktive Workflows pro Dokument erlaubt.
+- App-UI minimal verdrahtet:
+  - Prominenter Workflow-Hero/Button erscheint bei aktiven Workflows am Dokument.
+  - `workflow_panel=1` öffnet die Workflow-Maske im mittleren App-Bereich.
+  - Maske zeigt aktive Workflows, aktuellen Schritt, verfügbare Transitionen, Startformular, Abschluss/Abbruch und Historie.
+- Verifiziert:
+  - `py_compile` grün für Models, DB, Runtime-Service, UI und Migration.
+  - App/Health und Workflow Designer auf `:8000` HTTP 200.
+  - Runtime-Smoke-Test: zwei parallele Workflow-Instanzen auf einem synthetischen Dokument gestartet; eine transitioned+completed, eine cancelled; History enthielt `started`, `transitioned`, `completed`, `cancelled`; Testdaten bereinigt.
