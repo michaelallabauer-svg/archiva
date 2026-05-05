@@ -5471,8 +5471,10 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color:#4dd4ff; font-weight:700; }}
     .pillbar {{ display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }}
     .pill {{ background: rgba(255,255,255,0.04); border:1px solid rgba(77,212,255,0.12); border-radius:999px; padding:9px 14px; color:#eef2ff; }}
-    .grid {{ display:grid; grid-template-columns: 240px minmax(0, 1fr); gap:12px; align-items:start; }}
-    .stack {{ display:grid; gap:10px; }}
+    .grid {{ display:grid; grid-template-columns: 240px minmax(360px, 1fr) minmax(340px, 420px); gap:12px; align-items:start; }}
+    .stack {{ display:grid; gap:10px; min-width:0; }}
+    .designer-editor .field-grid {{ grid-template-columns: 1fr; }}
+    .designer-editor .panel {{ margin-bottom:0; }}
     .workflow-card {{ display:block; padding:11px; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); color:#eef2ff; }}
     .workflow-card.is-selected {{ border-color:#4dd4ff; box-shadow: 0 0 0 1px rgba(77,212,255,0.45), 0 14px 32px rgba(77,212,255,0.14); }}
     .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
@@ -5502,7 +5504,8 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     .workflow-insight-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }}
     .workflow-insight-card {{ padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); }}
     .workflow-insight-arrow {{ color:#4dd4ff; padding:0 8px; }}
-    @media (max-width: 980px) {{ .page {{ padding:10px; }} .grid, .field-grid {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 1180px) {{ .grid {{ grid-template-columns: 220px minmax(0, 1fr); }} .designer-editor {{ grid-column: 2; }} }}
+    @media (max-width: 980px) {{ .page {{ padding:10px; }} .grid, .field-grid, .designer-editor .field-grid {{ grid-template-columns: 1fr; }} .designer-editor {{ grid-column:auto; }} }}
   </style>
 </head>
 <body>
@@ -5567,6 +5570,8 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
           </div>
           <div class=\"stack\">{step_cards_html}</div>
         </div>
+      </div>
+      <div class=\"stack designer-editor\">
         <form method=\"post\" action=\"/ui/workflow-designer/steps\" class=\"panel\" style=\"{'display:block;' if selected_workflow else 'display:none;'}\">
           <h2 style=\"margin-top:0;\">Schritt anlegen</h2>
           <input type=\"hidden\" name=\"workflow_definition_id\" value=\"{selected_workflow.id if selected_workflow else ''}\">
