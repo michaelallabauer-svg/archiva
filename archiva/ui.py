@@ -3433,7 +3433,9 @@ def _render_admin_identity_page(
     .field {{ display:grid; gap:6px; }}
     .field.full {{ grid-column: 1 / -1; }}
     .checkbox-group {{ display:grid; gap:10px; padding:14px; border:1px solid rgba(77,212,255,0.08); border-radius:16px; background:var(--panel-deep); }}
-    .checkbox-item {{ display:flex; gap:10px; align-items:center; font-weight:400; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,0.02); }}
+    .checkbox-item {{ display:flex; justify-content:flex-start; gap:10px; align-items:center; width:100%; text-align:left; font-weight:400; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,0.02); }}
+    .checkbox-item input {{ flex:0 0 auto; }}
+    .checkbox-label-text {{ flex:1 1 auto; min-width:0; text-align:left; }}
     label {{ font-weight:600; font-size:0.95rem; }}
     input, textarea, select {{ width:100%; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:var(--panel-deep); color:var(--text); padding:12px; font:inherit; }}
     input[type="checkbox"] {{ width:auto; min-width:16px; height:16px; padding:0; accent-color:var(--accent-2); }}
@@ -7199,20 +7201,20 @@ def _render_identity_panel(
     selected_role = next((role for role in roles if str(role.id) == str(selected_role_id or "")), None)
     selected_team = next((team for team in teams if str(team.id) == str(selected_team_id or "")), None)
     role_options = "".join(
-        f'<label class="checkbox-item"><input type="checkbox" name="role_ids" value="{role.id}"> {_escape(role.name)}</label>'
+        f'<label class="checkbox-item"><input type="checkbox" name="role_ids" value="{role.id}"><span class="checkbox-label-text">{_escape(role.name)}</span></label>'
         for role in roles
     ) or '<div class="muted">Noch keine Rollen vorhanden.</div>'
 
     edit_role_options = "".join(
-        f'<label class="checkbox-item"><input type="checkbox" name="role_ids" value="{role.id}" {"checked" if selected_user and any(assignment.role_id == role.id for assignment in selected_user.role_assignments) else ""}> {_escape(role.name)}</label>'
+        f'<label class="checkbox-item"><input type="checkbox" name="role_ids" value="{role.id}" {"checked" if selected_user and any(assignment.role_id == role.id for assignment in selected_user.role_assignments) else ""}><span class="checkbox-label-text">{_escape(role.name)}</span></label>'
         for role in roles
     ) or '<div class="muted">Noch keine Rollen vorhanden.</div>'
     team_member_options = "".join(
-        f'<label class="checkbox-item"><input type="checkbox" name="member_user_ids" value="{user.id}"> {_escape(user.display_name)} <span class="muted">({_escape(user.email)})</span></label>'
+        f'<label class="checkbox-item"><input type="checkbox" name="member_user_ids" value="{user.id}"><span class="checkbox-label-text">{_escape(user.display_name)} <span class="muted">({_escape(user.email)})</span></span></label>'
         for user in users
     ) or '<div class="muted">Noch keine Benutzer vorhanden.</div>'
     edit_team_member_options = "".join(
-        f'<label class="checkbox-item"><input type="checkbox" name="member_user_ids" value="{user.id}" {"checked" if selected_team and any(membership.user_id == user.id for membership in selected_team.memberships) else ""}> {_escape(user.display_name)} <span class="muted">({_escape(user.email)})</span></label>'
+        f'<label class="checkbox-item"><input type="checkbox" name="member_user_ids" value="{user.id}" {"checked" if selected_team and any(membership.user_id == user.id for membership in selected_team.memberships) else ""}><span class="checkbox-label-text">{_escape(user.display_name)} <span class="muted">({_escape(user.email)})</span></span></label>'
         for user in users
     ) or '<div class="muted">Noch keine Benutzer vorhanden.</div>'
     message_html = f'<div class="badge" style="display:inline-block;">{_escape(message)}</div>' if message else ""
