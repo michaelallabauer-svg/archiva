@@ -221,15 +221,15 @@ Empfehlung: Für MVP direkt beim Upload bzw. nach erfolgreicher Metadatenvalidie
 
 ### Priorität A — Muss für MVP
 
-- [ ] Seed-/Setup-Funktion für Eingangsrechnungs-Struktur erstellen
-  - [ ] Cabinet Type `Eingangsrechnungsbuch`
-  - [ ] Cabinet pro Geschäftsjahr
-  - [ ] Document Type `Rechnung`
-  - [ ] Standard-Metadatenfelder
-- [ ] Workflow-Vorlage `Eingangsrechnung` definieren
-  - [ ] Schritte
-  - [ ] Transitionen
-  - [ ] Default-Zuweisungen/Rollen
+- [x] Seed-/Setup-Funktion für Eingangsrechnungs-Struktur erstellen
+  - [x] Cabinet Type `Eingangsrechnungsbuch`
+  - [x] Cabinet pro Geschäftsjahr
+  - [x] Document Type `Rechnung`
+  - [x] Standard-Metadatenfelder
+- [x] Workflow-Vorlage `Eingangsrechnung` definieren
+  - [x] Schritte
+  - [x] Transitionen
+  - [x] Default-Zuweisungen/Rollen
 - [ ] Dokumentdetail/App-Ansicht um Workflowstatus erweitern
   - [ ] Prominenter Workflow-Hero/Button, wenn ein Workflow auf dem Dokument aktiv ist
   - [ ] Klick öffnet Workflow-Maske im mittleren App-Bereich

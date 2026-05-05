@@ -906,6 +906,146 @@ def _invoice_default_fields(document_type_id: UUID) -> list[MetadataField]:
     return fields
 
 
+def _get_or_create_role(db: Session, *, name: str, description: str) -> Role:
+    role = db.query(Role).where(Role.name == name).first()
+    if role:
+        return role
+    role = Role(name=name, description=description, is_system=False, permissions_json='["app:read", "app:write", "workflow:execute"]')
+    db.add(role)
+    db.flush()
+    return role
+
+
+def _get_or_create_assignment_target(db: Session, *, role: Role, label: str) -> AssignmentTarget:
+    target = db.query(AssignmentTarget).where(AssignmentTarget.target_type == "role", AssignmentTarget.role_id == role.id).first()
+    if target:
+        if not target.label:
+            target.label = label
+        return target
+    target = AssignmentTarget(target_type="role", role_id=role.id, label=label, description=f"Workflow-Zuweisung für {label}")
+    db.add(target)
+    db.flush()
+    return target
+
+
+def seed_invoice_mvp(db: Session) -> dict[str, Any]:
+    """Create the Eingangsrechnung MVP structure and workflow idempotently."""
+    current_year = datetime.utcnow().year
+    created: list[str] = []
+
+    cabinet_type = db.query(CabinetType).where(CabinetType.name == "Eingangsrechnungsbuch").first()
+    if not cabinet_type:
+        cabinet_type = CabinetType(name="Eingangsrechnungsbuch", description="MVP-Struktur für Eingangsrechnungen", order=10)
+        db.add(cabinet_type)
+        db.flush()
+        created.append("Cabinet Type")
+
+    register_type = (
+        db.query(RegisterType)
+        .where(RegisterType.cabinet_type_id == cabinet_type.id, RegisterType.name == "Eingangsrechnungen")
+        .first()
+    )
+    if not register_type:
+        register_type = RegisterType(cabinet_type_id=cabinet_type.id, name="Eingangsrechnungen", description="Rechnungen im Eingang", order=10)
+        db.add(register_type)
+        db.flush()
+        created.append("Register Type")
+
+    cabinet = (
+        db.query(Cabinet)
+        .where(Cabinet.cabinet_type_id == cabinet_type.id, Cabinet.name == str(current_year), Cabinet.deleted_at.is_(None))
+        .first()
+    )
+    if not cabinet:
+        cabinet = Cabinet(cabinet_type_id=cabinet_type.id, name=str(current_year), description=f"Eingangsrechnungen {current_year}", order=current_year)
+        db.add(cabinet)
+        db.flush()
+        created.append("Jahres-Cabinet")
+
+    register = (
+        db.query(Register)
+        .where(Register.cabinet_id == cabinet.id, Register.name == "Eingangsrechnungen", Register.deleted_at.is_(None))
+        .first()
+    )
+    if not register:
+        register = Register(cabinet_id=cabinet.id, register_type_id=register_type.id, name="Eingangsrechnungen", description="Aktive Eingangsrechnungen", order=10)
+        db.add(register)
+        db.flush()
+        created.append("Register")
+
+    document_type = (
+        db.query(DocumentType)
+        .where(DocumentType.register_id == register.id, DocumentType.name == "Rechnung")
+        .first()
+    )
+    if not document_type:
+        document_type = DocumentType(register_id=register.id, cabinet_id=cabinet.id, name="Rechnung", description="Eingangsrechnung mit MVP-Metadaten", icon="🧾", order=10)
+        db.add(document_type)
+        db.flush()
+        created.append("Document Type")
+
+    existing_field_names = {field.name for field in document_type.fields}
+    for field in _invoice_default_fields(document_type.id):
+        if field.name not in existing_field_names:
+            db.add(field)
+            created.append(f"Feld {field.name}")
+
+    pruefer = _get_or_create_assignment_target(db, role=_get_or_create_role(db, name="Rechnungsprüfung", description="Sachliche Prüfung von Eingangsrechnungen"), label="Rechnungsprüfung")
+    freigabe = _get_or_create_assignment_target(db, role=_get_or_create_role(db, name="Rechnungsfreigabe", description="Freigabe von Eingangsrechnungen"), label="Rechnungsfreigabe")
+    buchhaltung = _get_or_create_assignment_target(db, role=_get_or_create_role(db, name="Buchhaltung", description="Verbuchung und Abschluss von Eingangsrechnungen"), label="Buchhaltung")
+
+    workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.name == "Eingangsrechnung").first()
+    if not workflow:
+        workflow = WorkflowDefinition(name="Eingangsrechnung", description="MVP-Workflow für Eingangsrechnungen", version=1, is_active=True)
+        db.add(workflow)
+        db.flush()
+        created.append("Workflow")
+
+    step_specs = [
+        ("erfasst", "Erfasst", 10, None),
+        ("sachliche_pruefung", "Sachliche Prüfung", 20, pruefer),
+        ("zurueckgewiesen", "Zurückgewiesen", 30, pruefer),
+        ("freigabe", "Freigabe", 40, freigabe),
+        ("buchhaltung", "Buchhaltung / Verbuchung", 50, buchhaltung),
+        ("abgeschlossen", "Abgeschlossen", 60, buchhaltung),
+    ]
+    steps_by_key = {step.step_key: step for step in workflow.steps}
+    for key, name, order, target in step_specs:
+        step = steps_by_key.get(key)
+        if not step:
+            step = WorkflowStepDefinition(workflow_definition_id=workflow.id, step_key=key, name=name, order=order)
+            db.add(step)
+            db.flush()
+            steps_by_key[key] = step
+            created.append(f"Schritt {name}")
+        step.assignment_target_id = target.id if target else None
+        step.order = order
+
+    transition_specs = [
+        ("erfasst", "sachliche_pruefung", "Zur sachlichen Prüfung", True),
+        ("sachliche_pruefung", "freigabe", "Sachlich freigeben", True),
+        ("sachliche_pruefung", "zurueckgewiesen", "Zurückweisen", False),
+        ("zurueckgewiesen", "sachliche_pruefung", "Erneut prüfen", True),
+        ("freigabe", "buchhaltung", "Freigeben", True),
+        ("freigabe", "sachliche_pruefung", "Zurück zur Prüfung", False),
+        ("buchhaltung", "abgeschlossen", "Abschließen", True),
+    ]
+    existing_transitions = {(str(t.from_step_id), str(t.to_step_id), _normalized_label(t.label)): t for t in workflow.steps for t in t.outgoing_transitions}
+    for from_key, to_key, label, is_default in transition_specs:
+        from_step = steps_by_key[from_key]
+        to_step = steps_by_key[to_key]
+        lookup = (str(from_step.id), str(to_step.id), _normalized_label(label))
+        transition = existing_transitions.get(lookup)
+        if not transition:
+            transition = WorkflowTransitionDefinition(workflow_definition_id=workflow.id, from_step_id=from_step.id, to_step_id=to_step.id, label=label)
+            db.add(transition)
+            created.append(f"Transition {label}")
+        transition.is_default = is_default
+
+    db.commit()
+    return {"created": created, "cabinet": cabinet, "register": register, "document_type": document_type, "workflow": workflow}
+
+
 @router.get("/", response_class=HTMLResponse)
 async def ui_root(request: Request) -> RedirectResponse:
     return RedirectResponse(url="/ui/admin", status_code=303)
@@ -2749,6 +2889,18 @@ async def ui_seed_invoice_fields(
     return _ui_redirect_with_message(f"/ui/admin/document-types/{document_type.id}")
 
 
+@router.post("/admin/setup/invoice-mvp")
+async def ui_seed_invoice_mvp(
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    result = seed_invoice_mvp(db)
+    document_type = result["document_type"]
+    workflow = result["workflow"]
+    created_count = len(result.get("created") or [])
+    message = f"Eingangsrechnungs-MVP eingerichtet ({created_count} neue Elemente) · Workflow {workflow.name} bereit"
+    return _ui_redirect_with_message(f"/ui/admin/document-types/{document_type.id}?message={quote_plus(message)}")
+
+
 @router.post("/admin/cabinet-types/{cabinet_type_id}/delete")
 async def ui_delete_cabinet_type(
     cabinet_type_id: UUID,
@@ -3340,6 +3492,7 @@ def _render_admin_page(
           <a class="pill" href="/ui/admin/trash">Papierkorb</a>
           <a class="pill" href="/ui/admin/identity">Identity & Rollen</a>
           <a class="pill" href="/ui/workflow-designer">Workflow Designer</a>
+          <form method="post" action="/ui/admin/setup/invoice-mvp" style="margin:0; display:inline-flex;"><button class="pill" type="submit">Eingangsrechnungs-MVP einrichten</button></form>
         </div>
       </div>
       <div class="panel hero-side">

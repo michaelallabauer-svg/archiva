@@ -269,3 +269,22 @@
   - `py_compile` grün für Models, DB, Runtime-Service, UI und Migration.
   - App/Health und Workflow Designer auf `:8000` HTTP 200.
   - Runtime-Smoke-Test: zwei parallele Workflow-Instanzen auf einem synthetischen Dokument gestartet; eine transitioned+completed, eine cancelled; History enthielt `started`, `transitioned`, `completed`, `cancelled`; Testdaten bereinigt.
+
+## Eingangsrechnungs-MVP Seed umgesetzt 2026-05-05 10:55
+- Admin-Route `POST /ui/admin/setup/invoice-mvp` legt die fachliche MVP-Struktur idempotent an:
+  - Cabinet Type `Eingangsrechnungsbuch`
+  - Register Type `Eingangsrechnungen`
+  - Jahres-Cabinet für das aktuelle Jahr
+  - Register `Eingangsrechnungen`
+  - Document Type `Rechnung`
+  - Standard-Metadatenfelder für Rechnungen
+  - Rollen/Zuweisungsziele `Rechnungsprüfung`, `Rechnungsfreigabe`, `Buchhaltung`
+  - Workflow-Vorlage `Eingangsrechnung` mit 6 Schritten und 7 Transitionen
+- Admin-UI hat im Hero einen Button `Eingangsrechnungs-MVP einrichten`.
+- Seed wurde auf lokaler DB ausgeführt; Workflow Designer zeigt `Eingangsrechnung`.
+- Verifiziert:
+  - `py_compile archiva/ui.py` grün
+  - Health/Admin/Workflow Designer HTTP 200
+  - Seed idempotent: zweiter Lauf erzeugt 0 neue Elemente
+  - DB-Counts: 11 Felder, 6 Schritte, 7 Transitionen, 3 Rollen
+  - App-Smoke: synthetische Rechnung konnte Workflow `Eingangsrechnung` starten; Workflow-Hero/-Maske und Start-History funktionieren; Testdokument bereinigt.
