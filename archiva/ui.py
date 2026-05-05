@@ -87,6 +87,24 @@ def _restore_soft_deleted_object(item: Any) -> None:
     item.deleted_by_label = None
 
 
+def _document_archive_focus_url(document: Document) -> str:
+    if document.document_type and document.document_type.register_id:
+        return f"/ui/app?node_kind=register&node_id={document.document_type.register_id}"
+    if document.cabinet_id:
+        return f"/ui/app?node_kind=cabinet&node_id={document.cabinet_id}"
+    if document.document_type_id:
+        return f"/ui/app?node_kind=document_type&node_id={document.document_type_id}"
+    return "/ui/app"
+
+
+def _safe_app_return_url(return_to: str, fallback: str = "/ui/app") -> str:
+    if not return_to.startswith("/ui/app"):
+        return fallback
+    if "/documents/" in return_to or "node_kind=document" in return_to:
+        return fallback
+    return return_to
+
+
 def _admin_identity_redirect(*, identity_tab: str = "users", selected_user_id: str | None = None, selected_role_id: str | None = None, message: str | None = None) -> RedirectResponse:
     parts = [f"identity_tab={quote_plus(identity_tab)}"]
     if selected_user_id:
@@ -1213,7 +1231,7 @@ async def ui_app_document_soft_delete(
     title = document.title or document.name
     db.add(document)
     db.commit()
-    target = return_to if return_to.startswith("/ui/app") and "/documents/" not in return_to else "/ui/app"
+    target = _safe_app_return_url(return_to, fallback=_document_archive_focus_url(document))
     separator = "&" if "?" in target else "?"
     return _ui_redirect_with_message(f"{target}{separator}message={quote_plus(f'Dokument {title} in den Papierkorb verschoben')}")
 
@@ -1228,7 +1246,7 @@ async def ui_app_document_delete_confirm(
     document = _active_documents_query(db).where(Document.id == document_id).first()
     if not document:
         return HTMLResponse(content="<h1>Dokument nicht gefunden</h1>", status_code=404)
-    safe_return_to = return_to if return_to.startswith("/ui/app") and "/documents/" not in return_to else "/ui/app"
+    safe_return_to = _safe_app_return_url(return_to, fallback=_document_archive_focus_url(document))
     return HTMLResponse(content=f"""<!doctype html>
 <html lang='de'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>Dokument löschen</title><style>:root{{color-scheme:dark;--bg:#0b1020;--panel:#121933;--text:#eef2ff;--muted:#a8b2d1;--accent:#4dd4ff}}body{{margin:0;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:var(--bg);color:var(--text)}}.page{{max-width:760px;margin:0 auto;padding:24px}}.panel{{background:var(--panel);border:1px solid rgba(77,212,255,.16);border-radius:18px;padding:20px}}.muted{{color:var(--muted)}}.actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}}button,a{{border-radius:999px;padding:10px 14px;font:inherit;text-decoration:none;border:1px solid rgba(77,212,255,.18);color:var(--text);background:rgba(255,255,255,.04);cursor:pointer}}.danger{{background:rgba(255,123,123,.16);border-color:rgba(255,123,123,.34);color:#ffd0d0}}</style></head>
@@ -1306,7 +1324,7 @@ async def ui_app_cabinet_soft_delete(
     cabinet.deleted_by_label = deleted_by_label
     db.add(cabinet)
     db.commit()
-    target = return_to if return_to.startswith("/ui/app") and "/cabinets/" not in return_to else "/ui/app"
+    target = _safe_app_return_url(return_to)
     separator = "&" if "?" in target else "?"
     return _ui_redirect_with_message(f"{target}{separator}message={quote_plus(f'Cabinet {cabinet.name} in den Papierkorb verschoben')}")
 
@@ -1344,7 +1362,7 @@ async def ui_app_register_soft_delete(
     register.deleted_by_label = deleted_by_label
     db.add(register)
     db.commit()
-    target = return_to if return_to.startswith("/ui/app") and "/registers/" not in return_to else "/ui/app"
+    target = _safe_app_return_url(return_to)
     separator = "&" if "?" in target else "?"
     return _ui_redirect_with_message(f"{target}{separator}message={quote_plus(f'Register {register.name} in den Papierkorb verschoben')}")
 
@@ -5750,6 +5768,7 @@ def _render_document_object_card(document: Document, href: str) -> str:
     doc_type_value = str(getattr(document.doc_type, "value", document.doc_type)).lower()
     type_icon = "🧾" if doc_type_value == "pdf" else ("🖼️" if doc_type_value == "image" else ("📝" if doc_type_value == "text" else "📄"))
     safe_href = _escape(href)
+    safe_delete_return_to = _escape(_document_archive_focus_url(document))
     safe_title = _escape(document.title or document.name)
     safe_name = _escape(document.name)
     safe_document_id = _escape(str(document.id))
@@ -5763,7 +5782,7 @@ def _render_document_object_card(document: Document, href: str) -> str:
         f'<summary class="document-action-menu-button" data-document-id="{safe_document_id}" data-document-title="{safe_title}" aria-label="Aktionen für {safe_title}">Aktionen ⋯</summary>'
         f'<div class="context-menu document-action-menu" aria-hidden="true">'
         f'<form method="post" action="/ui/app/documents/{safe_document_id}/delete" data-document-delete-form>'
-        f'<input type="hidden" name="return_to" value="{safe_href}">'
+        f'<input type="hidden" name="return_to" value="{safe_delete_return_to}">'
         f'<button type="submit" class="danger-action" data-document-action="delete" data-document-id="{safe_document_id}">Löschen</button>'
         f'</form>'
         f'<a href="{safe_href}">Öffnen</a>'
