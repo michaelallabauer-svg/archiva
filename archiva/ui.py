@@ -791,6 +791,19 @@ def _available_document_types_for_node(selected_node: dict[str, Any] | None, cab
                         unique_by_id[str(doc_type.id)] = doc_type
                     return list(unique_by_id.values())
         return []
+    if node_kind == "cabinet_type":
+        for cabinet in cabinets:
+            if not cabinet.cabinet_type or str(cabinet.cabinet_type.id) != str(node_id):
+                continue
+            candidates: list[DocumentType] = []
+            candidates.extend(cabinet.cabinet_type.document_type_definitions or [])
+            for typed_cabinet in [item for item in cabinets if item.cabinet_type and str(item.cabinet_type.id) == str(node_id)]:
+                candidates.extend(typed_cabinet.document_types or [])
+            unique_by_id: dict[str, DocumentType] = {}
+            for doc_type in candidates:
+                unique_by_id[str(doc_type.id)] = doc_type
+            return sorted(unique_by_id.values(), key=lambda item: (item.order, item.name or ""))
+        return []
     if node_kind == "cabinet":
         for cabinet in cabinets:
             if str(cabinet.id) != str(node_id):
@@ -1015,9 +1028,34 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
 
     document_type = (
         db.query(DocumentType)
+        .where(DocumentType.cabinet_type_id == cabinet_type.id, DocumentType.name == "Rechnung")
+        .first()
+    )
+    legacy_cabinet_document_type = (
+        db.query(DocumentType)
         .where(DocumentType.cabinet_id == cabinet.id, DocumentType.name == "Rechnung")
         .first()
     )
+    if document_type and legacy_cabinet_document_type and legacy_cabinet_document_type.id != document_type.id:
+        for document in db.query(Document).where(Document.document_type_id == legacy_cabinet_document_type.id).all():
+            document.document_type_id = document_type.id
+            if document.cabinet_id is None:
+                document.cabinet_id = cabinet.id
+        existing_field_names = {field.name for field in document_type.fields}
+        for field in list(legacy_cabinet_document_type.fields):
+            if field.name in existing_field_names:
+                continue
+            field.document_type_id = document_type.id
+            existing_field_names.add(field.name)
+        db.flush()
+        legacy_document_count = db.query(Document).where(Document.document_type_id == legacy_cabinet_document_type.id).count()
+        legacy_field_count = db.query(MetadataField).where(MetadataField.document_type_id == legacy_cabinet_document_type.id).count()
+        if legacy_document_count == 0 and legacy_field_count == 0:
+            db.delete(legacy_cabinet_document_type)
+            db.flush()
+            created.append("Legacy-Cabinet-Dokumenttyp entfernt")
+    if not document_type:
+        document_type = legacy_cabinet_document_type
     if not document_type and legacy_register:
         document_type = (
             db.query(DocumentType)
@@ -1025,14 +1063,14 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
             .first()
         )
     if not document_type:
-        document_type = DocumentType(cabinet_id=cabinet.id, name="Rechnung", description="Eingangsrechnung mit MVP-Metadaten", icon="🧾", order=10)
+        document_type = DocumentType(cabinet_type_id=cabinet_type.id, name="Rechnung", description="Eingangsrechnung mit MVP-Metadaten", icon="🧾", order=10)
         db.add(document_type)
         db.flush()
         created.append("Document Type")
-    document_type.cabinet_id = cabinet.id
+    document_type.cabinet_id = None
     document_type.register_id = None
     document_type.register_type_id = None
-    document_type.cabinet_type_id = None
+    document_type.cabinet_type_id = cabinet_type.id
 
     if legacy_register:
         for document in db.query(Document).where(Document.document_type_id == document_type.id).all():
@@ -1048,7 +1086,10 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
             db.delete(legacy_register_type)
             created.append("Legacy-Registertyp entfernt")
 
-    existing_field_names = {field.name for field in document_type.fields}
+    db.flush()
+    existing_field_names = {
+        name for (name,) in db.query(MetadataField.name).where(MetadataField.document_type_id == document_type.id).all()
+    }
     for field in _invoice_default_fields(document_type.id):
         if field.name not in existing_field_names:
             db.add(field)
@@ -6232,6 +6273,16 @@ def _render_archive_tree(
         type_menu = _creation_actions_for_node(node_kind="cabinet_type", node_id=type_id, node_label=type_name)
         chunks.append(node_link("cabinet_type", type_id, f"🗄️ {type_name}", 0, type_menu))
 
+        type_level_doc_types: dict[str, DocumentType] = {}
+        for doc_type in sorted(cabinet_type.document_type_definitions, key=lambda item: (item.order, (item.name or '').lower())):
+            type_level_doc_types[(doc_type.name or str(doc_type.id)).strip().lower()] = doc_type
+        for cabinet in typed_cabinets:
+            for doc_type in sorted(cabinet.document_types, key=lambda item: (item.order, (item.name or '').lower())):
+                type_level_doc_types.setdefault((doc_type.name or str(doc_type.id)).strip().lower(), doc_type)
+        for doc_type in sorted(type_level_doc_types.values(), key=lambda item: (item.order, (item.name or '').lower())):
+            dt_menu = _creation_actions_for_node(node_kind="document_type", node_id=str(doc_type.id), node_label=doc_type.name, document_type=doc_type)
+            chunks.append(node_link("document_type", str(doc_type.id), f"📄 {doc_type.name}", 1, dt_menu))
+
         for cabinet in typed_cabinets:
             cabinet_menu = _creation_actions_for_node(node_kind="cabinet", node_id=str(cabinet.id), node_label=cabinet.name, cabinet=cabinet)
             chunks.append(node_link("cabinet", str(cabinet.id), f"🗂️ {cabinet.name}", 1, cabinet_menu))
@@ -6241,9 +6292,6 @@ def _render_archive_tree(
                 for doc_type in sorted(register.document_types, key=lambda item: item.order):
                     dt_menu = _creation_actions_for_node(node_kind="document_type", node_id=str(doc_type.id), node_label=doc_type.name, document_type=doc_type)
                     chunks.append(node_link("document_type", str(doc_type.id), f"📄 {doc_type.name}", 3, dt_menu))
-            for doc_type in sorted(cabinet.document_types, key=lambda item: item.order):
-                dt_menu = _creation_actions_for_node(node_kind="document_type", node_id=str(doc_type.id), node_label=doc_type.name, document_type=doc_type)
-                chunks.append(node_link("document_type", str(doc_type.id), f"📄 {doc_type.name}", 2, dt_menu))
 
     remaining_type_ids = set(grouped.keys()) - {str(item.id) for item in (cabinet_types or [])}
     for type_id in sorted(remaining_type_ids):
@@ -6365,7 +6413,7 @@ def _render_document_type_index_search(
     active_filter_count = sum(1 for values in index_search_filters.values() if values)
     reset_url = f"/ui/app?node_kind=document_type&node_id={document_type.id}"
     return f"""
-      <div class="panel index-search-panel" id="index-search">
+      <div class="panel compact-indexdata index-search-panel" id="index-search">
         <div class="section-head">
           <div>
             <div class="eyebrow">Indexdaten-Suche</div>
@@ -6378,7 +6426,7 @@ def _render_document_type_index_search(
           <input type="hidden" name="node_kind" value="document_type">
           <input type="hidden" name="node_id" value="{_escape(str(document_type.id))}">
           <input type="hidden" name="q" value="{_escape(search_query)}">
-          <div class="field-grid metadata-display-grid">{field_inputs}</div>
+          <div class="field-grid">{field_inputs}</div>
           <div class="actions">
             <button class="primary" type="submit">Suchen</button>
             <a class="chip" href="{_escape(reset_url)}">Filter löschen</a>
