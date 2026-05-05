@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from archiva.database import get_db
 from archiva.config import load_settings
 from archiva.metadata_validation import metadata_from_json, validate_document_metadata, MetadataValidationError
-from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowHistoryEvent, WorkflowInstance, WorkflowStepDefinition, WorkflowTransitionDefinition
+from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowHistoryEvent, WorkflowInstance, WorkflowStepDefinition, WorkflowTask, WorkflowTransitionDefinition
 from archiva.preview_queue import enqueue_preview_job, get_latest_preview_artifact, get_latest_preview_job
 from archiva.indexer.dispatcher import enqueue_document_index
 from archiva.indexer.status import indexing_runtime_status
@@ -1383,6 +1383,7 @@ async def ui_app_home(
         document_type_for_search = next((doc_type for doc_type in document_types if str(doc_type.id) == str(selected_node.get("id"))), None)
         all_documents = _filter_documents_by_index_search(all_documents, document_type_for_search, index_search_filters)
     recent_documents = all_documents[:10]
+    active_workflow_count = db.query(WorkflowInstance).where(WorkflowInstance.status == "active").count()
     form_values = _parse_json_dict(form_data)
     return HTMLResponse(
         content=_render_app_page(
@@ -1402,8 +1403,29 @@ async def ui_app_home(
             cabinet_types,
             db,
             workflow_panel == "1",
+            active_workflow_count,
         )
     )
+
+
+@router.get("/app/workflows/inbox", response_class=HTMLResponse)
+async def ui_app_workflow_inbox(
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    tasks = (
+        db.query(WorkflowTask)
+        .join(WorkflowInstance, WorkflowTask.workflow_instance_id == WorkflowInstance.id)
+        .where(WorkflowTask.status == "open", WorkflowInstance.status == "active")
+        .order_by(WorkflowTask.due_at.asc().nullslast(), WorkflowTask.created_at.desc())
+        .all()
+    )
+    active_count = db.query(WorkflowInstance).where(WorkflowInstance.status == "active").count()
+    document_ids = [task.workflow_instance.subject_id for task in tasks if task.workflow_instance and task.workflow_instance.subject_kind == "document"]
+    documents_by_id = {
+        str(document.id): document
+        for document in db.query(Document).where(Document.id.in_(document_ids), Document.deleted_at.is_(None)).all()
+    } if document_ids else {}
+    return HTMLResponse(content=_render_workflow_inbox_page(tasks, active_count, documents_by_id))
 
 
 def _workflow_app_redirect(document_id: UUID, message: str | None = None) -> RedirectResponse:
@@ -3898,6 +3920,10 @@ def _workflow_instance_label(instance: WorkflowInstance) -> str:
     return f"{workflow_name} · {step_name}"
 
 
+def _active_workflow_count_label(count: int) -> str:
+    return "1 aktiver Workflow" if count == 1 else f"{count} aktive Workflows"
+
+
 def _render_workflow_hero(document: Document, active_instances: list[WorkflowInstance]) -> str:
     if not active_instances:
         return ""
@@ -4015,6 +4041,55 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
     """
 
 
+def _render_workflow_inbox_page(tasks: list[WorkflowTask], active_count: int, documents_by_id: dict[str, Document]) -> str:
+    active_count_label = _active_workflow_count_label(active_count)
+    rows: list[str] = []
+    for task in tasks:
+        instance = task.workflow_instance
+        document = documents_by_id.get(str(instance.subject_id)) if instance and instance.subject_kind == "document" else None
+        workflow_name = instance.workflow_definition.name if instance and instance.workflow_definition else (instance.title if instance else "Workflow")
+        step_name = task.step.name if task.step else (instance.current_step.name if instance and instance.current_step else "—")
+        assignment_label = task.assignment_target.label if task.assignment_target and task.assignment_target.label else _workflow_assignment_label(task.step)
+        due_label = str(task.due_at) if task.due_at else "Keine Frist"
+        subject_href = f"/ui/app?node_kind=document&node_id={instance.subject_id}&workflow_panel=1#workflow-panel" if instance and instance.subject_kind == "document" else "/ui/app"
+        subject_label = (document.title or document.name) if document else (f"Dokument {str(instance.subject_id)[:8]}" if instance else "Objekt")
+        rows.append(
+            f"""
+            <a class="inbox-card" href="{_escape(subject_href)}">
+              <div class="inbox-card-main">
+                <div class="eyebrow">{_escape(workflow_name)}</div>
+                <h3>{_escape(step_name)}</h3>
+                <p class="muted">{_escape(subject_label)} · Zuständig: {_escape(assignment_label)}</p>
+              </div>
+              <div class="inbox-card-side">
+                <span class="service-badge">offen</span>
+                <span class="muted">{_escape(due_label)}</span>
+              </div>
+            </a>
+            """
+        )
+    rows_html = "".join(rows) or "<div class='panel'><p class='muted'>Keine offenen Workflow-Aufgaben. Sehr angenehm.</p></div>"
+    return f"""<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archiva Workflow Inbox</title><link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+<style>
+:root {{ color-scheme:dark; --bg:#0b1020; --panel:#121933; --text:#eef2ff; --muted:#a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; }}
+body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, sans-serif; background:radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), var(--bg); color:var(--text); }}
+.page {{ max-width:1180px; margin:0 auto; padding:18px; }}
+.panel, .inbox-card {{ background:linear-gradient(180deg, rgba(18,25,51,.96), rgba(15,22,48,.96)); border:1px solid rgba(77,212,255,.10); border-radius:18px; padding:16px; box-shadow:0 18px 48px rgba(0,0,0,.28); }}
+a {{ color:var(--accent-2); text-decoration:none; }} .muted {{ color:var(--muted); }} .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.76rem; color:var(--accent-2); font-weight:700; }}
+.hero {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; margin-bottom:14px; }}
+.pillbar {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }} .pill, .service-badge {{ display:inline-flex; border-radius:999px; padding:7px 11px; background:rgba(77,212,255,.10); border:1px solid rgba(77,212,255,.18); color:var(--text); }}
+.inbox-list {{ display:grid; gap:10px; }} .inbox-card {{ display:flex; justify-content:space-between; gap:14px; align-items:center; color:var(--text); }}
+.inbox-card:hover {{ border-color:rgba(77,212,255,.42); box-shadow:0 0 0 4px rgba(77,212,255,.10), 0 18px 48px rgba(0,0,0,.28); }}
+.inbox-card h3 {{ margin:4px 0 6px; }} .inbox-card p {{ margin:0; }} .inbox-card-side {{ display:grid; gap:8px; justify-items:end; min-width:130px; }}
+@media (max-width:760px) {{ .page {{ padding:10px; }} .hero, .inbox-card {{ display:grid; }} .inbox-card-side {{ justify-items:start; }} }}
+</style></head><body><div class="page">
+<div class="panel hero"><div><div class="eyebrow">Workflow Inbox</div><h1 style="margin:4px 0 0;">Offene Workflow-Aufgaben</h1><p class="muted">Arbeitsliste für aktive Workflow-Schritte in Archiva.</p><div class="pillbar"><a class="pill" href="/ui/app">Zur App</a><span class="pill">{_escape(active_count_label)}</span><span class="pill">{len(tasks)} offene Aufgaben</span></div></div></div>
+<div class="inbox-list">{rows_html}</div>
+</div></body></html>"""
+
+
 def _render_app_page(
     cabinets: list[Cabinet],
     document_types: list[DocumentType],
@@ -4032,7 +4107,9 @@ def _render_app_page(
     cabinet_types: list[CabinetType] | None = None,
     db: Session | None = None,
     workflow_panel_open: bool = False,
+    active_workflow_count: int = 0,
 ) -> str:
+    active_workflow_count_label = _active_workflow_count_label(active_workflow_count)
     recent_documents_html = _render_recent_documents(recent_documents)
     indexing_status = indexing_runtime_status()
     indexing_tools = indexing_status.get("ocr", {})
@@ -4408,6 +4485,9 @@ def _render_app_page(
     .workflow-history-list {{ margin:8px 0 0; padding-left:18px; color:var(--text); }}
     .workflow-history-list li {{ margin:8px 0; }}
     .context-note {{ margin-top:10px; padding:10px 12px; border-radius:14px; background:rgba(255,255,255,0.03); border:1px solid rgba(77,212,255,0.10); color:var(--muted); font-size:.92rem; }}
+    .workflow-inbox-hero-link {{ display:inline-flex; align-items:center; gap:10px; margin-top:14px; padding:10px 13px; border-radius:16px; border:1px solid rgba(110,231,183,0.22); background:rgba(110,231,183,0.08); color:var(--text); position:relative; z-index:1; }}
+    .workflow-inbox-hero-link:hover {{ text-decoration:none; border-color:rgba(110,231,183,0.48); box-shadow:0 0 0 4px rgba(110,231,183,0.10); }}
+    .workflow-count-badge {{ display:inline-grid; place-items:center; min-width:28px; height:28px; padding:0 8px; border-radius:999px; background:rgba(110,231,183,0.20); color:#d6fff0; font-weight:800; }}
     .service-card::before {{ content:""; position:absolute; inset:0; background: linear-gradient(135deg, rgba(79,140,255,0.10), rgba(77,212,255,0.03) 55%, transparent 80%); pointer-events:none; }}
     .service-header {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; position:relative; z-index:1; }}
     .service-badge {{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:rgba(110,231,183,0.10); border:1px solid rgba(110,231,183,0.18); color:#d6fff0; font-size:.85rem; }}
@@ -4486,6 +4566,10 @@ def _render_app_page(
             <button class="primary" type="submit">Suchen</button>
           </div>
         </form>
+        <a class="workflow-inbox-hero-link" href="/ui/app/workflows/inbox">
+          <span class="workflow-count-badge">{active_workflow_count}</span>
+          <span><strong>Workflow Inbox</strong><br><span class="muted">{_escape(active_workflow_count_label)} momentan</span></span>
+        </a>
       </div>
       <div style="height:100%;">
         {context_panel_html}
