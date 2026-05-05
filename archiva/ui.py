@@ -5484,18 +5484,18 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }}
     button {{ border:none; border-radius:999px; padding:10px 14px; font:inherit; cursor:pointer; }}
     .primary {{ background: linear-gradient(135deg, #4f8cff, #4dd4ff); color: white; box-shadow: 0 8px 24px rgba(77,212,255,0.22); }}
-    .workflow-graph-lane {{ display:grid; gap:8px; overflow:visible; padding-bottom:0; max-width:100%; }}
-    .workflow-graph-track {{ overflow:visible; min-width:0; }}
-    .workflow-graph-sequence {{ display:grid; grid-template-columns:1fr; gap:0; min-width:0; padding:4px 0; }}
+    .workflow-graph-lane {{ display:grid; justify-items:center; gap:8px; overflow:visible; padding-bottom:0; max-width:100%; }}
+    .workflow-graph-track {{ overflow:visible; min-width:0; width:100%; display:grid; justify-items:center; }}
+    .workflow-graph-sequence {{ display:grid; grid-template-columns:minmax(220px, 360px); justify-content:center; gap:0; min-width:0; width:100%; padding:4px 0; }}
     .workflow-graph-form {{ display:block; max-width:100%; overflow:hidden; }}
-    .workflow-graph-node {{ width:auto; min-width:0; max-width:none; padding:10px 12px; border-radius:14px; border:1px solid rgba(77,212,255,0.16); background:rgba(255,255,255,0.04); color:#eef2ff; position:relative; box-shadow: 0 10px 24px rgba(0,0,0,0.14); cursor:grab; }}
+    .workflow-graph-node {{ width:100%; min-width:0; max-width:360px; padding:10px 12px; border-radius:14px; border:1px solid rgba(77,212,255,0.16); background:rgba(255,255,255,0.04); color:#eef2ff; position:relative; box-shadow: 0 10px 24px rgba(0,0,0,0.14); cursor:grab; box-sizing:border-box; }}
     .workflow-graph-node.is-selected {{ border-color:#4dd4ff; box-shadow: 0 0 0 1px rgba(77,212,255,0.55), 0 12px 28px rgba(77,212,255,0.12); }}
     .workflow-graph-order {{ display:inline-flex; padding:3px 8px; border-radius:999px; background:rgba(77,212,255,0.12); color:#4dd4ff; font-size:.78rem; margin:0 8px 0 0; }}
     .workflow-graph-key {{ margin-top:6px; color:#a8b2d1; font-size:.78rem; word-break:break-word; }}
     .workflow-mini-flag {{ margin-top:6px; display:inline-flex; padding:3px 8px; border-radius:999px; background:rgba(255,255,255,0.06); border:1px solid rgba(77,212,255,0.10); color:#eef2ff; font-size:.72rem; }}
-    .workflow-graph-connector {{ width:2px; height:18px; background:linear-gradient(180deg, rgba(77,212,255,0.30), rgba(77,212,255,0.85)); margin:3px 0 3px 18px; border-radius:999px; }}
-    .workflow-graph-start, .workflow-graph-end {{ justify-self:start; padding:7px 11px; border-radius:999px; border:1px solid rgba(77,212,255,0.18); background:rgba(255,255,255,0.03); color:#eef2ff; white-space:nowrap; font-size:.86rem; }}
-    .workflow-graph-arrow {{ color:#4dd4ff; font-size:1rem; transform:rotate(90deg); justify-self:start; margin-left:17px; }}
+    .workflow-graph-connector {{ justify-self:center; width:2px; height:18px; background:linear-gradient(180deg, rgba(77,212,255,0.30), rgba(77,212,255,0.85)); margin:3px 0; border-radius:999px; }}
+    .workflow-graph-start, .workflow-graph-end {{ justify-self:center; padding:7px 11px; border-radius:999px; border:1px solid rgba(77,212,255,0.18); background:rgba(255,255,255,0.03); color:#eef2ff; white-space:nowrap; font-size:.86rem; }}
+    .workflow-graph-arrow {{ color:#4dd4ff; font-size:1rem; transform:rotate(90deg); justify-self:center; }}
     .workflow-graph-empty {{ padding:8px 0; }}
     .workflow-step-summary {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
     .workflow-transition-hint {{ margin-top:10px; font-size:.88rem; color:#a8b2d1; }}
