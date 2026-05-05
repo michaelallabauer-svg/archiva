@@ -4385,6 +4385,7 @@ def _render_app_page(
     .page {{ max-width: 1760px; margin: 0 auto; padding: 14px 16px; }}
     .hero {{ display:grid; grid-template-columns: minmax(0, 4fr) minmax(260px, 1fr); gap:12px; align-items:stretch; margin-bottom:12px; }}
     .hero-card, .hero-status {{ position:relative; overflow:hidden; }}
+    .hero-card {{ padding-right:270px; }}
     .hero-card::before, .hero-status::before {{ content:""; position:absolute; inset:0; background: linear-gradient(135deg, rgba(79,140,255,0.14), rgba(77,212,255,0.06) 45%, transparent 75%); pointer-events:none; }}
     .hero-brand {{ display:flex; gap:12px; align-items:center; margin-bottom:10px; position:relative; z-index:1; }}
     .brand-mark {{ width:48px; height:48px; border-radius:16px; display:grid; place-items:center; background: linear-gradient(135deg, rgba(79,140,255,0.28), rgba(77,212,255,0.18)); border:1px solid rgba(77,212,255,0.28); box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset; }}
@@ -4485,7 +4486,7 @@ def _render_app_page(
     .workflow-history-list {{ margin:8px 0 0; padding-left:18px; color:var(--text); }}
     .workflow-history-list li {{ margin:8px 0; }}
     .context-note {{ margin-top:10px; padding:10px 12px; border-radius:14px; background:rgba(255,255,255,0.03); border:1px solid rgba(77,212,255,0.10); color:var(--muted); font-size:.92rem; }}
-    .workflow-inbox-hero-link {{ display:inline-flex; align-items:center; gap:10px; margin-top:14px; padding:10px 13px; border-radius:16px; border:1px solid rgba(110,231,183,0.22); background:rgba(110,231,183,0.08); color:var(--text); position:relative; z-index:1; }}
+    .workflow-inbox-hero-link {{ display:inline-flex; align-items:center; gap:10px; position:absolute; top:16px; right:16px; padding:10px 13px; border-radius:16px; border:1px solid rgba(110,231,183,0.22); background:rgba(110,231,183,0.08); color:var(--text); z-index:1; }}
     .workflow-inbox-hero-link:hover {{ text-decoration:none; border-color:rgba(110,231,183,0.48); box-shadow:0 0 0 4px rgba(110,231,183,0.10); }}
     .workflow-count-badge {{ display:inline-grid; place-items:center; min-width:28px; height:28px; padding:0 8px; border-radius:999px; background:rgba(110,231,183,0.20); color:#d6fff0; font-weight:800; }}
     .service-card::before {{ content:""; position:absolute; inset:0; background: linear-gradient(135deg, rgba(79,140,255,0.10), rgba(77,212,255,0.03) 55%, transparent 80%); pointer-events:none; }}
@@ -4541,6 +4542,7 @@ def _render_app_page(
     .compact-checkbox-group {{ padding:10px; gap:6px; }}
     .compact-checkbox-group .checkbox-item {{ padding:6px 8px; }}
     @media (max-width: 1200px) {{ .main-grid, .hero, .workspace-grid {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 820px) {{ .hero-card {{ padding-right:18px; }} .workflow-inbox-hero-link {{ position:relative; top:auto; right:auto; margin-top:14px; }} }}
   </style>
 </head>
 <body>
