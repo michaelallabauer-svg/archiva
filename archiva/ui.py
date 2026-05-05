@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import hmac
 import os
 import re
-import secrets
 import time
 from html import escape
 from datetime import datetime
@@ -19,6 +17,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from pydantic import BaseModel
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from urllib.parse import quote_plus
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -39,6 +39,7 @@ router = APIRouter(tags=["ui"])
 
 SESSION_COOKIE_NAME = "archiva_session"
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 12
+PASSWORD_HASHER = PasswordHasher()
 
 
 def _auth_secret() -> str:
@@ -46,14 +47,12 @@ def _auth_secret() -> str:
 
 
 def _hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 210_000).hex()
-    return f"pbkdf2_sha256${salt}${digest}"
+    return PASSWORD_HASHER.hash(password)
 
 
-def _verify_password(password: str, password_hash: str | None) -> bool:
-    if not password_hash:
-        return False
+def _verify_legacy_pbkdf2_password(password: str, password_hash: str) -> bool:
+    import hashlib
+
     try:
         algorithm, salt, expected = password_hash.split("$", 2)
     except ValueError:
@@ -62,6 +61,17 @@ def _verify_password(password: str, password_hash: str | None) -> bool:
         return False
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 210_000).hex()
     return hmac.compare_digest(digest, expected)
+
+
+def _verify_password(password: str, password_hash: str | None) -> bool:
+    if not password_hash:
+        return False
+    if password_hash.startswith("pbkdf2_sha256$"):
+        return _verify_legacy_pbkdf2_password(password, password_hash)
+    try:
+        return PASSWORD_HASHER.verify(password_hash, password)
+    except (InvalidHashError, VerificationError, VerifyMismatchError):
+        return False
 
 
 def _sign_session_payload(user_id: str, expires_at: int) -> str:

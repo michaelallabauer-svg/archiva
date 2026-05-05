@@ -315,7 +315,8 @@
   - `/ui/admin/identity` verwaltet Benutzer, Rollen und Teams.
   - Benutzeranlage hat Feld **Initiales Passwort**.
   - Benutzerbearbeitung hat Feld **Neues Passwort**; leer lassen bedeutet unverändert.
-  - Passwörter werden mit PBKDF2-SHA256 gehasht.
+  - Passwörter werden mit Argon2 via `argon2-cffi` gehasht.
+  - Legacy PBKDF2-SHA256-Hashes bleiben für bestehende lokale User verifizierbar, neue/geänderte Passwörter werden als Argon2 gespeichert.
   - Lokaler Bootstrap: Solange kein User einen Passwort-Hash hat, kann ein bestehender aktiver User mit leerem Passwort einloggen.
 - Actor-Verdrahtung:
   - Workflow-/Delete-Aktionen nutzen den eingeloggten User als Actor/Label.

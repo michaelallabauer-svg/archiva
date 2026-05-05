@@ -197,9 +197,16 @@ The server-rendered UI under `/ui/*` is protected by a login guard.
 - Logout: available as **Abmelden** in App/Admin/Workflow Designer
 - Identity admin: `http://localhost:8000/ui/admin/identity`
 
-Users are managed in **Admin → Identity & Rollen**. When creating a user you can set an **Initiales Passwort**; when editing a user you can set **Neues Passwort**. Passwords are stored as PBKDF2 hashes.
+Users are managed in **Admin → Identity & Rollen**. When creating a user you can set an **Initiales Passwort**; when editing a user you can set **Neues Passwort**. Passwords are stored as Argon2 hashes via `argon2-cffi`.
 
 Local bootstrap rule: if no user has a password hash yet, an existing active user can log in with an empty password. As soon as a password is set, normal password verification is required. For non-local deployments set `ARCHIVA_SESSION_SECRET` so signed session cookies do not use the development fallback secret.
+
+Auth-related dependencies:
+
+- `argon2-cffi` — password hashing and verification using Argon2.
+- Python stdlib `hmac`/`hashlib` — signed session cookie verification and legacy PBKDF2 hash compatibility.
+
+Legacy note: older local PBKDF2 password hashes are still accepted for verification, but new/changed passwords are written as Argon2 hashes.
 
 ## Workflow Runtime and Inbox
 

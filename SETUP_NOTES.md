@@ -49,3 +49,18 @@ open http://localhost:8000/ui/workflow-designer
 5. Ab dann ist Login nur noch mit Passwort möglich.
 
 Die UI-Session läuft über ein signiertes Cookie (`archiva_session`). Für lokale Entwicklung nutzt Archiva einen Dev-Secret-Fallback. Für ernsthafte Umgebungen sollte `ARCHIVA_SESSION_SECRET` gesetzt werden.
+
+Passwörter werden mit Argon2 über die Python-Abhängigkeit `argon2-cffi` gehasht. Nach einem frischen Clone/Update deshalb sicherstellen:
+
+```bash
+cd /Users/michaelallabauer/.openclaw/workspace/archiva
+uv sync --dev
+```
+
+oder bei klassischem venv:
+
+```bash
+./.venv/bin/python -m pip install -e ".[dev]"
+```
+
+Ältere lokale PBKDF2-Hashes bleiben lesbar, neue/geänderte Passwörter werden als Argon2-Hash gespeichert.

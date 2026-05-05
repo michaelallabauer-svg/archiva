@@ -240,7 +240,7 @@ Passwörter werden in der Benutzerverwaltung gesetzt:
 4. Feld **Neues Passwort** ausfüllen
 5. **Benutzer aktualisieren** klicken
 
-Beim Anlegen eines Benutzers kann direkt ein **Initiales Passwort** vergeben werden.
+Beim Anlegen eines Benutzers kann direkt ein **Initiales Passwort** vergeben werden. Neue oder geänderte Passwörter werden als Argon2-Hash gespeichert.
 
 ### 11.4 Bootstrap-Regel für lokale Entwicklung
 
@@ -289,6 +289,10 @@ Route:
 Die Inbox listet offene Workflow-Aufgaben und führt per Klick zurück zum Dokument mit geöffnetem Workflow-Panel.
 
 ---
+
+### 11.6 Technische Abhängigkeit
+
+Für Passwort-Hashing nutzt Archiva `argon2-cffi`. Ältere lokale PBKDF2-Hashes werden beim Login weiterhin akzeptiert, neue Passwörter werden aber mit Argon2 geschrieben.
 
 ## 13. Änderungslog Ergänzung 2026-05-05
 
