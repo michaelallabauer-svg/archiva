@@ -5363,16 +5363,16 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
   <style>
     :root {{ color-scheme: dark; }}
     body {{ font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), #0b1020; color: #eef2ff; margin: 0; }}
-    .page {{ max-width: 1280px; margin: 0 auto; padding: 28px; }}
-    .panel {{ background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border: 1px solid rgba(77,212,255,0.10); border-radius: 20px; padding: 22px; margin-bottom: 20px; box-shadow: 0 18px 48px rgba(0,0,0,0.28); }}
+    .page {{ max-width: none; margin: 0; padding: 12px 14px 20px 8px; }}
+    .panel {{ background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border: 1px solid rgba(77,212,255,0.10); border-radius: 18px; padding: 16px; margin-bottom: 14px; box-shadow: 0 18px 48px rgba(0,0,0,0.28); }}
     a {{ color: #4dd4ff; text-decoration: none; }}
     .muted {{ color: #a8b2d1; line-height: 1.6; }}
     .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color:#4dd4ff; font-weight:700; }}
     .pillbar {{ display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }}
     .pill {{ background: rgba(255,255,255,0.04); border:1px solid rgba(77,212,255,0.12); border-radius:999px; padding:9px 14px; color:#eef2ff; }}
-    .grid {{ display:grid; grid-template-columns: 340px minmax(0, 1fr); gap:20px; align-items:start; }}
-    .stack {{ display:grid; gap:16px; }}
-    .workflow-card {{ display:block; padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); color:#eef2ff; }}
+    .grid {{ display:grid; grid-template-columns: 240px minmax(0, 1fr); gap:12px; align-items:start; }}
+    .stack {{ display:grid; gap:10px; }}
+    .workflow-card {{ display:block; padding:11px; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); color:#eef2ff; }}
     .workflow-card.is-selected {{ border-color:#4dd4ff; box-shadow: 0 0 0 1px rgba(77,212,255,0.45), 0 14px 32px rgba(77,212,255,0.14); }}
     .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
     .field {{ display:grid; gap:6px; }}
@@ -5401,6 +5401,7 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
     .workflow-insight-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:12px; }}
     .workflow-insight-card {{ padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.03); }}
     .workflow-insight-arrow {{ color:#4dd4ff; padding:0 8px; }}
+    @media (max-width: 980px) {{ .page {{ padding:10px; }} .grid, .field-grid {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
