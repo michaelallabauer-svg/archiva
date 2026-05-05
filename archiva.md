@@ -288,3 +288,17 @@
   - Seed idempotent: zweiter Lauf erzeugt 0 neue Elemente
   - DB-Counts: 11 Felder, 6 Schritte, 7 Transitionen, 3 Rollen
   - App-Smoke: synthetische Rechnung konnte Workflow `Eingangsrechnung` starten; Workflow-Hero/-Maske und Start-History funktionieren; Testdokument bereinigt.
+
+## Eingangsrechnungs-Seed korrigiert 2026-05-05 11:15
+- Neymo fragte zurecht, warum ein Registertyp `Eingangsrechnungen` angelegt wurde. Entscheidung: Für MVP kein Registertyp/Register `Eingangsrechnungen`; `Rechnung` hängt direkt am Jahres-Cabinet. Workflowstatus bleibt führend.
+- Seed `POST /ui/admin/setup/invoice-mvp` wurde korrigiert:
+  - erstellt künftig keinen Registertyp und kein Register `Eingangsrechnungen`
+  - migriert bestehende `Rechnung` vom Legacy-Register direkt ans Jahres-Cabinet
+  - löscht leeres Legacy-Register und leeren Legacy-Registertyp
+- Dokument-Kontextmenü ergänzt: `Eingangsrechnungs-WF starten` startet Workflow `Eingangsrechnung` direkt und öffnet die Workflow-Maske.
+- Verifiziert:
+  - `py_compile archiva/ui.py` grün
+  - Health/Admin HTTP 200
+  - Seed entfernt bestehendes Legacy-Register + Registertyp
+  - Kontextmenü-HTML enthält `Eingangsrechnungs-WF starten`
+  - POST `/ui/app/documents/{id}/workflows/start-invoice` startet Workflow und redirectet zu `workflow_panel=1`; Testdaten bereinigt.

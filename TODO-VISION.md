@@ -50,14 +50,10 @@ Minimalstruktur für den MVP:
 
 - Cabinet Type: `Eingangsrechnungsbuch`
 - Cabinets: Geschäftsjahre, z. B. `2025`, `2026`
-- Optional Register:
-  - `Neu`
-  - `In Prüfung`
-  - `Freigegeben`
-  - `Zurückgewiesen`
-  - `Gebucht`
+- Document Type: `Rechnung` direkt am Jahres-Cabinet
+- Kein Registertyp/Register `Eingangsrechnungen` im MVP
 
-Alternative: Status nicht als Register modellieren, sondern rein über Workflow-Status. Empfehlung für MVP: **Workflow-Status ist führend**, Register nur verwenden, wenn es für die Navigation wirklich hilft.
+Alternative: Status nicht als Register modellieren, sondern rein über Workflow-Status. Entscheidung für MVP: **Workflow-Status ist führend**; Register nur verwenden, wenn es für die Navigation wirklich hilft.
 
 ### 3.2 Dokumenttyp: Rechnung
 
@@ -224,12 +220,13 @@ Empfehlung: Für MVP direkt beim Upload bzw. nach erfolgreicher Metadatenvalidie
 - [x] Seed-/Setup-Funktion für Eingangsrechnungs-Struktur erstellen
   - [x] Cabinet Type `Eingangsrechnungsbuch`
   - [x] Cabinet pro Geschäftsjahr
-  - [x] Document Type `Rechnung`
+  - [x] Document Type `Rechnung` direkt am Jahres-Cabinet, ohne Registertyp/Register `Eingangsrechnungen`
   - [x] Standard-Metadatenfelder
 - [x] Workflow-Vorlage `Eingangsrechnung` definieren
   - [x] Schritte
   - [x] Transitionen
   - [x] Default-Zuweisungen/Rollen
+  - [x] Start aus Dokument-Kontextmenü
 - [ ] Dokumentdetail/App-Ansicht um Workflowstatus erweitern
   - [ ] Prominenter Workflow-Hero/Button, wenn ein Workflow auf dem Dokument aktiv ist
   - [ ] Klick öffnet Workflow-Maske im mittleren App-Bereich

@@ -940,16 +940,11 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
         db.flush()
         created.append("Cabinet Type")
 
-    register_type = (
+    legacy_register_type = (
         db.query(RegisterType)
         .where(RegisterType.cabinet_type_id == cabinet_type.id, RegisterType.name == "Eingangsrechnungen")
         .first()
     )
-    if not register_type:
-        register_type = RegisterType(cabinet_type_id=cabinet_type.id, name="Eingangsrechnungen", description="Rechnungen im Eingang", order=10)
-        db.add(register_type)
-        db.flush()
-        created.append("Register Type")
 
     cabinet = (
         db.query(Cabinet)
@@ -962,27 +957,46 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
         db.flush()
         created.append("Jahres-Cabinet")
 
-    register = (
+    legacy_register = (
         db.query(Register)
         .where(Register.cabinet_id == cabinet.id, Register.name == "Eingangsrechnungen", Register.deleted_at.is_(None))
         .first()
     )
-    if not register:
-        register = Register(cabinet_id=cabinet.id, register_type_id=register_type.id, name="Eingangsrechnungen", description="Aktive Eingangsrechnungen", order=10)
-        db.add(register)
-        db.flush()
-        created.append("Register")
 
     document_type = (
         db.query(DocumentType)
-        .where(DocumentType.register_id == register.id, DocumentType.name == "Rechnung")
+        .where(DocumentType.cabinet_id == cabinet.id, DocumentType.name == "Rechnung")
         .first()
     )
+    if not document_type and legacy_register:
+        document_type = (
+            db.query(DocumentType)
+            .where(DocumentType.register_id == legacy_register.id, DocumentType.name == "Rechnung")
+            .first()
+        )
     if not document_type:
-        document_type = DocumentType(register_id=register.id, cabinet_id=cabinet.id, name="Rechnung", description="Eingangsrechnung mit MVP-Metadaten", icon="🧾", order=10)
+        document_type = DocumentType(cabinet_id=cabinet.id, name="Rechnung", description="Eingangsrechnung mit MVP-Metadaten", icon="🧾", order=10)
         db.add(document_type)
         db.flush()
         created.append("Document Type")
+    document_type.cabinet_id = cabinet.id
+    document_type.register_id = None
+    document_type.register_type_id = None
+    document_type.cabinet_type_id = None
+
+    if legacy_register:
+        for document in db.query(Document).where(Document.document_type_id == document_type.id).all():
+            if document.cabinet_id == legacy_register.cabinet_id or document.cabinet_id is None:
+                document.cabinet_id = cabinet.id
+        if not legacy_register.document_types and not legacy_register.metadata_fields:
+            db.delete(legacy_register)
+            db.flush()
+            created.append("Legacy-Register entfernt")
+    if legacy_register_type:
+        remaining_registers = db.query(Register).where(Register.register_type_id == legacy_register_type.id).count()
+        if not legacy_register_type.document_type_definitions and not legacy_register_type.metadata_fields and remaining_registers == 0:
+            db.delete(legacy_register_type)
+            created.append("Legacy-Registertyp entfernt")
 
     existing_field_names = {field.name for field in document_type.fields}
     for field in _invoice_default_fields(document_type.id):
@@ -1043,7 +1057,7 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
         transition.is_default = is_default
 
     db.commit()
-    return {"created": created, "cabinet": cabinet, "register": register, "document_type": document_type, "workflow": workflow}
+    return {"created": created, "cabinet": cabinet, "document_type": document_type, "workflow": workflow}
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -1317,6 +1331,23 @@ async def ui_app_start_document_workflow(
     except WorkflowRuntimeError as exc:
         return _workflow_app_redirect(document_id, str(exc))
     return _workflow_app_redirect(document_id, f"Workflow {instance.title or 'Workflow'} gestartet")
+
+
+@router.post("/app/documents/{document_id}/workflows/start-invoice")
+async def ui_app_start_invoice_workflow(
+    document_id: UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    workflow = db.query(WorkflowDefinition).where(WorkflowDefinition.name == "Eingangsrechnung", WorkflowDefinition.is_active.is_(True)).first()
+    if not workflow:
+        return _workflow_app_redirect(document_id, "Workflow-Vorlage Eingangsrechnung nicht gefunden. Bitte MVP-Setup im Admin ausführen.")
+    _actor_id, actor_label = _current_delete_actor(db, request)
+    try:
+        instance = start_workflow_for_document(db, document_id=document_id, workflow_definition_id=workflow.id, actor_label=actor_label, comment="Aus Kontextmenü gestartet")
+    except WorkflowRuntimeError as exc:
+        return _workflow_app_redirect(document_id, str(exc))
+    return _workflow_app_redirect(document_id, f"Workflow {instance.title or 'Eingangsrechnung'} gestartet")
 
 
 @router.post("/app/workflows/{instance_id}/transition")
@@ -6161,6 +6192,9 @@ def _render_document_object_card(document: Document, href: str) -> str:
         f'<form method="post" action="/ui/app/documents/{safe_document_id}/delete" data-document-delete-form>'
         f'<input type="hidden" name="return_to" value="{safe_delete_return_to}">'
         f'<button type="submit" class="danger-action" data-document-action="delete" data-document-id="{safe_document_id}">Löschen</button>'
+        f'</form>'
+        f'<form method="post" action="/ui/app/documents/{safe_document_id}/workflows/start-invoice">'
+        f'<button type="submit">Eingangsrechnungs-WF starten</button>'
         f'</form>'
         f'<a href="{safe_href}">Öffnen</a>'
         f'<a href="/ui/app/documents/{safe_document_id}">Details öffnen</a>'
