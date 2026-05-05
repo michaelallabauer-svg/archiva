@@ -3406,15 +3406,29 @@ def _render_admin_identity_page(
     * {{ box-sizing:border-box; }}
     body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), var(--bg); color:var(--text); }}
     a {{ color:var(--accent-2); text-decoration:none; }}
-    .page {{ padding:14px 16px; max-width:1400px; margin:0 auto; }}
+    .page {{ padding:14px 16px; max-width:1760px; margin:0 auto; }}
     .panel {{ background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border:1px solid rgba(77,212,255,0.10); border-radius:18px; padding:16px; box-shadow:var(--shadow); }}
-    .hero {{ margin-bottom:16px; }}
+    .panel h2, .panel h3 {{ margin-top:0; }}
+    .hero {{ margin-bottom:16px; position:relative; overflow:hidden; }}
+    .hero::before {{ content:""; position:absolute; inset:0; background:linear-gradient(135deg, rgba(79,140,255,0.14), rgba(77,212,255,0.06) 45%, transparent 80%); pointer-events:none; }}
+    .hero > * {{ position:relative; z-index:1; }}
     .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.78rem; color: var(--accent-2); font-weight:700; }}
-    .hero h1 {{ margin:4px 0 6px; font-size:1.7rem; }}
-    .hero p {{ margin:0; color:var(--muted); max-width:64ch; line-height:1.45; }}
+    .hero h1 {{ margin:4px 0 6px; font-size:1.9rem; letter-spacing:-.03em; }}
+    .hero p {{ margin:0; color:var(--muted); max-width:72ch; line-height:1.45; }}
     .pillbar {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }}
-    .pill {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(77,212,255,0.12); border-radius: 999px; padding: 7px 11px; color: var(--text); font-size:.92rem; }}
+    .pill {{ display:inline-flex; align-items:center; gap:7px; background: rgba(255,255,255,0.04); border: 1px solid rgba(77,212,255,0.12); border-radius: 999px; padding: 7px 11px; color: var(--text); font-size:.92rem; }}
+    .pill.is-active {{ border-color:rgba(77,212,255,.48); background:rgba(77,212,255,.12); box-shadow:0 0 0 4px rgba(77,212,255,.08); }}
     .stack {{ display:grid; gap:16px; }}
+    .identity-shell {{ display:grid; gap:12px; }}
+    .identity-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }}
+    .identity-tabs {{ display:flex; gap:8px; flex-wrap:wrap; }}
+    .identity-workspace {{ display:grid; grid-template-columns:minmax(320px, 440px) minmax(0, 1fr); gap:14px; align-items:start; }}
+    .identity-form-column {{ display:grid; gap:14px; }}
+    .identity-list-section {{ display:grid; gap:12px; min-width:0; }}
+    .identity-list-header {{ display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:2px; }}
+    .identity-list-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px; }}
+    .identity-card {{ background:linear-gradient(135deg, rgba(176,126,255,0.07), rgba(77,212,255,0.04)); border:1px solid rgba(176,126,255,0.20); border-radius:16px; padding:14px; min-width:0; }}
+    .identity-card h3 {{ margin:0 0 10px; font-size:1rem; color:#c4b5fd; }}
     .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
     .field {{ display:grid; gap:6px; }}
     .field.full {{ grid-column: 1 / -1; }}
@@ -3422,18 +3436,22 @@ def _render_admin_identity_page(
     .checkbox-item {{ display:flex; gap:10px; align-items:center; font-weight:400; padding:8px 10px; border-radius:12px; background:rgba(255,255,255,0.02); }}
     label {{ font-weight:600; font-size:0.95rem; }}
     input, textarea, select {{ width:100%; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:var(--panel-deep); color:var(--text); padding:12px; font:inherit; }}
+    input[type="checkbox"] {{ width:auto; min-width:16px; height:16px; padding:0; accent-color:var(--accent-2); }}
     textarea {{ min-height:92px; resize:vertical; }}
     .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; align-items:flex-start; }}
+    .chip {{ display:inline-flex; align-items:center; justify-content:center; border:1px solid rgba(77,212,255,.14); border-radius:999px; padding:8px 11px; background:rgba(255,255,255,.04); color:var(--text); font:inherit; cursor:pointer; }}
+    .chip:hover {{ border-color:rgba(77,212,255,.42); background:rgba(77,212,255,.08); }}
     button {{ border:none; border-radius:999px; padding:10px 14px; font:inherit; cursor:pointer; max-width:100%; }}
     .primary {{ background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: white; box-shadow: 0 8px 24px rgba(77,212,255,0.22); }}
     .badge {{ display:inline-block; margin-right:8px; margin-bottom:6px; padding:4px 8px; border-radius:999px; background:rgba(77,212,255,0.16); color:var(--accent-2); font-size:0.85rem; }}
-    .def-detail-card {{ background:linear-gradient(135deg, rgba(176,126,255,0.07), rgba(77,212,255,0.04)); border:1px solid rgba(176,126,255,0.20); border-radius:16px; padding:14px; }}
-    .def-detail-card h3 {{ margin:0 0 10px; font-size:1rem; color:#b07ae6; }}
-    .def-detail-row {{ display:grid; grid-template-columns:140px 1fr; gap:10px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,.06); font-size:.92rem; }}
+    .def-detail-row {{ display:grid; grid-template-columns:120px minmax(0,1fr); gap:10px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,.06); font-size:.92rem; }}
     .def-detail-row:last-child {{ border-bottom:none; }}
     .def-detail-key {{ color:var(--muted); font-weight:600; }}
-    .def-empty {{ color:var(--muted); font-style:italic; font-size:.9rem; padding:10px 0; }}
+    .def-detail-value {{ min-width:0; word-break:break-word; }}
+    .empty-state {{ color:var(--muted); font-style:italic; font-size:.92rem; padding:16px; border:1px dashed rgba(77,212,255,.18); border-radius:16px; background:rgba(255,255,255,.02); }}
     .muted {{ color:var(--muted); }}
+    @media (max-width: 1100px) {{ .identity-workspace {{ grid-template-columns:1fr; }} }}
+    @media (max-width: 720px) {{ .page {{ padding:10px; }} .field-grid, .def-detail-row {{ grid-template-columns:1fr; }} .identity-head {{ display:grid; }} }}
   </style>
 </head>
 <body>
@@ -7205,7 +7223,7 @@ def _render_identity_panel(
         role_badges = " ".join(f'<span class="badge">{_escape(role_name)}</span>' for role_name in assigned_roles) or '<span class="muted">Keine Rollen</span>'
         source_badge = "Lokal" if user.auth_source == "local" else user.auth_source
         user_rows.append(
-            f"<div class='def-detail-card'>"
+            f"<div class='identity-card'>"
             f"<h3>👤 {_escape(user.display_name)}</h3>"
             f"<div class='def-detail-row'><div class='def-detail-key'>E-Mail</div><div class='def-detail-value'>{_escape(user.email)}</div></div>"
             f"<div class='def-detail-row'><div class='def-detail-key'>Quelle</div><div class='def-detail-value'>{_escape(source_badge)}</div></div>"
@@ -7215,13 +7233,13 @@ def _render_identity_panel(
             f"<form method='post' action='/ui/admin/users/{user.id}/toggle-status' style='display:inline;'><button class='chip' type='submit'>{'Deaktivieren' if user.status == 'active' else 'Aktivieren'}</button></form></div>"
             f"</div>"
         )
-    users_html = "".join(user_rows) or "<p class='def-empty'>Noch keine Benutzer angelegt.</p>"
+    users_html = "".join(user_rows) or "<p class='empty-state'>Noch keine Benutzer angelegt.</p>"
 
     role_rows = []
     for role in roles:
         assignment_count = sum(1 for assignment in role.assignments if assignment.user)
         role_rows.append(
-            f"<div class='def-detail-card'>"
+            f"<div class='identity-card'>"
             f"<h3>🛡️ {_escape(role.name)}</h3>"
             f"<div class='def-detail-row'><div class='def-detail-key'>Beschreibung</div><div class='def-detail-value'>{_escape(role.description or '—')}</div></div>"
             f"<div class='def-detail-row'><div class='def-detail-key'>Systemrolle</div><div class='def-detail-value'>{'Ja' if role.is_system else 'Nein'}</div></div>"
@@ -7230,40 +7248,43 @@ def _render_identity_panel(
             f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=roles&selected_role_id={role.id}#identity-admin'>Bearbeiten</a></div>"
             f"</div>"
         )
-    roles_html = "".join(role_rows) or "<p class='def-empty'>Noch keine Rollen angelegt.</p>"
+    roles_html = "".join(role_rows) or "<p class='empty-state'>Noch keine Rollen angelegt.</p>"
 
     team_rows = []
     for team in teams:
         member_names = sorted({membership.user.display_name for membership in team.memberships if membership.user})
         member_badges = " ".join(f'<span class="badge">{_escape(member_name)}</span>' for member_name in member_names) or '<span class="muted">Keine Mitglieder</span>'
         team_rows.append(
-            f"<div class='def-detail-card'>"
+            f"<div class='identity-card'>"
             f"<h3>👥 {_escape(team.name)}</h3>"
             f"<div class='def-detail-row'><div class='def-detail-key'>Beschreibung</div><div class='def-detail-value'>{_escape(team.description or '—')}</div></div>"
             f"<div class='def-detail-row'><div class='def-detail-key'>Mitglieder</div><div class='def-detail-value'>{member_badges}</div></div>"
             f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}#identity-admin'>Bearbeiten</a></div>"
             f"</div>"
         )
-    teams_html = "".join(team_rows) or "<p class='def-empty'>Noch keine Teams angelegt.</p>"
+    teams_html = "".join(team_rows) or "<p class='empty-state'>Noch keine Teams angelegt.</p>"
 
-    users_section_style = "display:block;" if active_tab == "users" else "display:none;"
-    roles_section_style = "display:block;" if active_tab == "roles" else "display:none;"
-    teams_section_style = "display:block;" if active_tab == "teams" else "display:none;"
+    users_section_style = "display:grid;" if active_tab == "users" else "display:none;"
+    roles_section_style = "display:grid;" if active_tab == "roles" else "display:none;"
+    teams_section_style = "display:grid;" if active_tab == "teams" else "display:none;"
 
     return f"""
-      <div class="stack">
-        <div class="panel" style="margin-bottom:0;">
-          <h3>User & Rollen</h3>
-          <p class="muted">Natives Identitätsmodell für Archiva. Später kann Entra ID über dieselben Benutzerkonten und Rollen andocken.</p>
-          {message_html}
-          <div class="actions">
-            <a class="pill{' is-active' if active_tab == 'users' else ''}" href="/ui/admin/identity?identity_tab=users#identity-admin">Benutzer</a>
-            <a class="pill{' is-active' if active_tab == 'roles' else ''}" href="/ui/admin/identity?identity_tab=roles#identity-admin">Rollen</a>
-            <a class="pill{' is-active' if active_tab == 'teams' else ''}" href="/ui/admin/identity?identity_tab=teams#identity-admin">Teams</a>
+      <div class="identity-shell">
+        <div class="panel identity-head" style="margin-bottom:0;">
+          <div>
+            <h3>User, Rollen & Teams</h3>
+            <p class="muted">Natives Identitätsmodell für Archiva. Diese Empfänger werden im Workflow Designer für einzelne Schritte verwendet.</p>
+            {message_html}
+          </div>
+          <div class="identity-tabs">
+            <a class="pill{' is-active' if active_tab == 'users' else ''}" href="/ui/admin/identity?identity_tab=users#identity-admin">👤 Benutzer</a>
+            <a class="pill{' is-active' if active_tab == 'roles' else ''}" href="/ui/admin/identity?identity_tab=roles#identity-admin">🛡️ Rollen</a>
+            <a class="pill{' is-active' if active_tab == 'teams' else ''}" href="/ui/admin/identity?identity_tab=teams#identity-admin">👥 Teams</a>
           </div>
         </div>
 
-        <div id="identity-admin" style="{users_section_style}">
+        <div id="identity-admin" class="identity-workspace" style="{users_section_style}">
+          <div class="identity-form-column">
           <form method="post" action="/ui/admin/users" class="panel" style="margin-bottom:0;">
             <h3>Benutzer anlegen</h3>
             <p class="muted">Für v1 reicht ein lokaler Benutzerstamm. Externe Anmeldung kann später über `external_subject` und `auth_source` ergänzt werden.</p>
@@ -7286,10 +7307,15 @@ def _render_identity_panel(
             </div>
             <div class="actions"><button class="primary" type="submit">Benutzer aktualisieren</button></div>
           </form>
-          <div class="stack" style="margin-top:16px;">{users_html}</div>
+          </div>
+          <div class="identity-list-section panel">
+            <div class="identity-list-header"><h3 style="margin:0;">Benutzer</h3><span class="pill">{len(users)} Konten</span></div>
+            <div class="identity-list-grid">{users_html}</div>
+          </div>
         </div>
 
-        <div style="{roles_section_style}">
+        <div class="identity-workspace" style="{roles_section_style}">
+          <div class="identity-form-column">
           <form method="post" action="/ui/admin/roles" class="panel" style="margin-bottom:0;">
             <h3>Rolle anlegen</h3>
             <p class="muted">Rollen bleiben bewusst grob und lesbar. Feingranulare Rechte können wir später verfeinern.</p>
@@ -7310,10 +7336,15 @@ def _render_identity_panel(
             </div>
             <div class="actions"><button class="primary" type="submit">Rolle aktualisieren</button></div>
           </form>
-          <div class="stack" style="margin-top:16px;">{roles_html}</div>
+          </div>
+          <div class="identity-list-section panel">
+            <div class="identity-list-header"><h3 style="margin:0;">Rollen</h3><span class="pill">{len(roles)} Rollen</span></div>
+            <div class="identity-list-grid">{roles_html}</div>
+          </div>
         </div>
 
-        <div style="{teams_section_style}">
+        <div class="identity-workspace" style="{teams_section_style}">
+          <div class="identity-form-column">
           <form method="post" action="/ui/admin/teams" class="panel" style="margin-bottom:0;">
             <h3>Team anlegen</h3>
             <p class="muted">Teams und Gruppen sind die nächste fachliche Schicht für Workflow-Zuständigkeiten.</p>
@@ -7334,7 +7365,11 @@ def _render_identity_panel(
             </div>
             <div class="actions"><button class="primary" type="submit">Team aktualisieren</button></div>
           </form>
-          <div class="stack" style="margin-top:16px;">{teams_html}</div>
+          </div>
+          <div class="identity-list-section panel">
+            <div class="identity-list-header"><h3 style="margin:0;">Teams</h3><span class="pill">{len(teams)} Teams</span></div>
+            <div class="identity-list-grid">{teams_html}</div>
+          </div>
         </div>
       </div>
     """
