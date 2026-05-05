@@ -209,3 +209,96 @@ Erste erweiterbare Bedienungsanleitung angelegt mit Fokus auf:
 - Workflow Designer
 - Rücksprünge / Schleifen
 - Duplizieren / Versionieren
+
+---
+
+## 11. Login, Benutzer und Rollen
+
+Archiva schützt die servergerenderten UI-Seiten unter `/ui/*` per Login.
+
+### 11.1 Anmelden
+
+Login-Seite:
+
+```text
+/ui/login
+```
+
+Nach erfolgreichem Login wird man auf die ursprünglich aufgerufene Seite zurückgeführt, z. B. App, Admin oder Workflow Designer.
+
+### 11.2 Abmelden
+
+In App, Admin und Workflow Designer gibt es einen Button **Abmelden**. Dieser löscht die Session-Cookies und führt zurück zur Login-Seite.
+
+### 11.3 Passwort setzen
+
+Passwörter werden in der Benutzerverwaltung gesetzt:
+
+1. `Admin → Identity & Rollen`
+2. Tab **Benutzer** öffnen
+3. Benutzer über **Bearbeiten** auswählen
+4. Feld **Neues Passwort** ausfüllen
+5. **Benutzer aktualisieren** klicken
+
+Beim Anlegen eines Benutzers kann direkt ein **Initiales Passwort** vergeben werden.
+
+### 11.4 Bootstrap-Regel für lokale Entwicklung
+
+Wenn noch kein Benutzer ein Passwort gesetzt hat, erlaubt Archiva für bestehende aktive Benutzer einen initialen Login mit leerem Passwort. Sobald mindestens ein Passwort-Hash existiert, greift die normale Passwortprüfung.
+
+### 11.5 Rollen und Workflow-Empfänger
+
+Benutzer können Rollen erhalten, z. B.:
+
+- `Rechnungsprüfung`
+- `Rechnungsfreigabe`
+- `Buchhaltung`
+
+Diese Rollen werden über `AssignmentTarget` auch im Workflow Designer als Empfänger für einzelne Schritte nutzbar. Workflow-Aufgaben und History-Aktionen verwenden den aktuell eingeloggten Benutzer als Actor.
+
+---
+
+## 12. Workflow Runtime und Inbox
+
+Neben dem Workflow Designer gibt es eine Runtime für echte Durchläufe.
+
+### 12.1 Workflow starten
+
+Ein Workflow kann an einem Dokument gestartet werden. Für Eingangsrechnungen existiert eine eigene Aktion **Eingangsrechnungs-WF starten**.
+
+### 12.2 Aktive Workflows am Dokument
+
+Wenn ein Dokument aktive Workflows hat, zeigt die App eine Workflow-Maske mit:
+
+- aktuellem Schritt
+- Zuständigkeit / Empfänger
+- verfügbaren Transitionen
+- Abschluss / Abbruch
+- History
+
+### 12.3 Workflow Inbox
+
+Die Workflow Inbox ist in der App über den Hero erreichbar. Der Button zeigt die Anzahl aktuell aktiver Workflows.
+
+Route:
+
+```text
+/ui/app/workflows/inbox
+```
+
+Die Inbox listet offene Workflow-Aufgaben und führt per Klick zurück zum Dokument mit geöffnetem Workflow-Panel.
+
+---
+
+## 13. Änderungslog Ergänzung 2026-05-05
+
+Ergänzt und umgesetzt:
+
+- Soft-Delete/Papierkorb für Dokumente, Cabinets und Register
+- Workflow Runtime MVP mit Instanzen, Tasks und History
+- Eingangsrechnungs-MVP Seed
+- Workflow Designer Layout: kompakte vertikale Grafik, 3-Spalten-Editor
+- Dokumenttyp-Indexsuche, z. B. für `Rechnung`
+- Workflow Inbox mit aktiver Workflow-Zahl im App-Hero
+- Identity-Seite optisch überarbeitet
+- Login/Logout in die Anwendung verdrahtet

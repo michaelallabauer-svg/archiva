@@ -302,3 +302,30 @@
   - Seed entfernt bestehendes Legacy-Register + Registertyp
   - Kontextmenü-HTML enthält `Eingangsrechnungs-WF starten`
   - POST `/ui/app/documents/{id}/workflows/start-invoice` startet Workflow und redirectet zu `workflow_panel=1`; Testdaten bereinigt.
+
+## Stand 2026-05-05 21:56 — Login, Identity, Workflow Runtime
+
+- UI-Login ist in Archiva verdrahtet:
+  - `/ui/login` rendert die Login-Seite.
+  - `/ui/logout` meldet ab und löscht Session-Cookies.
+  - Middleware schützt `/ui/*` und leitet nicht eingeloggte Nutzer mit `return_to` zum Login.
+  - Session-Cookie `archiva_session` ist HMAC-signiert und 12 Stunden gültig.
+  - Für echte Umgebungen sollte `ARCHIVA_SESSION_SECRET` gesetzt werden; lokal gibt es einen Dev-Fallback.
+- Benutzerverwaltung:
+  - `/ui/admin/identity` verwaltet Benutzer, Rollen und Teams.
+  - Benutzeranlage hat Feld **Initiales Passwort**.
+  - Benutzerbearbeitung hat Feld **Neues Passwort**; leer lassen bedeutet unverändert.
+  - Passwörter werden mit PBKDF2-SHA256 gehasht.
+  - Lokaler Bootstrap: Solange kein User einen Passwort-Hash hat, kann ein bestehender aktiver User mit leerem Passwort einloggen.
+- Actor-Verdrahtung:
+  - Workflow-/Delete-Aktionen nutzen den eingeloggten User als Actor/Label.
+  - Legacy Header/Cookie-Fallback bleibt für lokale Tests erhalten.
+- Workflow/Inbox:
+  - Workflow Runtime mit `WorkflowInstance`, `WorkflowTask`, `WorkflowHistoryEvent` ist aktiv.
+  - App-Hero zeigt Workflow Inbox mit Zahl aktiver Workflows.
+  - `/ui/app/workflows/inbox` listet offene Tasks und verlinkt zurück zum Dokument-Workflow-Panel.
+- Dokumentation aktualisiert:
+  - `README.md`
+  - `SETUP_NOTES.md`
+  - `BEDIENUNGSANLEITUNG.md`
+  - `archiva.md`

@@ -6,11 +6,13 @@ Lightweight Enterprise Content Management with Full-Text Search.
 
 - 📄 Document upload and storage
 - 🧩 Admin-managed document/object definitions: Cabinet Types, Cabinets, Registers, Document Types, Metadata Fields
+- 🔐 Login-protected UI with local users, roles, password hashes and signed sessions
 - 📝 App workspace for daily ECM work: browse structure, capture documents, edit object metadata values
 - ✅ Server-side metadata validation driven by document type definitions
 - 🔍 Full-text search with OpenSearch when available and PostgreSQL fallback indexing
 - 🖼️ Preview/index queue worker started together with the app
 - 📁 Version tracking
+- 🔄 Workflow Designer, runtime tasks/history, invoice MVP seed and workflow inbox
 - 🏷️ Metadata and tagging
 - ⚙️ Configurable via YAML
 - 🐳 Docker-ready for local OpenSearch
@@ -129,7 +131,9 @@ Important paths/ports:
 - API: `http://localhost:8000/docs`
 - Admin UI: `http://localhost:8000/ui/admin`
 - App UI: `http://localhost:8000/ui/app`
-- Workflow UI: `http://localhost:8000/ui/workflows`
+- Login UI: `http://localhost:8000/ui/login`
+- Workflow Designer: `http://localhost:8000/ui/workflow-designer`
+- Workflow Inbox: `http://localhost:8000/ui/app/workflows/inbox`
 
 ### 6. Optional: OpenSearch
 
@@ -183,6 +187,30 @@ uv run python -m archiva.main
 ```
 
 If the browser still shows old UI, hard-refresh with `Cmd+Shift+R`.
+
+
+## Login and Identity
+
+The server-rendered UI under `/ui/*` is protected by a login guard.
+
+- Login: `http://localhost:8000/ui/login`
+- Logout: available as **Abmelden** in App/Admin/Workflow Designer
+- Identity admin: `http://localhost:8000/ui/admin/identity`
+
+Users are managed in **Admin → Identity & Rollen**. When creating a user you can set an **Initiales Passwort**; when editing a user you can set **Neues Passwort**. Passwords are stored as PBKDF2 hashes.
+
+Local bootstrap rule: if no user has a password hash yet, an existing active user can log in with an empty password. As soon as a password is set, normal password verification is required. For non-local deployments set `ARCHIVA_SESSION_SECRET` so signed session cookies do not use the development fallback secret.
+
+## Workflow Runtime and Inbox
+
+Archiva now has both definition-time and runtime workflow support:
+
+- Workflow definitions live in `/ui/workflow-designer`.
+- Runtime instances can be started on documents.
+- Each active instance keeps the current step, open task, assignment target and history events.
+- The App hero links to `/ui/app/workflows/inbox` and shows how many workflows are active.
+- Workflow actions record the logged-in user as actor.
+- The invoice MVP setup creates the `Eingangsrechnung` workflow and roles such as `Rechnungsprüfung`, `Rechnungsfreigabe` and `Buchhaltung`.
 
 ## Common dependency problems and fixes
 
