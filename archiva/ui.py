@@ -3834,6 +3834,7 @@ def _render_app_page(
     .document-action-menu-button::-webkit-details-marker {{ display:none; }}
     .document-action-menu-button:hover, .document-action-details[open] .document-action-menu-button {{ background:rgba(77,212,255,0.10); }}
     .document-action-menu {{ right:0; top:calc(100% + 6px); }}
+    .document-action-details[open] .document-action-menu {{ position:static; display:grid; margin-top:8px; min-width:210px; }}
     .context-menu .danger-action {{ color:#ffb4b4; }}
     .context-menu .danger-action:hover {{ background:rgba(255,123,123,0.12); }}
     .context-menu .danger-action.is-working {{ color:#ffd0d0; background:rgba(255,123,123,0.18); cursor:wait; }}
@@ -3997,50 +3998,6 @@ def _render_app_page(
           menu.setAttribute('aria-hidden', 'true');
         }}
       }});
-    }});
-
-    const prepareDocumentDeleteForm = (form, button) => {{
-      form.method = 'post';
-      form.action = `/ui/app/documents/${{button.dataset.documentId}}/delete`;
-      let returnInput = form.querySelector('input[name="return_to"]');
-      if (!returnInput) {{
-        returnInput = document.createElement('input');
-        returnInput.type = 'hidden';
-        returnInput.name = 'return_to';
-        form.appendChild(returnInput);
-      }}
-      returnInput.value = window.location.pathname + window.location.search;
-      button.disabled = true;
-      button.classList.add('is-working');
-      button.textContent = 'Wird in den Papierkorb verschoben…';
-    }};
-
-    const submitDocumentDeleteForm = (form, button) => {{
-      prepareDocumentDeleteForm(form, button);
-      window.setTimeout(() => form.submit(), 0);
-    }};
-
-
-    document.querySelectorAll('form[data-document-delete-form]').forEach((form) => {{
-      form.addEventListener('submit', (event) => {{
-        event.preventDefault();
-        const button = form.querySelector('[data-document-action="delete"]');
-        if (button) submitDocumentDeleteForm(form, button);
-      }});
-    }});
-
-    document.addEventListener('click', (event) => {{
-      const button = event.target.closest('[data-document-action="delete"]');
-      if (!button) return;
-      const form = button.closest('form');
-      if (form) {{
-        event.preventDefault();
-        submitDocumentDeleteForm(form, button);
-      }} else {{
-        // bare link — navigate to delete confirmation page
-        event.preventDefault();
-        window.location.href = button.href;
-      }}
     }});
 
     const openQuickCreate = (mode, nodeKind = '', nodeId = '', nodeLabel = '') => {{
