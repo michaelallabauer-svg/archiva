@@ -4,9 +4,11 @@ import asyncio
 import contextlib
 import logging
 from contextlib import asynccontextmanager
+from urllib.parse import quote_plus
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -20,7 +22,7 @@ from archiva.indexer.opensearch_client import OpenSearchClient
 from archiva.indexer.worker import process_pending_index_jobs
 from archiva.preview_queue import process_pending_preview_jobs
 from archiva.storage import StorageManager
-from archiva.ui import router as ui_router
+from archiva.ui import SESSION_COOKIE_NAME, _parse_session_cookie, router as ui_router
 
 logger = logging.getLogger("archiva.main")
 
@@ -83,6 +85,15 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def ui_login_guard(request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/ui") and not path.startswith("/ui/login") and path not in {"/ui/logout"}:
+            if _parse_session_cookie(request.cookies.get(SESSION_COOKIE_NAME)) is None:
+                return_to = path + (f"?{request.url.query}" if request.url.query else "")
+                return RedirectResponse(url=f"/ui/login?return_to={quote_plus(return_to)}", status_code=303)
+        return await call_next(request)
 
     init_router(storage)
     app.mount("/assets", StaticFiles(directory="assets"), name="assets")

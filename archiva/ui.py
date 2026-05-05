@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import os
 import re
+import secrets
+import time
 from html import escape
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +36,72 @@ from archiva.storage import StorageManager
 from archiva.workflow_runtime import WorkflowRuntimeError, active_instances_for_document, cancel_workflow, complete_workflow, start_workflow_for_document, transition_workflow
 
 router = APIRouter(tags=["ui"])
+
+SESSION_COOKIE_NAME = "archiva_session"
+SESSION_MAX_AGE_SECONDS = 60 * 60 * 12
+
+
+def _auth_secret() -> str:
+    return os.environ.get("ARCHIVA_SESSION_SECRET") or "archiva-local-dev-session-secret"
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 210_000).hex()
+    return f"pbkdf2_sha256${salt}${digest}"
+
+
+def _verify_password(password: str, password_hash: str | None) -> bool:
+    if not password_hash:
+        return False
+    try:
+        algorithm, salt, expected = password_hash.split("$", 2)
+    except ValueError:
+        return False
+    if algorithm != "pbkdf2_sha256":
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 210_000).hex()
+    return hmac.compare_digest(digest, expected)
+
+
+def _sign_session_payload(user_id: str, expires_at: int) -> str:
+    payload = f"{user_id}.{expires_at}"
+    signature = hmac.new(_auth_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def _parse_session_cookie(value: str | None) -> UUID | None:
+    if not value:
+        return None
+    try:
+        user_id, expires_at_raw, signature = value.split(".", 2)
+        expires_at = int(expires_at_raw)
+    except (ValueError, TypeError):
+        return None
+    if expires_at < int(time.time()):
+        return None
+    expected = hmac.new(_auth_secret().encode("utf-8"), f"{user_id}.{expires_at}".encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        return UUID(user_id)
+    except ValueError:
+        return None
+
+
+def _current_user_from_request(db: Session, request: Request) -> User | None:
+    session_user_id = _parse_session_cookie(request.cookies.get(SESSION_COOKIE_NAME))
+    raw_user_id = str(session_user_id) if session_user_id else (request.headers.get("x-archiva-user-id") or request.cookies.get("archiva_user_id"))
+    if not raw_user_id:
+        return None
+    try:
+        return db.query(User).where(User.id == UUID(raw_user_id), User.status == "active").first()
+    except ValueError:
+        return None
+
+
+def _login_redirect(return_to: str = "/ui/app") -> RedirectResponse:
+    return RedirectResponse(url=f"/ui/login?return_to={quote_plus(return_to)}", status_code=303)
 
 
 def _active_documents_query(db: Session):
@@ -71,14 +142,9 @@ def _active_registers_for_cabinet(cabinet: Cabinet | None) -> list[Register]:
 
 
 def _current_delete_actor(db: Session, request: Request) -> tuple[UUID | None, str]:
-    raw_user_id = request.headers.get("x-archiva-user-id") or request.cookies.get("archiva_user_id")
-    if raw_user_id:
-        try:
-            user = db.query(User).where(User.id == UUID(raw_user_id)).first()
-            if user:
-                return user.id, user.display_name or user.email
-        except ValueError:
-            pass
+    user = _current_user_from_request(db, request)
+    if user:
+        return user.id, user.display_name or user.email
     return None, "Archiva App (nicht angemeldet)"
 
 
@@ -102,6 +168,12 @@ def _safe_app_return_url(return_to: str, fallback: str = "/ui/app") -> str:
     if not return_to.startswith("/ui/app"):
         return fallback
     if "/documents/" in return_to or "node_kind=document" in return_to:
+        return fallback
+    return return_to
+
+
+def _safe_ui_return_url(return_to: str, fallback: str = "/ui/app") -> str:
+    if not return_to.startswith("/ui") or return_to.startswith("/ui/login"):
         return fallback
     return return_to
 
@@ -1149,6 +1221,47 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
 
     db.commit()
     return {"created": created, "cabinet": cabinet, "document_type": document_type, "workflow": workflow}
+
+
+@router.get("/login", response_class=HTMLResponse)
+async def ui_login_page(
+    request: Request,
+    return_to: str = "/ui/app",
+    message: str | None = None,
+    db: Session = Depends(get_db),
+) -> Response:
+    if _current_user_from_request(db, request):
+        return RedirectResponse(url=_safe_ui_return_url(return_to, "/ui/app"), status_code=303)
+    return HTMLResponse(content=_render_login_page(return_to=return_to, message=message))
+
+
+@router.post("/login")
+async def ui_login_submit(
+    email: str = Form(...),
+    password: str = Form(""),
+    return_to: str = Form("/ui/app"),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    normalized_email = email.strip().lower()
+    user = db.query(User).where(User.email.ilike(normalized_email), User.status == "active").first()
+    has_any_password = db.query(User).where(User.password_hash.isnot(None)).first() is not None
+    password_ok = bool(user and _verify_password(password, user.password_hash))
+    bootstrap_ok = bool(user and not user.password_hash and not has_any_password and not password)
+    if not user or not (password_ok or bootstrap_ok):
+        return RedirectResponse(url=f"/ui/login?return_to={quote_plus(return_to)}&message={quote_plus('Login fehlgeschlagen')}", status_code=303)
+    expires_at = int(time.time()) + SESSION_MAX_AGE_SECONDS
+    response = RedirectResponse(url=_safe_ui_return_url(return_to, "/ui/app"), status_code=303)
+    response.set_cookie(SESSION_COOKIE_NAME, _sign_session_payload(str(user.id), expires_at), max_age=SESSION_MAX_AGE_SECONDS, httponly=True, samesite="lax")
+    response.set_cookie("archiva_user_id", str(user.id), max_age=SESSION_MAX_AGE_SECONDS, httponly=False, samesite="lax")
+    return response
+
+
+@router.post("/logout")
+async def ui_logout() -> RedirectResponse:
+    response = RedirectResponse(url="/ui/login?message=Abgemeldet", status_code=303)
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    response.delete_cookie("archiva_user_id")
+    return response
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -2665,6 +2778,7 @@ async def ui_create_role(
 async def ui_create_user(
     email: str = Form(...),
     display_name: str = Form(...),
+    password: str = Form(""),
     status: str = Form("active"),
     role_ids: list[str] | None = Form(None),
     db: Session = Depends(get_db),
@@ -2680,6 +2794,7 @@ async def ui_create_user(
         display_name=display_name.strip(),
         status=status.strip() or "active",
         auth_source="local",
+        password_hash=_hash_password(password) if password else None,
     )
     try:
         db.add(user)
@@ -2708,6 +2823,7 @@ async def ui_update_user(
     user_id: UUID,
     email: str = Form(...),
     display_name: str = Form(...),
+    password: str = Form(""),
     status: str = Form("active"),
     role_ids: list[str] | None = Form(None),
     db: Session = Depends(get_db),
@@ -2727,6 +2843,8 @@ async def ui_update_user(
     user.email = normalized_email
     user.display_name = display_name.strip()
     user.status = status.strip() or "active"
+    if password:
+        user.password_hash = _hash_password(password)
     try:
         db.add(user)
 
@@ -3477,6 +3595,52 @@ def _render_admin_identity_page(
 """
 
 
+def _render_login_page(*, return_to: str = "/ui/app", message: str | None = None) -> str:
+    message_html = f'<div class="login-message">{_escape(message)}</div>' if message else ""
+    safe_return_to = _safe_ui_return_url(return_to, "/ui/app")
+    return f"""
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archiva Login</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+  <style>
+    :root {{ color-scheme:dark; --bg:#0b1020; --panel:#121933; --panel-deep:#0f1630; --text:#eef2ff; --muted:#a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family:Inter, ui-sans-serif, system-ui, sans-serif; background:radial-gradient(circle at top left, rgba(77,212,255,.12), transparent 30%), radial-gradient(circle at bottom right, rgba(79,140,255,.10), transparent 35%), var(--bg); color:var(--text); }}
+    .login-card {{ width:min(440px, calc(100vw - 28px)); padding:22px; border-radius:24px; border:1px solid rgba(77,212,255,.14); background:linear-gradient(180deg, rgba(18,25,51,.97), rgba(15,22,48,.97)); box-shadow:0 22px 70px rgba(0,0,0,.38); }}
+    .brand {{ display:flex; gap:12px; align-items:center; margin-bottom:16px; }}
+    .brand-mark {{ width:48px; height:48px; display:grid; place-items:center; border-radius:16px; background:linear-gradient(135deg, rgba(79,140,255,.28), rgba(77,212,255,.18)); border:1px solid rgba(77,212,255,.26); }}
+    .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.76rem; color:var(--accent-2); font-weight:800; }}
+    h1 {{ margin:3px 0 0; font-size:1.55rem; letter-spacing:-.03em; }}
+    p {{ margin:0 0 16px; color:var(--muted); line-height:1.45; }}
+    .field {{ display:grid; gap:6px; margin-top:12px; }}
+    label {{ font-weight:700; font-size:.94rem; }}
+    input {{ width:100%; border-radius:14px; border:1px solid rgba(77,212,255,.12); background:var(--panel-deep); color:var(--text); padding:12px; font:inherit; }}
+    input:focus {{ outline:none; border-color:rgba(77,212,255,.48); box-shadow:0 0 0 4px rgba(77,212,255,.12); }}
+    button {{ width:100%; margin-top:16px; border:0; border-radius:999px; padding:12px 14px; font:inherit; cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#fff; box-shadow:0 8px 24px rgba(77,212,255,.24); }}
+    .login-message {{ margin-bottom:12px; padding:10px 12px; border-radius:14px; background:rgba(77,212,255,.10); border:1px solid rgba(77,212,255,.18); color:var(--text); }}
+    .hint {{ margin-top:12px; font-size:.9rem; color:var(--muted); }}
+  </style>
+</head>
+<body>
+  <form class="login-card" method="post" action="/ui/login">
+    <div class="brand"><div class="brand-mark"><img src="/assets/archiva-logo-flow.svg" alt="" style="width:32px;height:32px;"></div><div><div class="eyebrow">Archiva</div><h1>Anmelden</h1></div></div>
+    <p>Bitte melde dich an, damit Workflow-Aktionen und Änderungen eindeutig einem Benutzer zugeordnet werden.</p>
+    {message_html}
+    <input type="hidden" name="return_to" value="{_escape(safe_return_to)}">
+    <div class="field"><label>E-Mail</label><input type="email" name="email" autocomplete="username" required autofocus></div>
+    <div class="field"><label>Passwort</label><input type="password" name="password" autocomplete="current-password"></div>
+    <button type="submit">Einloggen</button>
+    <div class="hint">Dev-Hinweis: Solange noch kein Passwort gesetzt wurde, ist initialer Login mit leerem Passwort möglich.</div>
+  </form>
+</body>
+</html>
+"""
+
+
 
 def _render_admin_page(
     *,
@@ -3657,6 +3821,7 @@ def _render_admin_page(
           <span class="pill">Cabinettypen / Registertypen / Dokumenttypen</span>
           <span class="pill">Metadatenmodell</span>
           <a class="pill" href="/ui/app">Zur ECM-App</a>
+          <form method="post" action="/ui/logout" style="display:inline;"><button class="pill" type="submit">Abmelden</button></form>
           <a class="pill" href="/ui/admin/queues">Queues & Logs</a>
           <a class="pill" href="/ui/admin/trash">Papierkorb</a>
           <a class="pill" href="/ui/admin/identity">Identity & Rollen</a>
@@ -4606,6 +4771,7 @@ def _render_app_page(
         <div class="actions" style="margin-top:0;">
           <a class="chip" href="#recent-documents">Zuletzt erfasste</a>
           <a class="chip" href="/ui/admin">Zur Admin-Oberfläche</a>
+          <form method="post" action="/ui/logout" style="display:inline;"><button class="chip" type="submit">Abmelden</button></form>
         </div>
       </div>
       <div class="workspace-grid">
@@ -5629,6 +5795,7 @@ def _render_workflow_designer_page(*, workflows: list[WorkflowDefinition], assig
         <a class=\"pill\" href=\"/ui/app\">Zur ECM-App</a>
         <a class=\"pill\" href=\"/ui/admin\">Zur Admin-Oberfläche</a>
         <a class=\"pill\" href=\"/ui/admin/identity\">Zur Identity</a>
+        <form method=\"post\" action=\"/ui/logout\" style=\"display:inline;\"><button class=\"pill\" type=\"submit\">Abmelden</button></form>
       </div>
     </div>
     {message_html}
@@ -7293,6 +7460,7 @@ def _render_identity_panel(
             <div class="field-grid">
               <div class="field"><label>Anzeigename</label><input type="text" name="display_name" required></div>
               <div class="field"><label>E-Mail</label><input type="email" name="email" required></div>
+              <div class="field"><label>Initiales Passwort</label><input type="password" name="password" autocomplete="new-password" placeholder="optional"></div>
               <div class="field"><label>Status</label><select name="status"><option value="active">active</option><option value="invited">invited</option><option value="disabled">disabled</option></select></div>
               <div class="field full"><label>Rollen</label><div class="checkbox-group">{role_options}</div></div>
             </div>
@@ -7304,6 +7472,7 @@ def _render_identity_panel(
             <div class="field-grid">
               <div class="field"><label>Anzeigename</label><input type="text" name="display_name" value="{_escape(selected_user.display_name) if selected_user else ''}" required></div>
               <div class="field"><label>E-Mail</label><input type="email" name="email" value="{_escape(selected_user.email) if selected_user else ''}" required></div>
+              <div class="field"><label>Neues Passwort</label><input type="password" name="password" autocomplete="new-password" placeholder="leer lassen = unverändert"></div>
               <div class="field"><label>Status</label><select name="status"><option value="active" {'selected' if selected_user and selected_user.status == 'active' else ''}>active</option><option value="invited" {'selected' if selected_user and selected_user.status == 'invited' else ''}>invited</option><option value="disabled" {'selected' if selected_user and selected_user.status == 'disabled' else ''}>disabled</option></select></div>
               <div class="field full"><label>Rollen</label><div class="checkbox-group">{edit_role_options}</div></div>
             </div>
