@@ -138,6 +138,15 @@ Für den MVP braucht jeder Schritt:
 - einfache Historie am Dokument
 - Aktion im UI, um den nächsten Workflow-Schritt auszulösen
 
+Runtime-Designentscheidung 2026-05-05:
+
+- Parallele Workflows auf einem Dokument sind grundsätzlich erlaubt.
+- Für den MVP laufen Workflow-Instanzen zunächst nur auf Dokumenten.
+- Das Runtime-Modell soll später aber auch Cabinets und Register als Workflow-Objekte tragen können.
+- History wird nicht nur bei Schrittwechseln erzeugt, sondern auch bei Start, Ende und Abbruch.
+- Wenn auf einem Dokument ein Workflow aktiv ist, zeigt die App einen prominenten Workflow-Hero/Button.
+- Klick auf den Workflow-Hero öffnet die Workflow-Maske im mittleren Bereich der App.
+
 Noch nicht zwingend für MVP:
 
 - komplexe SLA-/Fristen-Logik
@@ -222,8 +231,11 @@ Empfehlung: Für MVP direkt beim Upload bzw. nach erfolgreicher Metadatenvalidie
   - [ ] Transitionen
   - [ ] Default-Zuweisungen/Rollen
 - [ ] Dokumentdetail/App-Ansicht um Workflowstatus erweitern
+  - [ ] Prominenter Workflow-Hero/Button, wenn ein Workflow auf dem Dokument aktiv ist
+  - [ ] Klick öffnet Workflow-Maske im mittleren App-Bereich
 - [ ] Workflow-Aktionen in der App ausführbar machen
 - [ ] Workflow-Historie am Dokument anzeigen
+  - [ ] History-Ereignisse für Start, Transition, Ende und Abbruch
 - [ ] Upload/Capture so härten, dass Pflichtfelder, Duplikate und Fehler klar angezeigt werden
 - [ ] PDFStampede-Client in Archiva ergänzen
 - [ ] Eingangsstempel-Job implementieren

@@ -240,3 +240,11 @@
    - geprüft mit Testworkflow inklusive Rücksprung `B -> A`; Ergebnis: Original + Kopie + `v2` jeweils mit 2 Schritten und 2 Transitionen
 5. Offener Hinweis:
    - falls die Hauptinstanz auf `:8000` noch ohne Neustart läuft, braucht sie einen Archiva-Neustart, damit die neuen Duplicate-/Version-Routen und UI-Markierungen dort live sind
+
+## Workflow Runtime Designentscheidung 2026-05-05 10:29
+- Neymo entschieden: Archiva soll parallele Workflows erlauben.
+- Für den MVP reicht Workflow Runtime auf Dokumenten, aber das Datenmodell soll später auch Cabinet und Register als Workflow-Träger unterstützen können.
+- Workflow-History muss Ereignisse für Start, Transition/Schrittwechsel, Ende und Abbruch erzeugen.
+- UI-Idee: Wenn auf einem Dokument ein aktiver Workflow läuft, zeigt die App einen prominenten Workflow-Hero/Button am Dokument.
+- Klick auf den Workflow-Hero öffnet die Workflow-Maske im mittleren Bereich der App.
+- Konsequenz fürs Datenmodell: Workflow-Instanz sollte polymorph auf ein Zielobjekt zeigen, z.B. `subject_kind` + `subject_id`, statt hart nur `document_id`; MVP validiert/nutzt zunächst `subject_kind=document`.
