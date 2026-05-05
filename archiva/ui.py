@@ -3829,8 +3829,10 @@ def _render_app_page(
     .document-card-main {{ display:block; color:inherit; position:relative; z-index:1; }}
     .document-card-main:hover {{ text-decoration:none; }}
     .document-card-actions {{ display:grid; gap:8px; justify-items:end; position:relative; z-index:5; }}
-    .document-action-menu-button {{ border:none; border-radius:999px; padding:6px 10px; background:rgba(255,255,255,0.03); color:var(--accent-2); cursor:pointer; font-size:.9rem; }}
-    .document-action-menu-button:hover {{ background:rgba(77,212,255,0.10); }}
+    .document-action-details {{ position:relative; }}
+    .document-action-menu-button {{ display:inline-flex; border:none; border-radius:999px; padding:6px 10px; background:rgba(255,255,255,0.03); color:var(--accent-2); cursor:pointer; font-size:.9rem; list-style:none; }}
+    .document-action-menu-button::-webkit-details-marker {{ display:none; }}
+    .document-action-menu-button:hover, .document-action-details[open] .document-action-menu-button {{ background:rgba(77,212,255,0.10); }}
     .document-action-menu {{ right:0; top:calc(100% + 6px); }}
     .context-menu .danger-action {{ color:#ffb4b4; }}
     .context-menu .danger-action:hover {{ background:rgba(255,123,123,0.12); }}
@@ -3860,6 +3862,16 @@ def _render_app_page(
     .tree-actions {{ display:flex; align-items:center; gap:8px; }}
     .tree-menu-button {{ border:none; border-radius:10px; padding:6px 10px; background:rgba(255,255,255,0.03); color:var(--accent-2); cursor:pointer; }}
     .tree-menu-button:hover {{ background:rgba(77,212,255,0.10); }}
+    .tree-inline-menu {{ position:relative; }}
+    .tree-inline-menu summary {{ list-style:none; border:none; border-radius:10px; padding:6px 10px; background:rgba(255,255,255,0.03); color:var(--accent-2); cursor:pointer; }}
+    .tree-inline-menu summary::-webkit-details-marker {{ display:none; }}
+    .tree-inline-menu[open] summary {{ background:rgba(77,212,255,0.10); }}
+    .tree-inline-menu-panel {{ position:absolute; right:0; top:calc(100% + 6px); z-index:1200; min-width:220px; padding:8px; border-radius:16px; border:1px solid rgba(77,212,255,0.32); background:#111a36; box-shadow:0 18px 48px rgba(0,0,0,0.45); }}
+    .tree-inline-menu-panel form {{ margin:0; }}
+    .tree-inline-menu-panel button, .tree-inline-menu-panel a {{ width:100%; display:flex; align-items:center; justify-content:flex-start; text-align:left; background:rgba(255,255,255,0.02); color:var(--text); border:none; border-radius:12px; padding:10px 12px; cursor:pointer; font:inherit; }}
+    .tree-inline-menu-panel button:hover, .tree-inline-menu-panel a:hover {{ background:rgba(77,212,255,0.10); text-decoration:none; }}
+    .tree-inline-menu-panel .danger-action {{ color:#ffb4b4; }}
+    .tree-inline-menu-panel .danger-action:hover {{ background:rgba(255,123,123,0.12); }}
     .context-menu {{ position:absolute; z-index:1000; min-width:220px; padding:8px; border-radius:16px; border:1px solid rgba(77,212,255,0.32); background:#111a36; box-shadow:0 18px 48px rgba(0,0,0,0.45); display:none; pointer-events:auto; }}
     .context-menu.open {{ display:block; }}
     .context-menu form {{ margin:0; }}
@@ -3973,16 +3985,16 @@ def _render_app_page(
       }});
     }};
 
-    document.querySelectorAll('.document-action-menu-button').forEach((button) => {{
-      button.addEventListener('click', (event) => {{
-        event.preventDefault();
-        event.stopPropagation();
-        const menu = button.parentElement?.querySelector('.document-action-menu');
-        const wasOpen = menu?.classList.contains('open');
-        closeDocumentActionMenus();
-        if (menu && !wasOpen) {{
+    document.querySelectorAll('.document-action-details').forEach((details) => {{
+      details.addEventListener('toggle', () => {{
+        const menu = details.querySelector('.document-action-menu');
+        if (!menu) return;
+        if (details.open) {{
           menu.classList.add('open');
           menu.setAttribute('aria-hidden', 'false');
+        }} else {{
+          menu.classList.remove('open');
+          menu.setAttribute('aria-hidden', 'true');
         }}
       }});
     }});
@@ -4128,7 +4140,7 @@ def _render_app_page(
     if (window.location.hash === '#metadata-workbench') openMetadataWorkbench();
 
     document.querySelectorAll('[data-menu]').forEach((node) => {{
-      const trigger = node.querySelector('.tree-menu-button');
+      const trigger = node.querySelector('button.tree-menu-button');
       if (!trigger || !treeContextMenu) return;
       trigger.addEventListener('click', (event) => {{
         event.preventDefault();
@@ -4161,6 +4173,7 @@ def _render_app_page(
     document.addEventListener('click', (event) => {{
       if (!event.target.closest('.document-card-actions')) {{
         closeDocumentActionMenus();
+        document.querySelectorAll('.document-action-details[open]').forEach((details) => details.removeAttribute('open'));
       }}
       if (!treeContextMenu) return;
       if (!treeContextMenu.contains(event.target)) {{
@@ -4210,6 +4223,30 @@ def _render_app_page(
         treeContextMenu.setAttribute('aria-hidden', 'true');
       }});
     }}
+
+    document.querySelectorAll('.tree-inline-menu button[data-action]').forEach((button) => {{
+      button.addEventListener('click', (event) => {{
+        event.preventDefault();
+        event.stopPropagation();
+        const action = button.dataset.action;
+        const kind = button.dataset.kind || '';
+        const id = button.dataset.id || '';
+        const label = button.dataset.label || '';
+        const documentTypeId = button.dataset.documentTypeId || '';
+        if (action === 'new-cabinet') openQuickCreate('cabinet', kind, id, label);
+        if (action === 'new-register') openQuickCreate('register', kind, id, label);
+        if (action === 'edit-metadata') openMetadataWorkbench();
+        if (action === 'new-document') {{
+          const url = new URL(window.location.href);
+          if (documentTypeId) url.searchParams.set('selected_document_type_id', documentTypeId);
+          if (kind) url.searchParams.set('node_kind', kind);
+          if (id) url.searchParams.set('node_id', id);
+          url.hash = 'intake-form';
+          window.location.href = url.toString();
+        }}
+        if (action === 'new-cabinet-type') window.location.href = '/ui/admin';
+      }});
+    }});
 
     if (documentTypeSelect) {{
       documentTypeSelect.addEventListener('change', (event) => {{
@@ -5615,12 +5652,37 @@ def _render_archive_tree(
     selected_kind = selected_node.get("kind") if selected_node else None
     selected_id = selected_node.get("id") if selected_node else None
 
+    def inline_menu(menu: list[dict[str, str]], href: str) -> str:
+        items: list[str] = []
+        for action in menu:
+            title = _escape(action.get("title", "Aktion"))
+            action_name = _escape(action.get("action", ""))
+            kind = _escape(action.get("kind", ""))
+            action_id = _escape(action.get("id", ""))
+            label = _escape(action.get("label", ""))
+            doc_type_id = _escape(action.get("document_type_id", ""))
+            doc_type_name = _escape(action.get("document_type_name", ""))
+            if action.get("action") == "delete-node" and action.get("kind") in {"cabinet", "register"} and action.get("id"):
+                items.append(
+                    f'<form method="post" action="/ui/app/{kind}s/{action_id}/delete" data-tree-delete-form>'
+                    f'<input type="hidden" name="return_to" value="{_escape(href)}">'
+                    f'<button type="submit" class="danger-action">{title}</button>'
+                    f'</form>'
+                )
+            else:
+                items.append(
+                    f'<button type="button" data-action="{action_name}" data-kind="{kind}" data-id="{action_id}" data-label="{label}" data-document-type-id="{doc_type_id}" data-document-type-name="{doc_type_name}">{title}</button>'
+                )
+        if not items:
+            items.append("<div class='context-menu-empty'>Keine passenden Objekte definiert</div>")
+        return f'<details class="tree-inline-menu"><summary class="tree-menu-button">⋯</summary><div class="tree-inline-menu-panel">{"".join(items)}</div></details>'
+
     def node_link(kind: str, node_id: str, label: str, depth: int = 0, menu: list[dict[str, str]] | None = None) -> str:
         active = " active" if selected_kind == kind and selected_id == node_id else ""
         just_created = " just-created" if selected_kind == kind and selected_id == node_id else ""
         href = f"/ui/app?node_kind={kind}&node_id={node_id}"
         menu_attr = f" data-menu='{_escape(json.dumps(menu or [], ensure_ascii=False))}'" if menu is not None else ""
-        menu_button = "<div class='tree-actions'><button type='button' class='tree-menu-button'>⋯</button><a class='tree-tab-link' href='{}' target='_blank' rel='noopener noreferrer'>↗</a></div>".format(href) if menu is not None else f'<a class="tree-tab-link" href="{href}" target="_blank" rel="noopener noreferrer">↗</a>'
+        menu_button = f"<div class='tree-actions'>{inline_menu(menu or [], href)}<a class='tree-tab-link' href='{href}' target='_blank' rel='noopener noreferrer'>↗</a></div>" if menu is not None else f'<a class="tree-tab-link" href="{href}" target="_blank" rel="noopener noreferrer">↗</a>'
         return (
             f'<div class="tree-node depth-{depth}{active}{just_created}"{menu_attr}>'
             f'<a class="tree-link" href="{href}">{_escape(label)}</a>'
@@ -5740,7 +5802,8 @@ def _render_document_object_card(document: Document, href: str) -> str:
         f'<a class="document-card-main" href="{safe_href}"><strong>{type_icon} {safe_title}</strong><div class="muted">{safe_name}</div></a>'
         f'<div class="document-card-actions">'
         f'<div class="meta-pill">{_escape(status_icon)} {_escape(status_label)}</div>'
-        f'<button type="button" class="document-action-menu-button" data-document-id="{safe_document_id}" data-document-title="{safe_title}" aria-label="Aktionen für {safe_title}">Aktionen ⋯</button>'
+        f'<details class="document-action-details">'
+        f'<summary class="document-action-menu-button" data-document-id="{safe_document_id}" data-document-title="{safe_title}" aria-label="Aktionen für {safe_title}">Aktionen ⋯</summary>'
         f'<div class="context-menu document-action-menu" aria-hidden="true">'
         f'<form method="post" action="/ui/app/documents/{safe_document_id}/delete" data-document-delete-form>'
         f'<input type="hidden" name="return_to" value="{safe_href}">'
@@ -5749,6 +5812,7 @@ def _render_document_object_card(document: Document, href: str) -> str:
         f'<a href="{safe_href}">Öffnen</a>'
         f'<a href="/ui/app/documents/{safe_document_id}">Details öffnen</a>'
         f'</div>'
+        f'</details>'
         f'</div>'
         f'</div>'
         f'<a class="document-card-main" href="{safe_href}">'
