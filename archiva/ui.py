@@ -4173,6 +4173,8 @@ def _render_app_page(
       treeContextMenu.addEventListener('click', (event) => {{
         const button = event.target.closest('button[data-action]');
         if (!button) return;
+        event.preventDefault();
+        event.stopPropagation();
         const action = button.dataset.action;
         const kind = button.dataset.kind || '';
         const id = button.dataset.id || '';
@@ -4182,8 +4184,18 @@ def _render_app_page(
         if (action === 'new-register') openQuickCreate('register', kind, id, label);
         if (action === 'edit-metadata') openMetadataWorkbench();
         if (action === 'delete-node') {{
-          const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
-          window.location.href = `/ui/app/${{kind}}s/${{id}}/delete?return_to=${{returnTo}}`;
+          if (!kind || !id) return;
+          if (!window.confirm(`${{label || 'Objekt'}} in den Papierkorb verschieben?`)) return;
+          const form = document.createElement('form');
+          form.method = 'post';
+          form.action = `/ui/app/${{kind}}s/${{id}}/delete`;
+          const returnInput = document.createElement('input');
+          returnInput.type = 'hidden';
+          returnInput.name = 'return_to';
+          returnInput.value = window.location.pathname + window.location.search;
+          form.appendChild(returnInput);
+          document.body.appendChild(form);
+          form.submit();
         }}
         if (action === 'new-document') {{
           const url = new URL(window.location.href);
@@ -5730,7 +5742,10 @@ def _render_document_object_card(document: Document, href: str) -> str:
         f'<div class="meta-pill">{_escape(status_icon)} {_escape(status_label)}</div>'
         f'<button type="button" class="document-action-menu-button" data-document-id="{safe_document_id}" data-document-title="{safe_title}" aria-label="Aktionen für {safe_title}">Aktionen ⋯</button>'
         f'<div class="context-menu document-action-menu" aria-hidden="true">'
-        f'<a class="danger-action" href="/ui/app/documents/{safe_document_id}/delete?return_to={quote_plus(href)}">Löschen</a>'
+        f'<form method="post" action="/ui/app/documents/{safe_document_id}/delete" data-document-delete-form>'
+        f'<input type="hidden" name="return_to" value="{safe_href}">'
+        f'<button type="submit" class="danger-action" data-document-action="delete" data-document-id="{safe_document_id}">Löschen</button>'
+        f'</form>'
         f'<a href="{safe_href}">Öffnen</a>'
         f'<a href="/ui/app/documents/{safe_document_id}">Details öffnen</a>'
         f'</div>'
