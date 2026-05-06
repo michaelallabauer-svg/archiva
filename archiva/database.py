@@ -38,6 +38,7 @@ def create_tables() -> None:
     with _engine.begin() as conn:
         bootstrap_lock_key = int(hashlib.sha1(b"archiva:create_tables:v1").hexdigest()[:15], 16)
         conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": bootstrap_lock_key})
+        _ensure_postgres_enum_types(conn)
         Base.metadata.create_all(bind=conn)
         _ensure_identity_tables(conn)
         _ensure_document_cabinet_column(conn)
@@ -45,6 +46,23 @@ def create_tables() -> None:
         _ensure_soft_delete_columns(conn)
         _ensure_definition_model_columns(conn)
         _ensure_search_indexing_columns(conn)
+
+
+def _ensure_postgres_enum_types(conn) -> None:
+    """Create PostgreSQL enum types used by models before create_all."""
+    conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'previewjobstatus') THEN
+                    CREATE TYPE previewjobstatus AS ENUM ('pending', 'processing', 'completed', 'failed');
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
 
 
 def _ensure_identity_tables(conn) -> None:

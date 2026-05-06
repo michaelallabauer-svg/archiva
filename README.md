@@ -149,7 +149,33 @@ Check it with:
 curl http://localhost:9200
 ```
 
-### 7. Start Archiva
+### 7. One-command empty local install
+
+For a fresh, empty and working local system, use the install script:
+
+```bash
+scripts/install-empty-system.sh --reset-db --admin-password 'change-me'
+```
+
+What it does:
+
+- installs Python dependencies with `uv sync --dev`
+- writes a fresh `config.yaml` with PDFStampede enabled
+- drops/recreates the configured PostgreSQL database when `--reset-db` is used
+- creates the Archiva schema and stamps Alembic at `head`
+- creates one initial Admin user
+
+Useful options:
+
+```bash
+scripts/install-empty-system.sh --reset-db --with-opensearch --start
+scripts/install-empty-system.sh --reset-db --admin-email admin@example.local --admin-password 'change-me'
+scripts/install-empty-system.sh --help
+```
+
+If no admin password is provided, the first bootstrap login uses an empty password. Set a real password immediately in `Admin → Identity & Rollen`.
+
+### 8. Start Archiva
 
 Recommended:
 
