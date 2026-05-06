@@ -29,6 +29,7 @@ from archiva.config import load_settings
 from archiva.metadata_validation import metadata_from_json, validate_document_metadata, MetadataValidationError
 from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowHistoryEvent, WorkflowInstance, WorkflowStepDefinition, WorkflowTask, WorkflowTransitionDefinition
 from archiva.preview_queue import enqueue_preview_job, get_latest_preview_artifact, get_latest_preview_job
+from archiva.pdf_stampede import PdfStampedeError, list_pdf_stampede_templates, stamp_pdf_with_pdf_stampede
 from archiva.indexer.dispatcher import enqueue_document_index
 from archiva.indexer.status import indexing_runtime_status
 from archiva.search.service import SearchService
@@ -2111,6 +2112,66 @@ async def ui_app_document_download(
     return FileResponse(path=full_path, filename=document.name, media_type=document.mime_type or "application/octet-stream")
 
 
+@router.get("/app/documents/{document_id}/stamped-pdf")
+async def ui_app_document_stamped_pdf(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    document = _active_documents_query(db).where(Document.id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not document.stamped_pdf_storage_path:
+        raise HTTPException(status_code=404, detail="Stamped PDF not found")
+
+    settings = load_settings("config.yaml")
+    storage = StorageManager(settings.storage.base_path)
+    full_path = storage.full_path(Path(document.stamped_pdf_storage_path))
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="Stamped PDF file not found")
+
+    filename = f"stamped-{document.name or document.id}.pdf"
+    return FileResponse(path=full_path, filename=filename, media_type="application/pdf")
+
+
+def _try_stamp_pdf_for_document(
+    *,
+    settings: Any,
+    storage: StorageManager,
+    document: Document,
+    document_type: DocumentType,
+) -> None:
+    if document.doc_type != DocType.PDF:
+        document.stamp_status = "skipped_not_pdf"
+        return
+    if (document_type.file_type or "").lower() != DocType.PDF.value:
+        document.stamp_status = "skipped_document_type_not_pdf"
+        return
+    if not document_type.pdf_stampede_auto_stamp:
+        return
+
+    document.stamp_status = "pending"
+    source_path = storage.full_path(Path(document.storage_path))
+    try:
+        stamped_bytes = stamp_pdf_with_pdf_stampede(
+            settings=settings,
+            source_pdf_path=source_path,
+            document=document,
+            document_type=document_type,
+        )
+        stamped_relative_path = storage.generate_path(f"stamped-{Path(document.name or 'document.pdf').stem}.pdf")
+        stamped_full_path = storage.full_path(stamped_relative_path)
+        stamped_full_path.parent.mkdir(parents=True, exist_ok=True)
+        stamped_full_path.write_bytes(stamped_bytes)
+        document.stamped_pdf_storage_path = str(stamped_relative_path)
+        document.stamp_status = "ready"
+        document.stamp_template_id = document_type.pdf_stampede_template_id or settings.pdf_stampede.default_template_id
+        document.stamp_error = None
+    except PdfStampedeError as exc:
+        document.stamp_status = "failed"
+        document.stamp_template_id = document_type.pdf_stampede_template_id or settings.pdf_stampede.default_template_id
+        document.stamp_error = str(exc)
+
+
 @router.get("/preview/documents/{document_id}/status", response_model=PreviewStatusResponse)
 async def ui_preview_document_status(
     document_id: UUID,
@@ -2309,6 +2370,14 @@ async def ui_app_intake(
 
     extracted_text = None
 
+    if document_type.pdf_stampede_auto_stamp:
+        _try_stamp_pdf_for_document(
+            settings=settings,
+            storage=storage,
+            document=document,
+            document_type=document_type,
+        )
+
     enqueue_preview_job(db, document)
     db.commit()
     db.refresh(document)
@@ -2317,6 +2386,10 @@ async def ui_app_intake(
     success_message = "Dokument erfolgreich gespeichert, Preview-Rendering und Volltextindexierung eingereiht"
     if not extracted_text:
         success_message = "Dokument gespeichert, Preview-Rendering eingereiht. Kein extrahierbarer Text für Volltext gefunden"
+    if document.stamp_status == "ready":
+        success_message += " · PDF wurde automatisch gestempelt"
+    elif document.stamp_status == "failed":
+        success_message += " · PDF-Stempelung fehlgeschlagen, Details im Dokument"
 
     return _ui_redirect_with_message(
         _app_message_url(document_type_id, message=success_message)
@@ -3216,6 +3289,9 @@ async def ui_create_document_type(
     name: str = Form(...),
     description: str = Form(""),
     icon: str = Form(""),
+    file_type: str = Form(""),
+    pdf_stampede_auto_stamp: str | None = Form(None),
+    pdf_stampede_template_id: str = Form(""),
     order: int = Form(0),
     db: Session = Depends(get_db),
 ) -> RedirectResponse:
@@ -3251,6 +3327,9 @@ async def ui_create_document_type(
         name=name.strip(),
         description=description.strip() or None,
         icon=icon.strip() or None,
+        file_type=file_type.strip() or None,
+        pdf_stampede_auto_stamp=bool(pdf_stampede_auto_stamp) and file_type.strip() == DocType.PDF.value,
+        pdf_stampede_template_id=pdf_stampede_template_id.strip() or None,
         order=order,
     )
     db.add(document_type)
@@ -5630,6 +5709,7 @@ def _render_document_detail_page(
           <div class="detail-row"><div class="detail-key">Dokumenttyp</div><div class="detail-value">{_escape(document_type_label)}</div></div>
           <div class="detail-row"><div class="detail-key">Cabinet</div><div class="detail-value">{_escape(current_cabinet_label)}</div></div>
           <div class="detail-row"><div class="detail-key">Interner Dateityp</div><div class="detail-value">{_escape(str(document.doc_type))}</div></div>
+          <div class="detail-row"><div class="detail-key">Stempelstatus</div><div class="detail-value">{_escape(document.stamp_status or '—')}{' · Vorlage ' + _escape(document.stamp_template_id) if document.stamp_template_id else ''}{'<br><span class="muted">' + _escape(document.stamp_error) + '</span>' if document.stamp_error else ''}</div></div>
           <div class="detail-row"><div class="detail-key">Dokument-ID</div><div class="detail-value"><pre>{_escape(str(document.id))}</pre></div></div>
         </div>
         <div class="panel">
@@ -5647,11 +5727,18 @@ def _render_document_detail_page(
 
 def _render_document_preview(document: Document, download_link: str) -> str:
     preview_link = f"/ui/preview/documents/{document.id}"
+    stamped_action = ""
+    if document.stamp_status == "ready" and document.stamped_pdf_storage_path:
+        stamped_action = f'<a class="button primary" href="/ui/app/documents/{document.id}/stamped-pdf" target="_blank" rel="noopener noreferrer">Gestempeltes PDF öffnen</a>'
+    elif document.stamp_status == "failed":
+        stamped_action = f'<span class="pill">PDF-Stempelung fehlgeschlagen: {_escape(document.stamp_error or "unbekannter Fehler")}</span>'
+    elif document.stamp_status in {"pending", "skipped_not_pdf", "skipped_document_type_not_pdf"}:
+        stamped_action = f'<span class="pill">Stempelstatus: {_escape(document.stamp_status)}</span>'
     return (
         '<div class="preview-shell">'
         f'<iframe class="preview-frame" src="{preview_link}" title="Dokumentvorschau"></iframe>'
         '</div>'
-        f'<div class="actions"><a class="button" href="{download_link}" target="_blank" rel="noopener noreferrer">Original herunterladen</a></div>'
+        f'<div class="actions"><a class="button" href="{download_link}" target="_blank" rel="noopener noreferrer">Original herunterladen</a>{stamped_action}</div>'
     )
 
 
@@ -6272,6 +6359,9 @@ def _render_admin_summary(selected_document_type: DocumentType | None) -> str:
     cabinet_fields_html = render_field_list(sorted(cabinet.metadata_fields, key=lambda item: item.order)) if cabinet else "<li>Kein Cabinet zugeordnet.</li>"
     register_fields_html = render_field_list(sorted(register.metadata_fields, key=lambda item: item.order)) if register else "<li>Kein Register zugeordnet.</li>"
     document_fields_html = render_field_list(sorted(selected_document_type.fields, key=lambda item: item.order))
+    file_type_label = selected_document_type.file_type or "beliebig"
+    stamp_status_label = "aktiv" if selected_document_type.pdf_stampede_auto_stamp else "aus"
+    stamp_template_label = selected_document_type.pdf_stampede_template_id or "—"
 
     return f"""
       <p><strong>{selected_document_type.name}</strong></p>
@@ -6283,6 +6373,9 @@ def _render_admin_summary(selected_document_type: DocumentType | None) -> str:
         <span class="pill">Cabinet: {cabinet.name if cabinet else '—'}</span>
         <span class="pill">Register: {register.name if register else 'direkt am Cabinet'}</span>
         <span class="pill">Icon: {selected_document_type.icon or '📄'}</span>
+        <span class="pill">Dateityp: {file_type_label}</span>
+        <span class="pill">PDFStampede: {stamp_status_label}</span>
+        <span class="pill">Vorlage: {stamp_template_label}</span>
       </div>
       <form method="post" action="/ui/admin/document-types/{selected_document_type.id}/seed-invoice" style="margin:16px 0;">
         <button class="primary" type="submit">Standardfelder für Rechnung anlegen</button>
@@ -7456,6 +7549,14 @@ def _render_admin_create_panel(
     document_type_field_options = _admin_document_type_options(cabinet_types, cabinets, selected_document_type)
     field_type_options = "".join(f'<option value="{value}">{value}</option>' for value in ["text", "number", "currency", "date", "datetime", "selection", "multi_selection", "identity_reference", "auto_id", "boolean", "long_text", "url", "email", "phone"])
     width_options = "".join(f'<option value="{value}">{value}</option>' for value in ["full", "half", "third", "quarter"])
+    settings = load_settings("config.yaml")
+    stamp_templates = list_pdf_stampede_templates(settings)
+    stamp_template_options = _option_list(
+        [(str(item.get("id") or ""), str(item.get("name") or item.get("id") or "")) for item in stamp_templates if item.get("id")],
+        include_blank=("PDFStampede deaktiviert/nicht erreichbar" if not settings.pdf_stampede.enabled else "Bitte wählen"),
+    )
+    if settings.pdf_stampede.enabled and not stamp_templates:
+        stamp_template_options = '<option value="">Keine Vorlagen geladen — Template-ID manuell eintragen</option>'
 
     selected_cabinet_type = next((ct for ct in cabinet_types if str(ct.id) == selected_definition_id), None) if selected_definition_kind == "cabinet_type" else None
     selected_register_type = next((rt for ct in cabinet_types for rt in ct.register_types if str(rt.id) == selected_definition_id), None) if selected_definition_kind == "register_type" else None
@@ -7569,7 +7670,7 @@ def _render_admin_create_panel(
         <option value="🖇️">🖇️ Kettenglied</option>
     </select>
     <p class="hint">Wähle ein Icon aus oder lasse leer für das Standard-Dokument-Icon (📄)</p>
-</div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Dokumenttyp speichern</button></div></form>
+</div><div class="field"><label>Dateityp</label><select name="file_type"><option value="">Beliebig</option><option value="pdf">PDF</option><option value="image">Bild</option><option value="text">Text</option><option value="doc">Office/Dokument</option><option value="other">Sonstige</option></select><p class="hint">Für PDFStampede bitte PDF wählen.</p></div><div class="field"><label>PDFStampede-Vorlage / Template-ID</label><input list="pdf-stampede-template-list" name="pdf_stampede_template_id" placeholder="eingangsrechnung-standard"><datalist id="pdf-stampede-template-list">{stamp_template_options}</datalist><p class="hint">Vorlagen kommen aus PDFStampede; die ID kann auch manuell eingetragen werden.</p></div><div class="field"><label><input type="checkbox" name="pdf_stampede_auto_stamp" value="1"> PDFs automatisch stempeln</label><p class="hint">Wird beim Erfassen/Upload ausgeführt, Original bleibt unverändert.</p></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Dokumenttyp speichern</button></div></form>
 
         <form method="post" action="/ui/admin/cabinets" class="panel admin-create-section" id="admin-form-cabinet" style="display:none; margin-bottom:0;"><h3>Cabinet anlegen</h3><p class="muted">Lege ein konkretes Cabinet innerhalb eines Cabinettyps an, z. B. 2025 oder 2026 unter ERB.</p><div class="field-grid"><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id" required>{cabinet_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Cabinet speichern</button></div></form>
 

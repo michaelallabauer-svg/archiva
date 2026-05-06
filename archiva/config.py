@@ -48,6 +48,16 @@ class AppSettings(BaseSettings):
     md5_duplicate_check: bool = Field(default=True, description="Globale MD5-Duplikatprüfung beim Dokument-Upload")
 
 
+class PdfStampedeSettings(BaseSettings):
+    """External PDFStampede integration settings."""
+
+    enabled: bool = False
+    base_url: str = "http://localhost:8001"
+    default_template_id: str | None = None
+    timeout_seconds: int = 30
+    store_mode: str = "artifact"
+
+
 class Settings(BaseSettings):
     """Root settings container."""
 
@@ -55,6 +65,7 @@ class Settings(BaseSettings):
     storage: StorageSettings = Field(default_factory=StorageSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     app: AppSettings = Field(default_factory=AppSettings)
+    pdf_stampede: PdfStampedeSettings = Field(default_factory=PdfStampedeSettings)
 
     @classmethod
     def from_yaml(cls, path: Path) -> "Settings":

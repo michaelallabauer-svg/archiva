@@ -19,3 +19,10 @@ search:
   engine: "opensearch"
   opensearch_url: "http://localhost:9200"
   index_name: "archiva-documents-v1"
+
+pdf_stampede:
+  enabled: true
+  base_url: "http://localhost:8001"
+  default_template_id: ""
+  timeout_seconds: 30
+  store_mode: "artifact"

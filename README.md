@@ -330,6 +330,30 @@ search:
   engine: "opensearch"
   opensearch_url: "http://localhost:9200"
   index_name: "archiva-documents-v1"
+
+pdf_stampede:
+  enabled: true
+  base_url: "http://localhost:8001"
+  default_template_id: ""
+  timeout_seconds: 30
+  store_mode: "artifact"
+```
+
+### PDFStampede integration
+
+Archiva can use an external PDFStampede service to stamp uploaded PDFs automatically.
+Enable `pdf_stampede` in `config.yaml`, then create a document type in `/ui/admin` with:
+
+- **Dateityp:** `PDF`
+- **PDFStampede-Vorlage / Template-ID:** the template id from PDFStampede, e.g. `eingangsrechnung-standard`
+- **PDFs automatisch stempeln:** checked
+
+During intake Archiva keeps the original PDF unchanged, calls PDFStampede at `/pdf-stamps/render`, stores the stamped PDF as a separate artifact, and exposes it on the document detail page via **Gestempeltes PDF öffnen**. If PDFStampede is unreachable, the document is still saved and the error is shown as the stamp status.
+
+Run the database migration after pulling this feature:
+
+```bash
+uv run alembic upgrade head
 ```
 
 ## Roadmap / Vision

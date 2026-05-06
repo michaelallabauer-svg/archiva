@@ -270,7 +270,10 @@ class DocumentType(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     icon: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    file_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     md5_duplicate_check: Mapped[bool] = mapped_column(default=True, nullable=False)
+    pdf_stampede_auto_stamp: Mapped[bool] = mapped_column(default=False, nullable=False)
+    pdf_stampede_template_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
@@ -867,6 +870,10 @@ class Document(Base):
     index_ocr_used: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     file_hash: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    stamped_pdf_storage_path: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    stamp_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    stamp_template_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stamp_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Relationships
     document_type: Mapped[Optional["DocumentType"]] = relationship(
