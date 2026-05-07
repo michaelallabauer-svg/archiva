@@ -9,7 +9,7 @@ import os
 import re
 import time
 from html import escape
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -1785,6 +1785,45 @@ async def ui_app_workflow_inbox(
         for document in db.query(Document).where(Document.id.in_(document_ids), Document.deleted_at.is_(None)).all()
     } if document_ids else {}
     return HTMLResponse(content=_render_workflow_inbox_page(tasks, active_count, documents_by_id))
+
+
+@router.get("/app/invoices/dashboard", response_class=HTMLResponse)
+async def ui_app_invoice_dashboard(
+    status: str | None = None,
+    year: str | None = None,
+    supplier: str | None = None,
+    due: str | None = None,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    invoice_types = db.query(DocumentType).where(DocumentType.name == "Rechnung").all()
+    invoice_type_ids = [doc_type.id for doc_type in invoice_types]
+    documents = (
+        _active_documents_query(db)
+        .where(Document.document_type_id.in_(invoice_type_ids))
+        .order_by(Document.created_at.desc())
+        .all()
+        if invoice_type_ids
+        else []
+    )
+    document_ids = [document.id for document in documents]
+    instances = (
+        db.query(WorkflowInstance)
+        .where(WorkflowInstance.subject_kind == "document", WorkflowInstance.subject_id.in_(document_ids))
+        .order_by(WorkflowInstance.started_at.desc())
+        .all()
+        if document_ids
+        else []
+    )
+    instances_by_document: dict[str, list[WorkflowInstance]] = {}
+    for instance in instances:
+        instances_by_document.setdefault(str(instance.subject_id), []).append(instance)
+    return HTMLResponse(
+        content=_render_invoice_dashboard_page(
+            documents,
+            instances_by_document,
+            filters={"status": status or "", "year": year or "", "supplier": supplier or "", "due": due or ""},
+        )
+    )
 
 
 def _workflow_app_redirect(document_id: UUID, message: str | None = None) -> RedirectResponse:
@@ -4809,6 +4848,167 @@ a {{ color:var(--accent-2); text-decoration:none; }} .muted {{ color:var(--muted
 </div></body></html>"""
 
 
+def _invoice_metadata(document: Document) -> dict[str, Any]:
+    return metadata_from_json(document.metadata_json) or {}
+
+
+def _invoice_workflow_status(document: Document, instances_by_document: dict[str, list[WorkflowInstance]]) -> str:
+    instances = instances_by_document.get(str(document.id), [])
+    active = next((instance for instance in instances if instance.status == "active"), None)
+    if active and active.current_step:
+        return active.current_step.name
+    latest = instances[0] if instances else None
+    if latest and latest.status == "completed":
+        return "Abgeschlossen"
+    if latest and latest.status == "cancelled":
+        return "Abgebrochen"
+    metadata = _invoice_metadata(document)
+    return str(metadata.get("invoice_status") or "Ohne Workflow")
+
+
+def _parse_invoice_date(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text_value = str(value)[:10]
+    try:
+        return datetime.strptime(text_value, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _invoice_amount(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(str(value).replace(".", "").replace(",", "."))
+    except ValueError:
+        return 0.0
+
+
+def _invoice_query(filters: dict[str, str], **updates: str) -> str:
+    merged = {**filters, **updates}
+    parts = [f"{key}={quote_plus(value)}" for key, value in merged.items() if value]
+    return f"?{'&'.join(parts)}" if parts else ""
+
+
+def _render_invoice_dashboard_page(
+    documents: list[Document],
+    instances_by_document: dict[str, list[WorkflowInstance]],
+    *,
+    filters: dict[str, str],
+) -> str:
+    enriched: list[dict[str, Any]] = []
+    today = datetime.utcnow().date()
+    for document in documents:
+        metadata = _invoice_metadata(document)
+        workflow_status = _invoice_workflow_status(document, instances_by_document)
+        due_date = _parse_invoice_date(metadata.get("due_date"))
+        invoice_date = _parse_invoice_date(metadata.get("invoice_date"))
+        supplier = str(metadata.get("supplier_name") or "—")
+        year_value = str(metadata.get("business_year") or (invoice_date.year if invoice_date else document.created_at.year))
+        gross_amount = _invoice_amount(metadata.get("gross_amount"))
+        enriched.append(
+            {
+                "document": document,
+                "metadata": metadata,
+                "workflow_status": workflow_status,
+                "supplier": supplier,
+                "year": year_value,
+                "due_date": due_date,
+                "invoice_date": invoice_date,
+                "gross_amount": gross_amount,
+                "currency": str(metadata.get("currency") or "EUR"),
+            }
+        )
+
+    def matches(item: dict[str, Any]) -> bool:
+        if filters.get("status") and item["workflow_status"] != filters["status"]:
+            return False
+        if filters.get("year") and item["year"] != filters["year"]:
+            return False
+        if filters.get("supplier") and filters["supplier"].lower() not in item["supplier"].lower():
+            return False
+        if filters.get("due") == "overdue" and not (item["due_date"] and item["due_date"].date() < today and item["workflow_status"] != "Abgeschlossen"):
+            return False
+        if filters.get("due") == "next7" and not (item["due_date"] and today <= item["due_date"].date() <= today + timedelta(days=7)):
+            return False
+        return True
+
+    filtered = [item for item in enriched if matches(item)]
+    total_amount = sum(item["gross_amount"] for item in filtered)
+    status_order = ["Erfasst", "Sachliche Prüfung", "Zurückgewiesen", "Freigabe", "Buchhaltung / Verbuchung", "Abgeschlossen", "Ohne Workflow"]
+    status_counts = {status_name: 0 for status_name in status_order}
+    for item in enriched:
+        status_counts[item["workflow_status"]] = status_counts.get(item["workflow_status"], 0) + 1
+    overdue_count = sum(1 for item in enriched if item["due_date"] and item["due_date"].date() < today and item["workflow_status"] != "Abgeschlossen")
+    due7_count = sum(1 for item in enriched if item["due_date"] and today <= item["due_date"].date() <= today + timedelta(days=7))
+    years = sorted({item["year"] for item in enriched if item["year"]}, reverse=True)
+    year_options = '<option value="">Alle Jahre</option>' + ''.join(f'<option value="{_escape(year)}" {"selected" if filters.get("year") == year else ""}>{_escape(year)}</option>' for year in years)
+    status_options = '<option value="">Alle Status</option>' + ''.join(
+        f'<option value="{_escape(status_name)}" {"selected" if filters.get("status") == status_name else ""}>{_escape(status_name)}</option>'
+        for status_name in status_counts.keys()
+        if status_counts[status_name]
+    )
+    due_options = "".join(
+        f'<option value="{value}" {"selected" if filters.get("due") == value else ""}>{label}</option>'
+        for value, label in [("", "Alle Fälligkeiten"), ("overdue", "Überfällig"), ("next7", "Fällig in 7 Tagen")]
+    )
+    status_cards = "".join(
+        f'<a class="stat-card" href="/ui/app/invoices/dashboard{_invoice_query(filters, status=status_name)}"><span>{_escape(status_name)}</span><strong>{count}</strong></a>'
+        for status_name, count in status_counts.items()
+        if count or status_name in status_order[:6]
+    )
+    rows = "".join(
+        _render_invoice_dashboard_row(item)
+        for item in sorted(filtered, key=lambda item: (item["due_date"] or datetime.max, item["supplier"].lower()))
+    ) or '<tr><td colspan="8" class="muted">Keine Eingangsrechnungen für diese Filter.</td></tr>'
+    return f"""<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archiva Eingangsrechnungen Dashboard</title><link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+<style>
+:root {{ color-scheme:dark; --bg:#0b1020; --panel:#121933; --text:#eef2ff; --muted:#a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; --success:#6ee7b7; --danger:#ff7b7b; }}
+body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, sans-serif; background:radial-gradient(circle at top left, rgba(77,212,255,0.08), transparent 30%), var(--bg); color:var(--text); }}
+.page {{ max-width:1320px; margin:0 auto; padding:18px; }}
+.panel, .stat-card {{ background:linear-gradient(180deg, rgba(18,25,51,.96), rgba(15,22,48,.96)); border:1px solid rgba(77,212,255,.10); border-radius:18px; padding:16px; box-shadow:0 18px 48px rgba(0,0,0,.28); }}
+a {{ color:var(--accent-2); text-decoration:none; }} .muted {{ color:var(--muted); }} .eyebrow {{ letter-spacing:.12em; text-transform:uppercase; font-size:.76rem; color:var(--accent-2); font-weight:700; }}
+.hero {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; margin-bottom:14px; }} .pillbar, .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+.pill, .service-badge {{ display:inline-flex; border-radius:999px; padding:7px 11px; background:rgba(77,212,255,.10); border:1px solid rgba(77,212,255,.18); color:var(--text); }}
+.stats-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:14px; }} .stat-card {{ display:flex; justify-content:space-between; gap:12px; align-items:center; color:var(--text); }} .stat-card strong {{ font-size:1.65rem; }}
+.filter-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }} input, select {{ width:100%; box-sizing:border-box; border-radius:12px; border:1px solid rgba(77,212,255,.16); background:rgba(255,255,255,.04); color:var(--text); padding:10px 12px; font:inherit; }} button, .button {{ border:none; border-radius:999px; padding:10px 14px; font:inherit; cursor:pointer; color:white; background:linear-gradient(135deg,var(--accent),var(--accent-2)); }}
+table {{ width:100%; border-collapse:collapse; margin-top:12px; }} th, td {{ border-bottom:1px solid rgba(255,255,255,.08); padding:11px 9px; text-align:left; vertical-align:top; }} th {{ color:#d6fff0; font-size:.85rem; }} tr:hover td {{ background:rgba(77,212,255,.035); }}
+.status-chip {{ display:inline-flex; border-radius:999px; padding:5px 9px; border:1px solid rgba(110,231,183,.18); background:rgba(110,231,183,.08); color:#d6fff0; font-size:.84rem; }} .danger {{ color:#ffcccc; }}
+@media (max-width:900px) {{ .hero, .filter-grid, .stats-grid {{ display:grid; grid-template-columns:1fr; }} table {{ font-size:.9rem; }} }}
+</style></head><body><div class="page">
+<div class="panel hero"><div><div class="eyebrow">Eingangsrechnungen</div><h1 style="margin:4px 0 0;">Dashboard</h1><p class="muted">Offene Rechnungen nach Workflowstatus, Fälligkeit, Lieferant und Geschäftsjahr.</p><div class="pillbar"><a class="pill" href="/ui/app">Zur App</a><a class="pill" href="/ui/app/workflows/inbox">Workflow Inbox</a><span class="pill">{len(enriched)} Rechnungen gesamt</span><span class="pill">{len(filtered)} im Filter</span><span class="pill">Summe: {_escape(f'{total_amount:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.'))} EUR</span></div></div><div><span class="service-badge">{overdue_count} überfällig</span><br><br><span class="service-badge">{due7_count} bald fällig</span></div></div>
+<div class="stats-grid">{status_cards}</div>
+<div class="panel"><form method="get" action="/ui/app/invoices/dashboard"><div class="filter-grid"><select name="status">{status_options}</select><select name="year">{year_options}</select><input type="search" name="supplier" value="{_escape(filters.get('supplier') or '')}" placeholder="Lieferant suchen"><select name="due">{due_options}</select></div><div class="actions"><button type="submit">Filtern</button><a class="pill" href="/ui/app/invoices/dashboard">Zurücksetzen</a><a class="pill" href="/ui/app?selected_document_type_id={_escape(str(documents[0].document_type_id) if documents else '')}#intake-form">Neue Rechnung erfassen</a></div></form></div>
+<div class="panel"><table><thead><tr><th>ER-ID</th><th>Rechnung</th><th>Lieferant</th><th>Betrag</th><th>Fällig</th><th>Workflow</th><th>Index/Stempel</th><th>Aktion</th></tr></thead><tbody>{rows}</tbody></table></div>
+</div></body></html>"""
+
+
+def _render_invoice_dashboard_row(item: dict[str, Any]) -> str:
+    document: Document = item["document"]
+    metadata = item["metadata"]
+    due_date = item["due_date"]
+    today = datetime.utcnow().date()
+    due_label = due_date.strftime("%d.%m.%Y") if due_date else "—"
+    due_class = " danger" if due_date and due_date.date() < today and item["workflow_status"] != "Abgeschlossen" else ""
+    amount = f'{item["gross_amount"]:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+    stamped = " · gestempelt" if document.stamp_status == "ready" else (" · Stempel fehlgeschlagen" if document.stamp_status == "failed" else "")
+    return f"""
+      <tr>
+        <td>{_escape(str(metadata.get('er_id') or '—'))}</td>
+        <td><a href="/ui/app?node_kind=document&node_id={document.id}">{_escape(str(metadata.get('invoice_number') or document.title or document.name))}</a><div class="muted">{_escape(document.name)}</div></td>
+        <td>{_escape(item['supplier'])}</td>
+        <td>{_escape(amount)} {_escape(item['currency'])}</td>
+        <td class="{due_class}">{_escape(due_label)}</td>
+        <td><span class="status-chip">{_escape(item['workflow_status'])}</span></td>
+        <td>{_escape(document.index_status or '—')}{_escape(stamped)}</td>
+        <td><a class="pill" href="/ui/app?node_kind=document&node_id={document.id}&workflow_panel=1#workflow-panel">Öffnen</a></td>
+      </tr>
+    """
+
+
 def _upload_accept_attribute(document_type: DocumentType | None) -> str:
     file_type = (document_type.file_type if document_type else "") or ""
     accept = {
@@ -5253,6 +5453,8 @@ def _render_app_page(
     .context-note {{ margin-top:10px; padding:10px 12px; border-radius:14px; background:rgba(255,255,255,0.03); border:1px solid rgba(77,212,255,0.10); color:var(--muted); font-size:.92rem; }}
     .workflow-inbox-hero-link {{ display:inline-flex; align-items:center; gap:10px; position:absolute; top:16px; right:16px; padding:10px 13px; border-radius:16px; border:1px solid rgba(110,231,183,0.22); background:rgba(110,231,183,0.08); color:var(--text); z-index:1; }}
     .workflow-inbox-hero-link:hover {{ text-decoration:none; border-color:rgba(110,231,183,0.48); box-shadow:0 0 0 4px rgba(110,231,183,0.10); }}
+    .invoice-dashboard-hero-link {{ display:inline-flex; align-items:center; gap:10px; position:absolute; top:78px; right:16px; padding:10px 13px; border-radius:16px; border:1px solid rgba(77,212,255,0.22); background:rgba(77,212,255,0.08); color:var(--text); z-index:1; }}
+    .invoice-dashboard-hero-link:hover {{ text-decoration:none; border-color:rgba(77,212,255,0.48); box-shadow:0 0 0 4px rgba(77,212,255,0.10); }}
     .workflow-count-badge {{ display:inline-grid; place-items:center; min-width:28px; height:28px; padding:0 8px; border-radius:999px; background:rgba(110,231,183,0.20); color:#d6fff0; font-weight:800; }}
     @media (max-width:900px) {{ .workflow-index-grid, .workflow-task-row {{ display:grid; grid-template-columns:1fr; }} }}
     .service-card::before {{ content:""; position:absolute; inset:0; background: linear-gradient(135deg, rgba(79,140,255,0.10), rgba(77,212,255,0.03) 55%, transparent 80%); pointer-events:none; }}
@@ -5308,7 +5510,7 @@ def _render_app_page(
     .compact-checkbox-group {{ padding:10px; gap:6px; }}
     .compact-checkbox-group .checkbox-item {{ padding:6px 8px; }}
     @media (max-width: 1200px) {{ .main-grid, .hero, .workspace-grid {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} }}
-    @media (max-width: 820px) {{ .hero-card {{ padding-right:18px; }} .workflow-inbox-hero-link {{ position:relative; top:auto; right:auto; margin-top:14px; }} }}
+    @media (max-width: 820px) {{ .hero-card {{ padding-right:18px; }} .workflow-inbox-hero-link, .invoice-dashboard-hero-link {{ position:relative; top:auto; right:auto; margin-top:14px; }} }}
   </style>
 </head>
 <body>
@@ -5337,6 +5539,9 @@ def _render_app_page(
         <a class="workflow-inbox-hero-link" href="/ui/app/workflows/inbox">
           <span class="workflow-count-badge">{active_workflow_count}</span>
           <span><strong>Workflow Inbox</strong><br><span class="muted">{_escape(active_workflow_count_label)} momentan</span></span>
+        </a>
+        <a class="invoice-dashboard-hero-link" href="/ui/app/invoices/dashboard">
+          <span><strong>Rechnungsdashboard</strong><br><span class="muted">Status, Fälligkeit, Lieferant</span></span>
         </a>
       </div>
       <div style="height:100%;">
