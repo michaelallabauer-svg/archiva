@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from archiva.indexer.ocr import run_ocr_on_image, run_ocr_on_pdf
+from archiva.indexer.office_extractor import extract_office_text, is_office_document
 from archiva.email_utils import parse_eml
 
 
@@ -27,6 +28,10 @@ def extract_text_for_indexing(storage_path: str, mime_type: str | None = None) -
             return path.read_text(encoding="utf-8", errors="ignore"), False, None
         except OSError:
             return "", False, None
+
+    if is_office_document(path, mime_type):
+        text, engine = extract_office_text(path, mime_type)
+        return text, False, engine
 
     if mime_type == "application/pdf" or lower_name.endswith(".pdf"):
         extracted = _extract_pdf_text(path)
