@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
+import subprocess
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 from io import StringIO
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from sqlalchemy.orm import Session
 
 from archiva.models import Document, PreviewArtifact, PreviewJob, PreviewJobStatus
+from archiva.email_utils import parse_eml, render_email_preview_html
 from archiva.storage import StorageManager
 
 TEXTLIKE_MIME_TYPES = {
@@ -35,8 +41,17 @@ OFFICE_MIME_TYPES = {
     "application/vnd.ms-powerpoint": "PowerPoint-Datei",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint-Datei",
 }
+OFFICE_EXTENSIONS = {
+    ".doc": "Word-Dokument",
+    ".docx": "Word-Dokument",
+    ".xlsx": "Excel-Datei",
+    ".xls": "Excel-Datei",
+    ".pptx": "PowerPoint-Datei",
+    ".ppt": "PowerPoint-Datei",
+}
 CODE_EXTENSIONS = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".md", ".txt", ".yaml", ".yml", ".toml", ".ini", ".sh", ".sql", ".xml", ".json", ".csv"}
 DIRECT_MEDIA_TYPES = {"application/pdf"}
+EMAIL_MIME_TYPES = {"message/rfc822", "application/eml", "application/vnd.ms-outlook"}
 
 
 @dataclass
@@ -146,6 +161,10 @@ def render_preview_payload(path: Path, mime_type: str | None) -> PreviewPayload:
     detected_mime = (mime_type or "application/octet-stream").lower()
     suffix = path.suffix.lower()
 
+    if detected_mime in EMAIL_MIME_TYPES or suffix == ".eml":
+        parsed = parse_eml(path)
+        return PreviewPayload(content=render_email_preview_html(parsed, path.name), media_type="text/html; charset=utf-8", kind="html")
+
     if detected_mime in DIRECT_MEDIA_TYPES or detected_mime.startswith("image/"):
         kind = "pdf" if detected_mime == "application/pdf" else "image"
         return PreviewPayload(content=path.read_bytes(), media_type=detected_mime, kind=kind)
@@ -156,7 +175,10 @@ def render_preview_payload(path: Path, mime_type: str | None) -> PreviewPayload:
     if detected_mime.startswith("text/") or detected_mime in TEXTLIKE_MIME_TYPES or suffix in CODE_EXTENSIONS:
         return PreviewPayload(content=_render_text_preview(path, detected_mime), media_type="text/html; charset=utf-8", kind="html")
 
-    if detected_mime in OFFICE_MIME_TYPES:
+    if detected_mime in OFFICE_MIME_TYPES or suffix in OFFICE_EXTENSIONS:
+        office_pdf = _convert_office_to_pdf(path)
+        if office_pdf:
+            return PreviewPayload(content=office_pdf, media_type="application/pdf", kind="pdf")
         return PreviewPayload(content=_render_office_preview(path, detected_mime), media_type="text/html; charset=utf-8", kind="html")
 
     return PreviewPayload(content=_render_generic_preview(path, detected_mime), media_type="text/html; charset=utf-8", kind="html")
@@ -250,15 +272,159 @@ def _render_csv_preview(path: Path) -> bytes:
 
 
 def _render_office_preview(path: Path, mime_type: str) -> bytes:
-    label = OFFICE_MIME_TYPES.get(mime_type, 'Office-Datei')
-    body = f"""
+    label = OFFICE_MIME_TYPES.get(mime_type) or OFFICE_EXTENSIONS.get(path.suffix.lower(), "Office-Datei")
+    suffix = path.suffix.lower()
+    if suffix == ".docx":
+        body = _render_docx_html(path)
+        subtitle = "Word/Office365 Fallback-Vorschau aus OOXML-Inhalt"
+    elif suffix == ".xlsx":
+        body = _render_xlsx_html(path)
+        subtitle = "Excel/Office365 Fallback-Vorschau aus OOXML-Inhalt"
+    elif suffix == ".pptx":
+        body = _render_pptx_html(path)
+        subtitle = "PowerPoint/Office365 Fallback-Vorschau aus OOXML-Inhalt"
+    else:
+        body = f"""
 <div class=\"meta-list\">
   <div class=\"meta-row\"><div class=\"meta-key\">Erkanntes Format</div><div>{escape(label)}</div></div>
   <div class=\"meta-row\"><div class=\"meta-key\">Dateiname</div><div>{escape(path.name)}</div></div>
-  <div class=\"meta-row\"><div class=\"meta-key\">Status</div><div>Queue-basierte Vorschau vorbereitet, echte Konvertierung noch nicht angeschlossen.</div></div>
+  <div class=\"meta-row\"><div class=\"meta-key\">Status</div><div>Für dieses ältere Binärformat ist LibreOffice/soffice nötig. Wenn es installiert ist, rendert Archiva automatisch als PDF.</div></div>
 </div>
 """
-    return _preview_shell(path.name, body, f"{label} Vorschau")
+        subtitle = f"{label} Vorschau"
+    return _preview_shell(path.name, body, subtitle)
+
+
+def _convert_office_to_pdf(path: Path) -> bytes | None:
+    """Render Office docs through LibreOffice when available."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        return None
+    with tempfile.TemporaryDirectory(prefix="archiva-office-preview-") as tmpdir:
+        tmp_path = Path(tmpdir)
+        try:
+            subprocess.run(
+                [
+                    soffice,
+                    "--headless",
+                    "--nologo",
+                    "--nofirststartwizard",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    str(tmp_path),
+                    str(path),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        pdf_path = tmp_path / f"{path.stem}.pdf"
+        if not pdf_path.exists():
+            candidates = list(tmp_path.glob("*.pdf"))
+            pdf_path = candidates[0] if candidates else pdf_path
+        return pdf_path.read_bytes() if pdf_path.exists() else None
+
+
+def _render_docx_html(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml = archive.read("word/document.xml")
+        root = ET.fromstring(xml)
+        paragraphs = []
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        for paragraph in root.findall(".//w:p", ns):
+            text = "".join(node.text or "" for node in paragraph.findall(".//w:t", ns)).strip()
+            if text:
+                paragraphs.append(f"<p>{escape(text)}</p>")
+        return "".join(paragraphs[:300]) or "<p>Keine Textinhalte gefunden.</p>"
+    except Exception as exc:
+        return _office_fallback_error(path, "DOCX", exc)
+
+
+def _render_xlsx_html(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shared_strings = _xlsx_shared_strings(archive)
+            sheet_names = sorted(name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))
+            if not sheet_names:
+                return "<p>Keine Tabellenblätter gefunden.</p>"
+            sections = []
+            for sheet_index, sheet_name in enumerate(sheet_names[:5], start=1):
+                rows = _xlsx_rows(archive.read(sheet_name), shared_strings)
+                table = f"<h2>Tabelle {sheet_index}</h2><table><tbody>"
+                for row in rows[:50]:
+                    table += "<tr>" + "".join(f"<td>{escape(cell)}</td>" for cell in row[:20]) + "</tr>"
+                table += "</tbody></table>"
+                sections.append(table)
+            return "".join(sections)
+    except Exception as exc:
+        return _office_fallback_error(path, "XLSX", exc)
+
+
+def _render_pptx_html(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            slide_names = sorted(name for name in archive.namelist() if name.startswith("ppt/slides/slide") and name.endswith(".xml"))
+            ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+            sections = []
+            for slide_index, slide_name in enumerate(slide_names[:50], start=1):
+                root = ET.fromstring(archive.read(slide_name))
+                texts = [node.text or "" for node in root.findall(".//a:t", ns) if node.text]
+                content = "<br>".join(escape(text) for text in texts) or "Keine Textinhalte gefunden."
+                sections.append(f"<h2>Folie {slide_index}</h2><p>{content}</p>")
+            return "".join(sections) or "<p>Keine Folien gefunden.</p>"
+    except Exception as exc:
+        return _office_fallback_error(path, "PPTX", exc)
+
+
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    try:
+        root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+    except KeyError:
+        return []
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    strings = []
+    for item in root.findall("main:si", ns):
+        strings.append("".join(node.text or "" for node in item.findall(".//main:t", ns)))
+    return strings
+
+
+def _xlsx_rows(sheet_xml: bytes, shared_strings: list[str]) -> list[list[str]]:
+    root = ET.fromstring(sheet_xml)
+    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rows = []
+    for row in root.findall(".//main:row", ns):
+        values = []
+        for cell in row.findall("main:c", ns):
+            value_node = cell.find("main:v", ns)
+            inline_node = cell.find("main:is/main:t", ns)
+            if inline_node is not None and inline_node.text is not None:
+                value = inline_node.text
+            elif value_node is None or value_node.text is None:
+                value = ""
+            elif cell.get("t") == "s":
+                index = int(value_node.text)
+                value = shared_strings[index] if 0 <= index < len(shared_strings) else ""
+            else:
+                value = value_node.text
+            values.append(value)
+        if any(values):
+            rows.append(values)
+    return rows
+
+
+def _office_fallback_error(path: Path, format_label: str, exc: Exception) -> str:
+    return f"""
+<div class=\"meta-list\">
+  <div class=\"meta-row\"><div class=\"meta-key\">Dateiname</div><div>{escape(path.name)}</div></div>
+  <div class=\"meta-row\"><div class=\"meta-key\">Format</div><div>{escape(format_label)}</div></div>
+  <div class=\"meta-row\"><div class=\"meta-key\">Status</div><div>Office-Fallback konnte die Datei nicht lesen: {escape(str(exc))}</div></div>
+</div>
+"""
 
 
 def _render_generic_preview(path: Path, mime_type: str) -> bytes:

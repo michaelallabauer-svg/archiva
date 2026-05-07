@@ -26,6 +26,8 @@ from sqlalchemy.exc import IntegrityError
 
 from archiva.database import get_db
 from archiva.config import load_settings
+from archiva.email_attachments import create_email_attachment_children
+from archiva.email_utils import email_metadata, parse_eml
 from archiva.metadata_validation import metadata_from_json, validate_document_metadata, MetadataValidationError
 from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowHistoryEvent, WorkflowInstance, WorkflowStepDefinition, WorkflowTask, WorkflowTransitionDefinition
 from archiva.preview_queue import enqueue_preview_job, get_latest_preview_artifact, get_latest_preview_job
@@ -2323,7 +2325,11 @@ async def ui_app_intake(
 
     detected_doc_type = DocType.OTHER
     content_type = (file.content_type or "").lower()
-    if content_type.startswith("image/"):
+    filename_lower = original_filename.lower()
+    if content_type in {"message/rfc822", "application/eml"} or filename_lower.endswith(".eml"):
+        detected_doc_type = DocType.EMAIL
+        content_type = content_type or "message/rfc822"
+    elif content_type.startswith("image/"):
         detected_doc_type = DocType.IMAGE
     elif "pdf" in content_type:
         detected_doc_type = DocType.PDF
@@ -2353,13 +2359,19 @@ async def ui_app_intake(
     elif not resolved_cabinet and document_type.register and document_type.register.cabinet:
         resolved_cabinet = document_type.register.cabinet
 
+    if detected_doc_type == DocType.EMAIL:
+        try:
+            metadata.setdefault("_email", email_metadata(parse_eml(saved_path)))
+        except Exception as exc:
+            metadata.setdefault("_email", {"parse_error": str(exc), "attachments": [], "attachment_count": 0})
+
     document = Document(
         name=original_filename,
         title=Path(original_filename).stem,
         doc_type=detected_doc_type,
         document_type_id=document_type.id,
         cabinet_id=resolved_cabinet.id if resolved_cabinet else None,
-        mime_type=file.content_type,
+        mime_type=content_type or file.content_type,
         size_bytes=int(file_size),
         storage_path=str(relative_path),
         metadata_json=json.dumps(metadata, ensure_ascii=False),
@@ -2367,6 +2379,15 @@ async def ui_app_intake(
     )
     db.add(document)
     db.flush()
+    email_attachment_children: list[Document] = []
+    if detected_doc_type == DocType.EMAIL:
+        email_attachment_children = create_email_attachment_children(
+            db,
+            storage=storage,
+            parent_document=document,
+            eml_path=saved_path,
+            parent_metadata=metadata,
+        )
 
     extracted_text = None
 
@@ -2382,6 +2403,8 @@ async def ui_app_intake(
     db.commit()
     db.refresh(document)
     enqueue_document_index(db, document=document, reason="document_uploaded_ui")
+    for child in email_attachment_children:
+        enqueue_document_index(db, document=child, reason="email_attachment_uploaded_ui")
 
     success_message = "Dokument erfolgreich gespeichert, Preview-Rendering und Volltextindexierung eingereiht"
     if not extracted_text:
@@ -2390,6 +2413,8 @@ async def ui_app_intake(
         success_message += " · PDF wurde automatisch gestempelt"
     elif document.stamp_status == "failed":
         success_message += " · PDF-Stempelung fehlgeschlagen, Details im Dokument"
+    if email_attachment_children:
+        success_message += f" · {len(email_attachment_children)} Mail-Anhang/Anhänge als Child-Dokumente angelegt"
 
     return _ui_redirect_with_message(
         _app_message_url(document_type_id, message=success_message)
@@ -3439,6 +3464,48 @@ async def ui_seed_invoice_fields(
     return _ui_redirect_with_message(f"/ui/admin/document-types/{document_type.id}")
 
 
+@router.post("/admin/document-types/{document_type_id}")
+async def ui_update_document_type(
+    document_type_id: UUID,
+    name: str = Form(...),
+    description: str = Form(""),
+    icon: str = Form(""),
+    file_type: str = Form(""),
+    pdf_stampede_auto_stamp: str | None = Form(None),
+    pdf_stampede_template_id: str = Form(""),
+    order: int = Form(0),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    document_type = db.query(DocumentType).where(DocumentType.id == document_type_id).first()
+    if not document_type:
+        return _ui_redirect_with_message("/ui/admin?message=Dokumenttyp+nicht+gefunden")
+
+    normalized_file_type = file_type.strip() or None
+    auto_stamp = bool(pdf_stampede_auto_stamp)
+    template_id = pdf_stampede_template_id.strip() or None
+
+    if auto_stamp and normalized_file_type != DocType.PDF.value:
+        return _ui_redirect_with_message(
+            f"/ui/admin/document-types/{document_type.id}?message={quote_plus('PDFStampede kann nur für Dateityp PDF aktiviert werden')}"
+        )
+    if auto_stamp and not template_id:
+        return _ui_redirect_with_message(
+            f"/ui/admin/document-types/{document_type.id}?message={quote_plus('Bitte eine PDFStampede-Vorlage wählen, bevor Stempeln aktiviert wird')}"
+        )
+
+    document_type.name = name.strip()
+    document_type.description = description.strip() or None
+    document_type.icon = icon.strip() or None
+    document_type.file_type = normalized_file_type
+    document_type.pdf_stampede_auto_stamp = auto_stamp
+    document_type.pdf_stampede_template_id = template_id
+    document_type.order = order
+    db.commit()
+    return _ui_redirect_with_message(
+        f"/ui/admin/document-types/{document_type.id}?message={quote_plus('Dokumenttyp gespeichert')}"
+    )
+
+
 @router.post("/admin/setup/invoice-mvp")
 async def ui_seed_invoice_mvp(
     db: Session = Depends(get_db),
@@ -3973,6 +4040,10 @@ def _render_admin_page(
     indexing_status = indexing_runtime_status()
     indexing_status_html = f"<div class='status-chip'><span>OCR / Index</span><span class='service-badge'><span class='status-dot'></span> {'bereit' if any(item.get('available') for item in indexing_status.get('ocr', {}).values() if isinstance(item, dict)) else 'Basisbetrieb'}</span></div>"
     tooltip_hint = '<span class="tooltip" tabindex="0">?<span class="tooltip-bubble">Mehr Kontext bei Hover oder Fokus.</span></span>'
+    settings = load_settings("config.yaml")
+    pdf_stampede_base_url = str(settings.pdf_stampede.base_url).rstrip("/")
+    pdf_stampede_editor_url = pdf_stampede_base_url[:-7] if pdf_stampede_base_url.endswith("/api/v1") else pdf_stampede_base_url
+    pdf_stampede_editor_url = f"{pdf_stampede_editor_url.rstrip('/')}/admin/pdf-stamp-editor"
 
     return f"""
 <!doctype html>
@@ -4111,6 +4182,7 @@ def _render_admin_page(
           <a class="pill" href="/ui/admin/trash">Papierkorb</a>
           <a class="pill" href="/ui/admin/identity">Identity & Rollen</a>
           <a class="pill" href="/ui/workflow-designer">Workflow Designer</a>
+          <a class="pill" href="{_escape(pdf_stampede_editor_url)}" target="_blank" rel="noopener">PDFStampede Vorlagen</a>
           <form method="post" action="/ui/admin/setup/invoice-mvp" style="margin:0; display:inline-flex;"><button class="pill" type="submit">Eingangsrechnungs-MVP einrichten</button></form>
         </div>
       </div>
@@ -6586,6 +6658,20 @@ def _render_definition_detail(
             dt = next((dt for ct in cabinet_types for dt in ct.document_type_definitions if str(dt.id) == node_id), None)
         if not dt:
             return "<p class='def-empty'>Dokumenttyp nicht gefunden.</p>"
+        settings = load_settings("config.yaml")
+        stamp_templates = list_pdf_stampede_templates(settings)
+        stamp_template_items = [(str(item.get("id") or ""), str(item.get("name") or item.get("id") or "")) for item in stamp_templates if item.get("id")]
+        if dt.pdf_stampede_template_id and dt.pdf_stampede_template_id not in {value for value, _label in stamp_template_items}:
+            stamp_template_items.append((dt.pdf_stampede_template_id, f"{dt.pdf_stampede_template_id} (aktuell/manuell)"))
+        stamp_template_options = _option_list(
+            stamp_template_items,
+            selected_value=dt.pdf_stampede_template_id,
+            include_blank=("Keine Vorlage / Stempeln aus" if stamp_templates else "Keine Vorlagen geladen — Template-ID manuell eintragen"),
+        )
+        file_type_options = _option_list(
+            [("", "Beliebig"), ("pdf", "PDF"), ("image", "Bild"), ("text", "Text"), ("doc", "Office/Dokument"), ("other", "Sonstige")],
+            selected_value=dt.file_type or "",
+        )
         cabinet_path = ""
         if dt.cabinet:
             cabinet_path = f"{dt.cabinet.cabinet_type.name if dt.cabinet.cabinet_type else ''} → {dt.cabinet.name}"
@@ -6602,8 +6688,24 @@ def _render_definition_detail(
           <div class="def-detail-row"><div class="def-detail-key">Beschreibung</div><div class="def-detail-value">{_escape(dt.description or '—')}</div></div>
           <div class="def-detail-row"><div class="def-detail-key">Icon</div><div class="def-detail-value">{dt.icon or '📄'}</div></div>
           <div class="def-detail-row"><div class="def-detail-key">Pfad</div><div class="def-detail-value">{_escape(cabinet_path) if cabinet_path else '—'}</div></div>
+          <div class="def-detail-row"><div class="def-detail-key">Dateityp</div><div class="def-detail-value">{_escape(dt.file_type or 'beliebig')}</div></div>
+          <div class="def-detail-row"><div class="def-detail-key">PDFStampede</div><div class="def-detail-value">{'Stempeln aktiv' if dt.pdf_stampede_auto_stamp else 'Stempeln aus'}{f' · Vorlage {_escape(dt.pdf_stampede_template_id)}' if dt.pdf_stampede_template_id else ''}</div></div>
           <div class="def-detail-row"><div class="def-detail-key">Felder</div><div class="def-detail-value">{len(dt.fields)} definiert</div></div>
         </div>
+        <form method="post" action="/ui/admin/document-types/{dt.id}" class="def-detail-card">
+          <h3>⚙️ Dokumenttyp bearbeiten</h3>
+          <p class="def-empty">Hier stellst du ein, ob neue PDFs dieses Typs automatisch mit PDFStampede gestempelt werden und welche Vorlage verwendet wird.</p>
+          <div class="field-grid">
+            <div class="field"><label>Name</label><input type="text" name="name" value="{_escape(dt.name)}" required></div>
+            <div class="field"><label>Icon</label><input type="text" name="icon" value="{_escape(dt.icon or '')}" placeholder="🧾"></div>
+            <div class="field"><label>Dateityp</label><select name="file_type">{file_type_options}</select><p class="hint">PDFStampede greift nur bei Dateityp PDF.</p></div>
+            <div class="field"><label>PDFStampede-Vorlage</label><select name="pdf_stampede_template_id">{stamp_template_options}</select><p class="hint">Neue Vorlagen kannst du oben über „PDFStampede Vorlagen“ erstellen.</p></div>
+            <div class="field"><label><input type="checkbox" name="pdf_stampede_auto_stamp" value="1" {'checked' if dt.pdf_stampede_auto_stamp else ''}> Neue PDFs automatisch stempeln</label></div>
+            <div class="field"><label>Reihenfolge</label><input type="number" name="order" value="{dt.order}"></div>
+            <div class="field full"><label>Beschreibung</label><textarea name="description">{_escape(dt.description or '')}</textarea></div>
+          </div>
+          <div class="actions"><button class="primary" type="submit">Dokumenttyp speichern</button></div>
+        </form>
         <div class="def-detail-card">
           <h3>🔢 Metadatenfelder</h3>
           {field_list(dt.fields)}

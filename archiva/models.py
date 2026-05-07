@@ -810,6 +810,7 @@ class DocType(str, enum.Enum):
     PDF = "pdf"
     DOC = "doc"
     IMAGE = "image"
+    EMAIL = "email"
     OTHER = "other"
 
 
@@ -833,6 +834,12 @@ class Document(Base):
     document_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("document_types.id"), nullable=True
     )
+    parent_document_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=True
+    )
+    relation_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    source_attachment_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    source_attachment_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     cabinet_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("cabinets.id"), nullable=True
     )
@@ -881,6 +888,12 @@ class Document(Base):
     )
     cabinet: Mapped[Optional["Cabinet"]] = relationship("Cabinet")
     deleted_by_user: Mapped[Optional["User"]] = relationship("User")
+    parent_document: Mapped[Optional["Document"]] = relationship(
+        "Document", remote_side=[id], back_populates="child_documents"
+    )
+    child_documents: Mapped[list["Document"]] = relationship(
+        "Document", back_populates="parent_document"
+    )
     versions: Mapped[list["DocumentVersion"]] = relationship(
         "DocumentVersion", back_populates="document", cascade="all, delete-orphan"
     )
@@ -893,6 +906,8 @@ class Document(Base):
         Index("ix_documents_deleted_at", "deleted_at"),
         Index("ix_documents_deleted_by_user_id", "deleted_by_user_id"),
         Index("ix_documents_document_type_id", "document_type_id"),
+        Index("ix_documents_parent_document_id", "parent_document_id"),
+        Index("ix_documents_relation_type", "relation_type"),
         Index("ix_documents_cabinet_id", "cabinet_id"),
         Index("ix_documents_file_hash", "file_hash"),
     )

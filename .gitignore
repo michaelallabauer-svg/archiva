@@ -34,8 +34,9 @@ build/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs / local process files
 *.log
+*.pid
 
 # uv-managed virtual environment
 .venv/

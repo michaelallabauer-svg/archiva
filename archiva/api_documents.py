@@ -14,6 +14,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from archiva.database import get_db
+from archiva.email_attachments import create_email_attachment_children
+from archiva.email_utils import email_metadata, parse_eml
 from archiva.indexer.dispatcher import enqueue_document_index
 from archiva.metadata_validation import (
     metadata_from_json,
@@ -135,16 +137,27 @@ async def upload_document(
         metadata_payload = validation.normalized
         metadata_json = metadata_to_json(metadata_payload)
 
-    doc_type = _guess_doc_type(file.content_type)
+    doc_type = _guess_doc_type(file.content_type, file.filename)
     storage_path = storage.generate_path(file.filename)
-    await storage.save(file, storage_path)
+    saved_path = await storage.save(file, storage_path)
+
+    mime_type = file.content_type
+    if doc_type == DocType.EMAIL:
+        mime_type = mime_type or "message/rfc822"
+        metadata_payload = metadata_payload or {}
+        try:
+            metadata_payload.setdefault("_email", email_metadata(parse_eml(saved_path)))
+            metadata_json = metadata_to_json(metadata_payload)
+        except Exception as exc:
+            metadata_payload.setdefault("_email", {"parse_error": str(exc), "attachments": [], "attachment_count": 0})
+            metadata_json = metadata_to_json(metadata_payload)
 
     content_text = await _extract_text(file, storage_path, doc_type)
 
     document = Document(
         name=file.filename,
         doc_type=doc_type,
-        mime_type=file.content_type,
+        mime_type=mime_type,
         size_bytes=file.size or 0,
         storage_path=str(storage_path),
         title=title or file.filename,
@@ -158,6 +171,15 @@ async def upload_document(
 
     db.add(document)
     db.flush()
+    email_attachment_children: list[Document] = []
+    if doc_type == DocType.EMAIL:
+        email_attachment_children = create_email_attachment_children(
+            db,
+            storage=storage,
+            parent_document=document,
+            eml_path=saved_path,
+            parent_metadata=metadata_payload,
+        )
 
     if content_text:
         update_document_vector(db, document.id, content_text)
@@ -165,6 +187,8 @@ async def upload_document(
     db.commit()
     db.refresh(document)
     enqueue_document_index(db, document=document, reason="document_uploaded_api")
+    for child in email_attachment_children:
+        enqueue_document_index(db, document=child, reason="email_attachment_uploaded_api")
     return _document_to_response(document)
 
 
@@ -338,19 +362,22 @@ def _parse_metadata_payload(metadata: Optional[str]) -> dict[str, Any] | None:
     return payload
 
 
-def _guess_doc_type(mime_type: Optional[str]) -> DocType:
-    if not mime_type:
+def _guess_doc_type(mime_type: Optional[str], filename: Optional[str] = None) -> DocType:
+    normalized_mime = (mime_type or "").lower()
+    if normalized_mime in {"message/rfc822", "application/eml"} or (filename or "").lower().endswith(".eml"):
+        return DocType.EMAIL
+    if not normalized_mime:
         return DocType.OTHER
-    if mime_type.startswith("text/"):
+    if normalized_mime.startswith("text/"):
         return DocType.TEXT
-    elif mime_type == "application/pdf":
+    elif normalized_mime == "application/pdf":
         return DocType.PDF
-    elif mime_type in (
+    elif normalized_mime in (
         "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ):
         return DocType.DOC
-    elif mime_type.startswith("image/"):
+    elif normalized_mime.startswith("image/"):
         return DocType.IMAGE
     return DocType.OTHER
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from archiva.indexer.ocr import run_ocr_on_image, run_ocr_on_pdf
+from archiva.email_utils import parse_eml
 
 
 def extract_text_for_indexing(storage_path: str, mime_type: str | None = None) -> tuple[str, bool, str | None]:
@@ -14,6 +15,12 @@ def extract_text_for_indexing(storage_path: str, mime_type: str | None = None) -
 
     lower_name = path.name.lower()
     mime_type = (mime_type or "").lower()
+
+    if mime_type in {"message/rfc822", "application/eml", "application/vnd.ms-outlook"} or lower_name.endswith(".eml"):
+        try:
+            return parse_eml(path).fulltext(), False, "eml"
+        except Exception:
+            return "", False, None
 
     if mime_type.startswith("text/") or lower_name.endswith((".txt", ".md", ".csv", ".log", ".json")):
         try:

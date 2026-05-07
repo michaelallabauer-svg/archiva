@@ -427,6 +427,7 @@ def _ensure_soft_delete_columns(conn) -> None:
 
 
 def _ensure_search_indexing_columns(conn) -> None:
+    conn.execute(text("ALTER TYPE doctype ADD VALUE IF NOT EXISTS 'EMAIL'"))
     conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS index_status VARCHAR(50) NOT NULL DEFAULT 'pending'"))
     conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS index_revision INTEGER NOT NULL DEFAULT 0"))
     conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_hash VARCHAR(255) NULL"))
@@ -437,6 +438,27 @@ def _ensure_search_indexing_columns(conn) -> None:
     conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS index_ocr_used BOOLEAN NOT NULL DEFAULT FALSE"))
     conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_hash VARCHAR(32) NULL"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_file_hash ON documents (file_hash)"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS parent_document_id UUID NULL"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS relation_type VARCHAR(50) NULL"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_attachment_name VARCHAR(500) NULL"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_attachment_index INTEGER NULL"))
+    parent_fk_exists = conn.execute(
+        text(
+            """
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'fk_documents_parent_document_id'
+              AND table_name = 'documents'
+            """
+        )
+    ).first()
+    if not parent_fk_exists:
+        conn.execute(
+            text(
+                "ALTER TABLE documents ADD CONSTRAINT fk_documents_parent_document_id FOREIGN KEY (parent_document_id) REFERENCES documents(id)"
+            )
+        )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_parent_document_id ON documents (parent_document_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_relation_type ON documents (relation_type)"))
     conn.execute(text("ALTER TABLE document_types ADD COLUMN IF NOT EXISTS md5_duplicate_check BOOLEAN NOT NULL DEFAULT TRUE"))
     conn.execute(
             text(
