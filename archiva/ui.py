@@ -1167,6 +1167,55 @@ def _app_message_url(
     return "&".join(parts)
 
 
+def _detect_upload_doc_type(filename: str, content_type: str | None) -> tuple[DocType, str | None]:
+    normalized_content_type = (content_type or "").lower()
+    filename_lower = (filename or "").lower()
+    suffix = Path(filename_lower).suffix
+    if normalized_content_type in {"message/rfc822", "application/eml"} or suffix == ".eml":
+        return DocType.EMAIL, normalized_content_type or "message/rfc822"
+    if normalized_content_type.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".tif", ".tiff", ".bmp"}:
+        return DocType.IMAGE, normalized_content_type or None
+    if "pdf" in normalized_content_type or suffix == ".pdf":
+        return DocType.PDF, normalized_content_type or "application/pdf"
+    if normalized_content_type.startswith("text/") or suffix in {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml"}:
+        return DocType.TEXT, normalized_content_type or "text/plain"
+    if (
+        "word" in normalized_content_type
+        or "officedocument" in normalized_content_type
+        or "ms-excel" in normalized_content_type
+        or "ms-powerpoint" in normalized_content_type
+        or suffix in {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
+    ):
+        return DocType.DOC, normalized_content_type or None
+    return DocType.OTHER, normalized_content_type or None
+
+
+def _validate_upload_file_type(document_type: DocumentType, detected_doc_type: DocType, filename: str) -> str | None:
+    expected = (document_type.file_type or "").strip().lower()
+    if not expected:
+        return None
+    detected = detected_doc_type.value if hasattr(detected_doc_type, "value") else str(detected_doc_type)
+    if expected == detected:
+        return None
+    expected_label = {
+        "pdf": "PDF",
+        "image": "Bild",
+        "text": "Text",
+        "doc": "Office/Dokument",
+        "email": "E-Mail (.eml)",
+        "other": "Sonstige Datei",
+    }.get(expected, expected)
+    detected_label = {
+        "pdf": "PDF",
+        "image": "Bild",
+        "text": "Text",
+        "doc": "Office/Dokument",
+        "email": "E-Mail (.eml)",
+        "other": "Sonstige Datei",
+    }.get(detected, detected)
+    return f"Dokumenttyp {document_type.name} erwartet {expected_label}; hochgeladen wurde {detected_label} ({filename})."
+
+
 def _option_list(items: list[tuple[str, str]], selected_value: str | None = None, include_blank: str | None = None) -> str:
     options: list[str] = []
     if include_blank is not None:
@@ -2323,6 +2372,31 @@ async def ui_app_intake(
     metadata = _apply_automatic_metadata(db, document_type, metadata)
     metadata = _resolve_identity_metadata_labels(db, document_type, metadata)
 
+    original_filename = file.filename or ""
+    if not original_filename:
+        return _ui_redirect_with_message(
+            _app_message_url(
+                document_type_id,
+                message="Bitte eine Datei auswählen.",
+                error_field="file",
+                error_message="Datei fehlt",
+                form_data=metadata,
+            )
+        )
+
+    detected_doc_type, normalized_content_type = _detect_upload_doc_type(original_filename, file.content_type)
+    file_type_error = _validate_upload_file_type(document_type, detected_doc_type, original_filename)
+    if file_type_error:
+        return _ui_redirect_with_message(
+            _app_message_url(
+                document_type_id,
+                message=file_type_error,
+                error_field="file",
+                error_message=file_type_error,
+                form_data=metadata,
+            )
+        )
+
     try:
         validation = validate_document_metadata(db, document_type.id, metadata)
         metadata = validation.normalized
@@ -2342,25 +2416,21 @@ async def ui_app_intake(
 
     settings = load_settings("config.yaml")
     storage = StorageManager(settings.storage.base_path)
-    original_filename = file.filename or "upload.bin"
     relative_path = storage.generate_path(original_filename)
     saved_path = await storage.save(file, relative_path)
     file_size = saved_path.stat().st_size if saved_path.exists() else 0
-
-    detected_doc_type = DocType.OTHER
-    content_type = (file.content_type or "").lower()
-    filename_lower = original_filename.lower()
-    if content_type in {"message/rfc822", "application/eml"} or filename_lower.endswith(".eml"):
-        detected_doc_type = DocType.EMAIL
-        content_type = content_type or "message/rfc822"
-    elif content_type.startswith("image/"):
-        detected_doc_type = DocType.IMAGE
-    elif "pdf" in content_type:
-        detected_doc_type = DocType.PDF
-    elif content_type.startswith("text/"):
-        detected_doc_type = DocType.TEXT
-    elif "word" in content_type or "officedocument" in content_type:
-        detected_doc_type = DocType.DOC
+    if file_size <= 0:
+        saved_path.unlink(missing_ok=True)
+        return _ui_redirect_with_message(
+            _app_message_url(
+                document_type_id,
+                message="Die hochgeladene Datei ist leer und wurde nicht gespeichert.",
+                error_field="file",
+                error_message="Leere Datei",
+                form_data=metadata,
+            )
+        )
+    content_type = normalized_content_type or (file.content_type or "").lower()
 
     cabinet_id_raw = str(form.get("cabinet_id") or "").strip()
     register_id_raw = str(form.get("register_id") or "").strip()
@@ -2387,7 +2457,16 @@ async def ui_app_intake(
         try:
             metadata.setdefault("_email", email_metadata(parse_eml(saved_path)))
         except Exception as exc:
-            metadata.setdefault("_email", {"parse_error": str(exc), "attachments": [], "attachment_count": 0})
+            saved_path.unlink(missing_ok=True)
+            return _ui_redirect_with_message(
+                _app_message_url(
+                    document_type_id,
+                    message=f"EML-Datei konnte nicht gelesen werden: {exc}",
+                    error_field="file",
+                    error_message="Ungültige EML-Datei",
+                    form_data=metadata,
+                )
+            )
 
     document = Document(
         name=original_filename,
@@ -4730,6 +4809,29 @@ a {{ color:var(--accent-2); text-decoration:none; }} .muted {{ color:var(--muted
 </div></body></html>"""
 
 
+def _upload_accept_attribute(document_type: DocumentType | None) -> str:
+    file_type = (document_type.file_type if document_type else "") or ""
+    accept = {
+        "pdf": ".pdf,application/pdf",
+        "image": "image/*",
+        "text": ".txt,.md,.csv,.log,.json,.xml,.yaml,.yml,text/*,application/json,application/xml",
+        "doc": ".doc,.docx,.xls,.xlsx,.ppt,.pptx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "email": ".eml,message/rfc822,application/eml",
+    }.get(file_type.lower())
+    return f'accept="{_escape(accept)}"' if accept else ""
+
+
+def _upload_expected_file_hint(document_type: DocumentType | None) -> str:
+    file_type = (document_type.file_type if document_type else "") or ""
+    return {
+        "pdf": "Erwartet: PDF",
+        "image": "Erwartet: Bilddatei",
+        "text": "Erwartet: Text/CSV/JSON",
+        "doc": "Erwartet: Office365/Office-Dokument",
+        "email": "Erwartet: E-Mail-Datei (.eml)",
+    }.get(file_type.lower(), "Beliebiger Dateityp erlaubt")
+
+
 def _render_app_page(
     cabinets: list[Cabinet],
     document_types: list[DocumentType],
@@ -4975,6 +5077,10 @@ def _render_app_page(
     capture_empty_hint_html = f'<div class="muted" style="margin-top:10px;">{capture_preview}</div>' if not capture_field_inputs else ""
     intake_panel_html = ""
     if show_intake_panel:
+        expected_file_hint = _upload_expected_file_hint(selected_capture_document_type)
+        file_error_class = " error" if error_field == "file" else ""
+        file_error_html = f'<div class="field-error">{_escape(error_message)}</div>' if error_field == "file" and error_message else ""
+        file_accept_attr = _upload_accept_attribute(selected_capture_document_type)
         intake_panel_html = (
             f'<div id="intake-form" class="panel">'
             f'<div class="section-head"><div><h2 style="margin:0;">Dokument erfassen</h2><div class="muted" style="margin-top:6px;">Datei per Drag and Drop ablegen und Indexdaten direkt im aktuellen Kontext erfassen.</div></div></div>'
@@ -4983,10 +5089,10 @@ def _render_app_page(
             f'<input type="hidden" name="node_id" value="{_escape(selected_node.get("id", "") if selected_node else "")}">'
             f'<input type="hidden" name="selected_document_type_id" value="{_escape(str(selected_capture_document_type.id)) if selected_capture_document_type else ""}">'
             f'<input type="hidden" name="hash" id="file-hash-input" value="">'
-            f'<div id="file-dropzone" class="dropzone" style="margin-top:8px;"><strong>Datei hier ablegen</strong><div class="muted" id="dropzone-hint" style="margin-top:8px;">oder klicken, um eine Datei auszuwählen</div><input id="file-input" type="file" name="file" required style="display:none"></div>'
+            f'<div id="file-dropzone" class="dropzone{file_error_class}" style="margin-top:8px;"><strong>Datei hier ablegen</strong><div class="muted" id="dropzone-hint" style="margin-top:8px;">oder klicken, um eine Datei auszuwählen · {expected_file_hint}</div><input id="file-input" type="file" name="file" required {file_accept_attr} data-expected-file-type="{_escape((selected_capture_document_type.file_type or '') if selected_capture_document_type else '')}" style="display:none"></div>{file_error_html}'
             f'<div class="field-grid" style="margin-top:16px;"><div class="field"><label>Cabinet</label><select name="cabinet_id" required>{cabinet_options}</select></div><div class="field"><label>Register</label><select name="register_id">{register_options}</select></div><div class="field full"><label>Dokumenttyp</label><select id="document-type-select" name="document_type_id" required>{document_type_options}</select></div></div>'
             f'<div class="panel" style="margin:16px 0 0 0; padding:16px;"><h3 style="margin:0 0 12px 0;">Indexdaten</h3><div class="field-grid">{capture_fields_html}</div>{capture_empty_hint_html}</div>'
-            f'<div id="duplicate-warning" class="panel" style="display:none; margin-top:12px; padding:12px 16px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.30); border-radius:12px;"><strong style="color:#ff7b7b;">⚠ Duplikat erkannt!</strong><div id="duplicate-info" style="margin-top:6px; color:var(--muted); font-size:.9rem;"></div></div>'
+            f'<div id="upload-validation-warning" class="panel" style="display:none; margin-top:12px; padding:12px 16px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.30); border-radius:12px;"><strong style="color:#ff7b7b;" id="upload-validation-title">⚠ Upload prüfen</strong><div id="upload-validation-info" style="margin-top:6px; color:var(--muted); font-size:.9rem;"></div></div>'
             f'<div class="actions"><button class="primary" type="submit" id="intake-submit-btn">Dokument speichern</button></div></form></div>'
         )
 
@@ -5076,8 +5182,7 @@ def _render_app_page(
     input:focus, textarea:focus, select:focus {{ outline:none; border-color: rgba(77,212,255,0.46); box-shadow: 0 0 0 4px var(--glow); }}
     textarea {{ min-height: 110px; resize: vertical; }}
     .dropzone {{ border:2px dashed rgba(77,212,255,0.16); border-radius:20px; padding:28px; text-align:center; background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02)); }}
-    .duplicate-warning {{ margin-top:12px; padding:12px 16px; background:rgba(255,123,123,0.10); border:1px solid rgba(255,123,123,0.30); border-radius:12px; display:none; }}
-    .duplicate-warning.visible {{ display:block; }}
+    .dropzone.error {{ border-color:#ff8f8f; box-shadow:0 0 0 1px rgba(255,143,143,.25) inset; background:rgba(255,123,123,0.06); }}
     .actions {{ display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }}
     button, .chip {{ border:none; border-radius:999px; padding:10px 14px; font:inherit; cursor:pointer; transition: all .18s ease; }}
     .primary {{ background: linear-gradient(135deg, var(--accent), var(--accent-2)); color:white; box-shadow: 0 8px 24px rgba(77,212,255,0.22); }}
@@ -5533,6 +5638,29 @@ def _render_app_page(
     }}
 
     if (fileDropzone && fileInput) {{
+      const detectClientFileType = (file) => {{
+        const name = (file.name || '').toLowerCase();
+        const type = (file.type || '').toLowerCase();
+        const ext = name.includes('.') ? name.slice(name.lastIndexOf('.')) : '';
+        if (type === 'message/rfc822' || type === 'application/eml' || ext === '.eml') return 'email';
+        if (type.startsWith('image/') || ['.png','.jpg','.jpeg','.gif','.webp','.tif','.tiff','.bmp'].includes(ext)) return 'image';
+        if (type.includes('pdf') || ext === '.pdf') return 'pdf';
+        if (type.startsWith('text/') || ['.txt','.md','.csv','.log','.json','.xml','.yaml','.yml'].includes(ext)) return 'text';
+        if (type.includes('word') || type.includes('officedocument') || type.includes('ms-excel') || type.includes('ms-powerpoint') || ['.doc','.docx','.xls','.xlsx','.ppt','.pptx'].includes(ext)) return 'doc';
+        return 'other';
+      }};
+      const showUploadWarning = (titleText, infoText) => {{
+        const warning = document.getElementById('upload-validation-warning');
+        const info = document.getElementById('upload-validation-info');
+        const title = document.getElementById('upload-validation-title');
+        if (warning) warning.style.display = 'block';
+        if (title) title.textContent = titleText;
+        if (info) info.textContent = infoText;
+      }};
+      const hideUploadWarning = () => {{
+        const warning = document.getElementById('upload-validation-warning');
+        if (warning) warning.style.display = 'none';
+      }};
       const setFile = (fileList, skipHashCheck) => {{
         if (!fileList || !fileList.length) return;
         const file = fileList[0];
@@ -5540,6 +5668,16 @@ def _render_app_page(
         if (dropzoneHint) {{
           dropzoneHint.textContent = `Ausgewählt: ${{file.name}}`;
         }}
+        const submitBtn = document.getElementById('intake-submit-btn');
+        const expectedType = (fileInput.dataset.expectedFileType || '').toLowerCase();
+        const detectedType = detectClientFileType(file);
+        if (expectedType && expectedType !== detectedType) {{
+          showUploadWarning('⚠ Dateityp passt nicht', `Dieser Dokumenttyp erwartet ${{expectedType}}, erkannt wurde ${{detectedType}}. Die Datei wird serverseitig nicht gespeichert.`);
+          if (submitBtn) submitBtn.disabled = true;
+          return;
+        }}
+        hideUploadWarning();
+        if (submitBtn) submitBtn.disabled = false;
         if (skipHashCheck) return;
         const reader = new FileReader();
         reader.onload = async (e) => {{
@@ -5561,12 +5699,14 @@ def _render_app_page(
           try {{
             const resp = await fetch(`/api/v1/duplicate-check?hash=${{encodeURIComponent(hashHex)}}${{docTypeId ? '&document_type_id=' + docTypeId : ''}}`);
             const data = await resp.json();
-            const warning = document.getElementById('duplicate-warning');
-            const info = document.getElementById('duplicate-info');
+            const warning = document.getElementById('upload-validation-warning');
+            const info = document.getElementById('upload-validation-info');
+            const title = document.getElementById('upload-validation-title');
             const submitBtn = document.getElementById('intake-submit-btn');
             if (data.duplicate && data.existing_document) {{
               if (warning) {{ warning.style.display = 'block'; warning.style.background = 'rgba(255,123,123,0.10)'; warning.style.borderColor = 'rgba(255,123,123,0.30)'; }}
-              if (info) {{ const date = data.existing_document.created_at ? new Date(data.existing_document.created_at).toLocaleDateString('de-DE') : 'unbekannt'; info.textContent = `Existiert bereits: "${{data.existing_document.name}}" (hochgeladen am ${{date}}) - Dokument wird nicht erneut gespeichert.`; }}
+              if (title) title.textContent = '⚠ Duplikat erkannt';
+              if (info) {{ const date = data.existing_document.created_at ? new Date(data.existing_document.created_at).toLocaleDateString('de-DE') : 'unbekannt'; info.innerHTML = `Existiert bereits: <a href="/ui/app?node_kind=document&node_id=${{data.existing_document.id}}">"${{data.existing_document.name}}"</a> (hochgeladen am ${{date}}). Dokument wird nicht erneut gespeichert.`; }}
               if (submitBtn) submitBtn.disabled = true;
             }} else {{
               if (warning) warning.style.display = 'none';
@@ -6842,7 +6982,7 @@ def _render_definition_detail(
             include_blank=("Keine Vorlage / Stempeln aus" if stamp_templates else "Keine Vorlagen geladen — Template-ID manuell eintragen"),
         )
         file_type_options = _option_list(
-            [("", "Beliebig"), ("pdf", "PDF"), ("image", "Bild"), ("text", "Text"), ("doc", "Office/Dokument"), ("other", "Sonstige")],
+            [("", "Beliebig"), ("pdf", "PDF"), ("image", "Bild"), ("text", "Text"), ("doc", "Office/Dokument"), ("email", "E-Mail (.eml)"), ("other", "Sonstige")],
             selected_value=dt.file_type or "",
         )
         cabinet_path = ""
@@ -7945,7 +8085,7 @@ def _render_admin_create_panel(
         <option value="🖇️">🖇️ Kettenglied</option>
     </select>
     <p class="hint">Wähle ein Icon aus oder lasse leer für das Standard-Dokument-Icon (📄)</p>
-</div><div class="field"><label>Dateityp</label><select name="file_type"><option value="">Beliebig</option><option value="pdf">PDF</option><option value="image">Bild</option><option value="text">Text</option><option value="doc">Office/Dokument</option><option value="other">Sonstige</option></select><p class="hint">Für PDFStampede bitte PDF wählen.</p></div><div class="field"><label>PDFStampede-Vorlage / Template-ID</label><input list="pdf-stampede-template-list" name="pdf_stampede_template_id" placeholder="eingangsrechnung-standard"><datalist id="pdf-stampede-template-list">{stamp_template_options}</datalist><p class="hint">Vorlagen kommen aus PDFStampede; die ID kann auch manuell eingetragen werden.</p></div><div class="field"><label><input type="checkbox" name="pdf_stampede_auto_stamp" value="1"> PDFs automatisch stempeln</label><p class="hint">Wird beim Erfassen/Upload ausgeführt, Original bleibt unverändert.</p></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Dokumenttyp speichern</button></div></form>
+</div><div class="field"><label>Dateityp</label><select name="file_type"><option value="">Beliebig</option><option value="pdf">PDF</option><option value="image">Bild</option><option value="text">Text</option><option value="doc">Office/Dokument</option><option value="email">E-Mail (.eml)</option><option value="other">Sonstige</option></select><p class="hint">Für PDFStampede bitte PDF wählen.</p></div><div class="field"><label>PDFStampede-Vorlage / Template-ID</label><input list="pdf-stampede-template-list" name="pdf_stampede_template_id" placeholder="eingangsrechnung-standard"><datalist id="pdf-stampede-template-list">{stamp_template_options}</datalist><p class="hint">Vorlagen kommen aus PDFStampede; die ID kann auch manuell eingetragen werden.</p></div><div class="field"><label><input type="checkbox" name="pdf_stampede_auto_stamp" value="1"> PDFs automatisch stempeln</label><p class="hint">Wird beim Erfassen/Upload ausgeführt, Original bleibt unverändert.</p></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Dokumenttyp speichern</button></div></form>
 
         <form method="post" action="/ui/admin/cabinets" class="panel admin-create-section" id="admin-form-cabinet" style="display:none; margin-bottom:0;"><h3>Cabinet anlegen</h3><p class="muted">Lege ein konkretes Cabinet innerhalb eines Cabinettyps an, z. B. 2025 oder 2026 unter ERB.</p><div class="field-grid"><div class="field"><label>Cabinettyp</label><select name="cabinet_type_id" required>{cabinet_type_options}</select></div><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Cabinet speichern</button></div></form>
 
