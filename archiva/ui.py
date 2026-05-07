@@ -2135,6 +2135,30 @@ async def ui_app_document_stamped_pdf(
     return FileResponse(path=full_path, filename=filename, media_type="application/pdf")
 
 
+@router.post("/app/documents/{document_id}/stamp/retry")
+async def ui_app_retry_document_stamp(
+    document_id: UUID,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    document = _active_documents_query(db).where(Document.id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not document.document_type:
+        return _ui_redirect_with_message(_document_detail_message_url(document_id, message="Dokumenttyp fehlt, Stempelung nicht möglich"))
+
+    settings = load_settings("config.yaml")
+    storage = StorageManager(settings.storage.base_path)
+    _try_stamp_pdf_for_document(settings=settings, storage=storage, document=document, document_type=document.document_type)
+    db.commit()
+    if document.stamp_status == "ready":
+        message = "PDF-Stempelung erfolgreich erneuert"
+    elif document.stamp_status == "failed":
+        message = f"PDF-Stempelung fehlgeschlagen: {document.stamp_error or 'unbekannter Fehler'}"
+    else:
+        message = f"PDF-Stempelung Status: {document.stamp_status or 'nicht ausgeführt'}"
+    return _ui_redirect_with_message(_document_detail_message_url(document_id, message=message))
+
+
 def _try_stamp_pdf_for_document(
     *,
     settings: Any,
@@ -5774,6 +5798,11 @@ def _render_document_detail_page(
     .muted {{ color: var(--muted); }}
     .preview-shell {{ border:1px solid rgba(77,212,255,.10); border-radius:18px; overflow:hidden; background:#09101f; width:100%; height:calc(100vh - 220px); min-height:900px; }}
     .preview-frame {{ width:100%; height:100%; min-height:900px; border:0; background:#0a1224; display:block; }}
+    .stamped-pdf-panel {{ margin-top:14px; }}
+    .stamped-pdf-preview {{ margin-top:14px; border-radius:18px; overflow:hidden; border:1px solid rgba(110,231,183,0.18); background:#0f1630; }}
+    .stamped-pdf-preview .preview-frame {{ height:58vh; min-height:620px; }}
+    .stamp-meta-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:12px 0; }}
+    .stamp-error {{ margin:12px 0; padding:10px 12px; border-radius:14px; border:1px solid rgba(255,123,123,0.22); background:rgba(255,123,123,0.08); color:#ffcccc; }}
     .preview-image-wrap {{ display:flex; justify-content:center; align-items:flex-start; padding:0; background:#09101f; min-height:760px; width:100%; }}
     .preview-image {{ width:100%; height:auto; max-height:none; object-fit:contain; border-radius:0; box-shadow:none; display:block; }}
     .preview-placeholder {{ padding:20px; border:1px dashed rgba(77,212,255,.18); border-radius:14px; background:rgba(255,255,255,.03); }}
@@ -5785,7 +5814,7 @@ def _render_document_detail_page(
     .service-badge {{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:rgba(110,231,183,0.10); border:1px solid rgba(110,231,183,0.18); color:#d6fff0; font-size:.85rem; }}
     .status-dot {{ width:10px; height:10px; border-radius:999px; background: var(--success); box-shadow: 0 0 12px rgba(110,231,183,0.5); }}
     pre {{ margin:0; white-space:pre-wrap; word-break:break-word; font:inherit; color:var(--text); }}
-    @media (max-width: 900px) {{ .hero, .detail-grid, .detail-row {{ display:block; }} .detail-row {{ padding:14px 0; }} .detail-key {{ margin-bottom:6px; }} .field-grid, .metadata-display-grid {{ grid-template-columns:1fr; }} .field, .field.width-half, .field.width-third, .field.width-quarter, .metadata-card, .metadata-card.width-half, .metadata-card.width-third, .metadata-card.width-quarter {{ grid-column:1 / -1; }} .preview-frame {{ min-height:480px; }} }}
+    @media (max-width: 900px) {{ .hero, .detail-grid, .detail-row {{ display:block; }} .detail-row {{ padding:14px 0; }} .detail-key {{ margin-bottom:6px; }} .field-grid, .metadata-display-grid, .stamp-meta-grid {{ grid-template-columns:1fr; }} .field, .field.width-half, .field.width-third, .field.width-quarter, .metadata-card, .metadata-card.width-half, .metadata-card.width-third, .metadata-card.width-quarter {{ grid-column:1 / -1; }} .preview-frame, .stamped-pdf-preview .preview-frame {{ min-height:480px; }} }}
   </style>
 </head>
 <body>
@@ -5883,6 +5912,7 @@ def _render_document_detail_page(
 
 def _render_document_preview(document: Document, download_link: str) -> str:
     preview_link = f"/ui/preview/documents/{document.id}"
+    stamp_panel = _render_stamped_pdf_panel(document)
     stamped_action = ""
     if document.stamp_status == "ready" and document.stamped_pdf_storage_path:
         stamped_action = f'<a class="button primary" href="/ui/app/documents/{document.id}/stamped-pdf" target="_blank" rel="noopener noreferrer">Gestempeltes PDF öffnen</a>'
@@ -5895,7 +5925,66 @@ def _render_document_preview(document: Document, download_link: str) -> str:
         f'<iframe class="preview-frame" src="{preview_link}" title="Dokumentvorschau"></iframe>'
         '</div>'
         f'<div class="actions"><a class="button" href="{download_link}" target="_blank" rel="noopener noreferrer">Original herunterladen</a>{stamped_action}</div>'
+        f'{stamp_panel}'
     )
+
+
+def _render_stamped_pdf_panel(document: Document) -> str:
+    if document.doc_type != DocType.PDF and not document.stamp_status and not document.stamped_pdf_storage_path:
+        return ""
+    status_label = _stamp_status_label(document.stamp_status)
+    stamped_url = f"/ui/app/documents/{document.id}/stamped-pdf"
+    stamped_embed = ""
+    stamped_actions = ""
+    if document.stamp_status == "ready" and document.stamped_pdf_storage_path:
+        stamped_embed = f"""
+          <div class="stamped-pdf-preview">
+            <iframe class="preview-frame" src="{stamped_url}" title="Gestempeltes PDF"></iframe>
+          </div>
+        """
+        stamped_actions = f"""
+          <a class="button primary" href="{stamped_url}" target="_blank" rel="noopener noreferrer">Gestempeltes PDF öffnen</a>
+          <a class="button" href="/ui/app/documents/{document.id}/download" target="_blank" rel="noopener noreferrer">Original öffnen</a>
+        """
+    else:
+        stamped_actions = f'<a class="button" href="/ui/app/documents/{document.id}/download" target="_blank" rel="noopener noreferrer">Original öffnen</a>'
+    retry_allowed = document.doc_type == DocType.PDF and document.document_type and document.document_type.pdf_stampede_auto_stamp
+    retry_form = f"""
+      <form method="post" action="/ui/app/documents/{document.id}/stamp/retry" style="margin:0;">
+        <button class="button" type="submit">Stempelung erneut ausführen</button>
+      </form>
+    """ if retry_allowed else ""
+    error_html = f"<div class='stamp-error'>{_escape(document.stamp_error)}</div>" if document.stamp_error else ""
+    return f"""
+      <div class="panel stamped-pdf-panel">
+        <div class="section-head">
+          <div>
+            <div class="eyebrow">PDFStampede</div>
+            <h2 style="margin:0;">Gestempeltes PDF</h2>
+            <p class="muted">Original bleibt unverändert; die gestempelte Version wird separat als Rendition gespeichert.</p>
+          </div>
+          <span class="service-badge">{_escape(status_label)}</span>
+        </div>
+        <div class="stamp-meta-grid">
+          <div class="detail-row"><div class="detail-key">Status</div><div class="detail-value">{_escape(document.stamp_status or '—')}</div></div>
+          <div class="detail-row"><div class="detail-key">Template</div><div class="detail-value">{_escape(document.stamp_template_id or '—')}</div></div>
+          <div class="detail-row"><div class="detail-key">Rendition</div><div class="detail-value">{_escape(document.stamped_pdf_storage_path or '—')}</div></div>
+        </div>
+        {error_html}
+        <div class="actions">{stamped_actions}{retry_form}</div>
+        {stamped_embed}
+      </div>
+    """
+
+
+def _stamp_status_label(status: str | None) -> str:
+    return {
+        "ready": "bereit",
+        "failed": "fehlgeschlagen",
+        "pending": "in Arbeit",
+        "skipped_not_pdf": "übersprungen: kein PDF",
+        "skipped_document_type_not_pdf": "übersprungen: Dokumenttyp nicht PDF",
+    }.get(status or "", status or "nicht gestempelt")
 
 
 def _render_preview_waiting_state(document_id: UUID, document_name: str, status: str, error_message: str | None = None) -> bytes:
