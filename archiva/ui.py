@@ -4488,6 +4488,7 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
         return "<div class='panel' id='workflow-panel'><h2>Workflow</h2><p class='muted'>Workflow Runtime ist nicht verfügbar.</p></div>"
     active_instances = active_instances_for_document(db, document.id)
     workflow_definitions = db.query(WorkflowDefinition).where(WorkflowDefinition.is_active.is_(True)).order_by(WorkflowDefinition.name).all()
+    subject_index_overview = _render_workflow_subject_index_overview(document, db)
     instance_cards = []
     for instance in active_instances:
         outgoing = []
@@ -4518,7 +4519,7 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
             db.query(WorkflowHistoryEvent)
             .where(WorkflowHistoryEvent.workflow_instance_id == instance.id)
             .order_by(WorkflowHistoryEvent.created_at.desc())
-            .limit(8)
+            .limit(20)
             .all()
         )
         history_html = "".join(
@@ -4527,6 +4528,11 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
         ) or "<li class='muted'>Noch keine History.</li>"
         current_step_name = instance.current_step.name if instance.current_step else "—"
         assignment_label = _workflow_assignment_label(instance.current_step)
+        open_tasks = [task for task in instance.tasks if task.status == "open"]
+        task_html = "".join(
+            f"<div class='workflow-task-row'><strong>{_escape(task.step.name if task.step else current_step_name)}</strong><span class='muted'>Zuständig: {_escape(task.assignment_target.label if task.assignment_target and task.assignment_target.label else assignment_label)} · Frist: {_escape(str(task.due_at) if task.due_at else 'keine')}</span></div>"
+            for task in sorted(open_tasks, key=lambda item: (item.due_at is None, item.due_at or item.created_at))
+        ) or "<p class='muted'>Keine offene Aufgabe für diesen Workflow.</p>"
         instance_cards.append(
             f"""
             <div class="workflow-instance-card">
@@ -4542,6 +4548,8 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
                 </div>
                 <span class="service-badge">{_escape(_workflow_status_label(instance.status))}</span>
               </div>
+              <h4>Offene Aufgabe</h4>
+              <div class="workflow-task-list">{task_html}</div>
               <div class="workflow-action-grid">{transition_buttons}</div>
               <details class="workflow-danger-zone">
                 <summary>Abschluss / Abbruch</summary>
@@ -4577,8 +4585,74 @@ def _render_workflow_panel(document: Document, db: Session | None) -> str:
           </div>
           <a class="chip" href="/ui/app?node_kind=document&node_id={document.id}">Zur Objektansicht</a>
         </div>
+        {subject_index_overview}
         {active_html}
         {start_panel}
+      </div>
+    """
+
+
+def _render_workflow_subject_index_overview(document: Document, db: Session) -> str:
+    metadata = metadata_from_json(document.metadata_json) or {}
+    metadata_fields = _document_type_fields_only(document.document_type)
+    metadata_html = _render_metadata_display(metadata, metadata_fields, empty_message="Keine strukturierten Metadaten.")
+    index_preview = (document.extracted_text_preview or "").strip()
+    if index_preview:
+        index_preview_html = f"<pre>{_escape(index_preview[:4000])}</pre>"
+    else:
+        index_preview_html = "<p class='muted'>Noch kein extrahierter Indextext vorhanden.</p>"
+    child_documents = (
+        db.query(Document)
+        .where(Document.parent_document_id == document.id, Document.deleted_at.is_(None))
+        .order_by(Document.source_attachment_index.asc().nullslast(), Document.created_at.asc())
+        .all()
+    )
+    child_rows = "".join(
+        f"<tr><td><a href='/ui/app?node_kind=document&node_id={child.id}'>{_escape(child.name)}</a></td><td>{_escape(child.relation_type or 'Child')}</td><td>{_escape(child.doc_type.value if hasattr(child.doc_type, 'value') else str(child.doc_type))}</td><td>{_escape(child.index_status or '—')}</td></tr>"
+        for child in child_documents
+    ) or "<tr><td colspan='4' class='muted'>Keine Child-Dokumente/Anhänge.</td></tr>"
+    stamp_rows = ""
+    if document.stamp_status or document.stamped_pdf_storage_path:
+        stamped_link = f"<a href='/ui/app/documents/{document.id}/stamped-pdf' target='_blank'>Gestempeltes PDF öffnen</a>" if document.stamped_pdf_storage_path else "—"
+        stamp_rows = f"""
+          <div class='meta-display-row'><div class='meta-display-label'>Stempelstatus</div><div class='meta-display-value'>{_escape(document.stamp_status or '—')}</div></div>
+          <div class='meta-display-row'><div class='meta-display-label'>Stempelvorlage</div><div class='meta-display-value'>{_escape(document.stamp_template_id or '—')}</div></div>
+          <div class='meta-display-row'><div class='meta-display-label'>Gestempelt</div><div class='meta-display-value'>{stamped_link}</div></div>
+        """
+    return f"""
+      <div class="workflow-subject-card">
+        <div class="section-head">
+          <div>
+            <div class="eyebrow">Workflow-Objekt / Indexdaten</div>
+            <h3 style="margin:0;">{_escape(document.title or document.name)}</h3>
+            <p class="muted">Diese Übersicht bleibt in der Workflow-Maske sichtbar, damit Prüfer/Freigeber die Index- und Metadaten direkt vor sich haben.</p>
+          </div>
+          <a class="chip" href="/ui/app/documents/{document.id}/download" target="_blank">Original öffnen</a>
+        </div>
+        <div class="workflow-index-grid">
+          <div class="workflow-index-box">
+            <h4>Basis & Index</h4>
+            <div class="meta-display-row"><div class="meta-display-label">Dateiname</div><div class="meta-display-value">{_escape(document.name)}</div></div>
+            <div class="meta-display-row"><div class="meta-display-label">Typ</div><div class="meta-display-value">{_escape(document.document_type.name if document.document_type else (document.doc_type.value if hasattr(document.doc_type, 'value') else str(document.doc_type)))}</div></div>
+            <div class="meta-display-row"><div class="meta-display-label">MIME</div><div class="meta-display-value">{_escape(document.mime_type or '—')}</div></div>
+            <div class="meta-display-row"><div class="meta-display-label">Indexstatus</div><div class="meta-display-value">{_escape(document.index_status or '—')}</div></div>
+            <div class="meta-display-row"><div class="meta-display-label">Index-Engine</div><div class="meta-display-value">{_escape(document.index_engine or '—')}</div></div>
+            <div class="meta-display-row"><div class="meta-display-label">Textlänge</div><div class="meta-display-value">{_escape(str(document.extracted_text_length or 0))}</div></div>
+            {stamp_rows}
+          </div>
+          <div class="workflow-index-box">
+            <h4>Strukturierte Metadaten</h4>
+            {metadata_html}
+          </div>
+        </div>
+        <details class="workflow-index-text" open>
+          <summary>Extrahierter Indextext</summary>
+          {index_preview_html}
+        </details>
+        <details class="workflow-index-text">
+          <summary>Child-Dokumente / Mail-Anhänge</summary>
+          <table><thead><tr><th>Name</th><th>Relation</th><th>Typ</th><th>Index</th></tr></thead><tbody>{child_rows}</tbody></table>
+        </details>
       </div>
     """
 
@@ -5026,6 +5100,15 @@ def _render_app_page(
     .workflow-hero:hover {{ text-decoration:none; border-color:rgba(110,231,183,0.58); box-shadow:0 0 0 4px rgba(110,231,183,0.13), 0 18px 46px rgba(110,231,183,0.14); }}
     .workflow-hero-icon {{ display:grid; place-items:center; width:42px; height:42px; border-radius:16px; background:rgba(110,231,183,0.18); color:#d6fff0; font-size:1.4rem; }}
     .workflow-panel {{ scroll-margin-top:18px; }}
+    .workflow-subject-card {{ margin:14px 0; padding:16px; border-radius:18px; border:1px solid rgba(110,231,183,0.18); background:linear-gradient(135deg, rgba(110,231,183,0.07), rgba(77,212,255,0.04)); }}
+    .workflow-index-grid {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; margin-top:12px; }}
+    .workflow-index-box {{ padding:12px; border-radius:16px; border:1px solid rgba(77,212,255,0.10); background:rgba(0,0,0,0.10); }}
+    .workflow-index-box h4 {{ margin:0 0 10px; }}
+    .workflow-index-text {{ margin-top:12px; padding:10px 12px; border-radius:14px; border:1px solid rgba(77,212,255,0.10); background:rgba(255,255,255,0.025); }}
+    .workflow-index-text summary {{ cursor:pointer; color:#d6fff0; font-weight:700; }}
+    .workflow-index-text pre {{ max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-size:.86rem; }}
+    .workflow-task-list {{ display:grid; gap:8px; margin-bottom:10px; }}
+    .workflow-task-row {{ display:flex; justify-content:space-between; gap:12px; align-items:center; padding:9px 11px; border-radius:13px; background:rgba(77,212,255,0.055); border:1px solid rgba(77,212,255,0.10); }}
     .workflow-instance-card {{ margin-top:14px; padding:16px; border-radius:18px; border:1px solid rgba(77,212,255,0.12); background:rgba(255,255,255,0.035); }}
     .workflow-chip-row {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
     .workflow-chip {{ display:inline-flex; align-items:center; gap:6px; padding:5px 9px; border-radius:999px; background:rgba(77,212,255,0.08); border:1px solid rgba(77,212,255,0.14); color:var(--muted); font-size:.82rem; }}
@@ -5042,6 +5125,7 @@ def _render_app_page(
     .workflow-inbox-hero-link {{ display:inline-flex; align-items:center; gap:10px; position:absolute; top:16px; right:16px; padding:10px 13px; border-radius:16px; border:1px solid rgba(110,231,183,0.22); background:rgba(110,231,183,0.08); color:var(--text); z-index:1; }}
     .workflow-inbox-hero-link:hover {{ text-decoration:none; border-color:rgba(110,231,183,0.48); box-shadow:0 0 0 4px rgba(110,231,183,0.10); }}
     .workflow-count-badge {{ display:inline-grid; place-items:center; min-width:28px; height:28px; padding:0 8px; border-radius:999px; background:rgba(110,231,183,0.20); color:#d6fff0; font-weight:800; }}
+    @media (max-width:900px) {{ .workflow-index-grid, .workflow-task-row {{ display:grid; grid-template-columns:1fr; }} }}
     .service-card::before {{ content:""; position:absolute; inset:0; background: linear-gradient(135deg, rgba(79,140,255,0.10), rgba(77,212,255,0.03) 55%, transparent 80%); pointer-events:none; }}
     .service-header {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; position:relative; z-index:1; }}
     .service-badge {{ display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:rgba(110,231,183,0.10); border:1px solid rgba(110,231,183,0.18); color:#d6fff0; font-size:.85rem; }}
