@@ -15,7 +15,7 @@ Lightweight Enterprise Content Management with Full-Text Search.
 - 🔄 Workflow Designer, runtime tasks/history, invoice MVP seed and workflow inbox
 - 🏷️ Metadata and tagging
 - ⚙️ Configurable via YAML
-- 🐳 Docker-ready for local OpenSearch
+- 🐳 Docker Compose setup for Archiva + PostgreSQL + OpenSearch
 
 ## Stack
 
@@ -135,9 +135,45 @@ Important paths/ports:
 - Workflow Designer: `http://localhost:8000/ui/workflow-designer`
 - Workflow Inbox: `http://localhost:8000/ui/app/workflows/inbox`
 
-### 6. Optional: OpenSearch
+### 6. Docker Compose full stack
 
-OpenSearch is optional for local development. If it is not reachable, Archiva still maintains the PostgreSQL fallback index so queue jobs do not stay permanently blocked.
+For Windows, Linux or macOS container-based operation, Docker Compose can run the full stack: Archiva app, PostgreSQL 16 and OpenSearch 2.x.
+
+```bash
+# Optional but recommended outside throwaway local dev
+export ARCHIVA_SESSION_SECRET="change-this-to-a-long-random-secret"
+
+docker compose up -d --build
+```
+
+Open:
+
+- Login: `http://localhost:8000/ui/login`
+- App UI: `http://localhost:8000/ui/app`
+- Admin UI: `http://localhost:8000/ui/admin`
+- API docs: `http://localhost:8000/docs`
+
+Create the initial admin user once after the first start:
+
+```bash
+docker compose exec \
+  -e ARCHIVA_ADMIN_EMAIL="admin@archiva.local" \
+  -e ARCHIVA_ADMIN_NAME="Archiva Admin" \
+  -e ARCHIVA_ADMIN_PASSWORD="change-me" \
+  app python scripts/bootstrap-admin.py
+```
+
+Compose uses `config/docker.yaml` inside the app container and persists data in Docker volumes:
+
+- `archiva-documents`
+- `postgres-data`
+- `opensearch-data`
+
+Windows-specific notes are in [`WINDOWS_DOCKER_SETUP.md`](WINDOWS_DOCKER_SETUP.md).
+
+### 7. Optional: OpenSearch only
+
+OpenSearch is optional for non-Docker local development. If it is not reachable, Archiva still maintains the PostgreSQL fallback index so queue jobs do not stay permanently blocked.
 
 ```bash
 docker compose up -d opensearch
@@ -149,7 +185,7 @@ Check it with:
 curl http://localhost:9200
 ```
 
-### 7. One-command empty local install
+### 8. One-command empty local install
 
 For a fresh, empty and working local system, use the install script:
 
@@ -175,7 +211,7 @@ scripts/install-empty-system.sh --help
 
 If no admin password is provided, the first bootstrap login uses an empty password. Set a real password immediately in `Admin → Identity & Rollen`.
 
-### 8. Start Archiva
+### 9. Start Archiva
 
 Recommended:
 
@@ -199,7 +235,7 @@ The app creates/updates required tables on startup, including compatibility colu
 
 No separate Alembic command is required for the current local setup.
 
-### 8. Restart after code changes
+### 10. Restart after code changes
 
 The main app on `:8000` may run without reload depending on `config.yaml` (`app.debug: false` by default). After changing server-rendered UI/code, restart the process:
 

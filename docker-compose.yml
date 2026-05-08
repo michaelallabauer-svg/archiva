@@ -1,11 +1,55 @@
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: archiva:local
+    container_name: archiva-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_started
+    environment:
+      ARCHIVA_SESSION_SECRET: ${ARCHIVA_SESSION_SECRET:-change-this-session-secret-for-non-local-use}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config/docker.yaml:/app/config.yaml:ro
+      - archiva-documents:/app/data/documents
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: archiva-postgres
+    environment:
+      POSTGRES_DB: archiva
+      POSTGRES_USER: archiva
+      POSTGRES_PASSWORD: archiva
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U archiva -d archiva"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   opensearch:
     image: opensearchproject/opensearch:2.19.1
     container_name: archiva-opensearch
     environment:
       discovery.type: single-node
       DISABLE_SECURITY_PLUGIN: "true"
-      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "ArchivaDev-2026!"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-ArchivaLocalAdmin123!}
       OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
     ports:
       - "9200:9200"
@@ -19,6 +63,15 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
 
 volumes:
+  archiva-documents:
+  postgres-data:
   opensearch-data:
