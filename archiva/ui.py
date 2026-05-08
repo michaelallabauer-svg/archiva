@@ -8,6 +8,7 @@ import hmac
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1469,6 +1470,322 @@ def seed_invoice_mvp(db: Session) -> dict[str, Any]:
     return {"created": created, "cabinet": cabinet, "document_type": document_type, "workflow": workflow}
 
 
+def _xml_attr(element: ET.Element, name: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool):
+        element.set(name, "true" if value else "false")
+        return
+    element.set(name, str(value))
+
+
+def _xml_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "ja", "on"}
+
+
+def _xml_int(value: str | None, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metadata_field_to_xml(parent: ET.Element, field: MetadataField) -> None:
+    field_el = ET.SubElement(parent, "metadata-field")
+    for name in [
+        "name",
+        "field_type",
+        "label",
+        "description",
+        "placeholder",
+        "default_value",
+        "is_required",
+        "is_unique",
+        "order",
+        "width",
+        "config_json",
+        "options",
+        "min_value",
+        "max_value",
+        "min_length",
+        "max_length",
+        "pattern",
+    ]:
+        _xml_attr(field_el, name, getattr(field, name, None))
+
+
+def _document_type_to_xml(parent: ET.Element, document_type: DocumentType) -> None:
+    doc_el = ET.SubElement(parent, "document-type")
+    for name in [
+        "name",
+        "description",
+        "icon",
+        "file_type",
+        "md5_duplicate_check",
+        "pdf_stampede_auto_stamp",
+        "pdf_stampede_template_id",
+        "order",
+    ]:
+        _xml_attr(doc_el, name, getattr(document_type, name, None))
+    fields_el = ET.SubElement(doc_el, "metadata-fields")
+    for field in sorted(document_type.fields, key=lambda item: (item.order, item.name)):
+        _metadata_field_to_xml(fields_el, field)
+
+
+def export_structure_xml(db: Session) -> str:
+    """Export Archiva definition and instance structure as XML.
+
+    The export intentionally excludes uploaded documents and workflow runtime
+    instances. It captures the reusable structure: cabinet/register/document
+    definitions, metadata fields, concrete cabinets and concrete registers.
+    """
+    root = ET.Element("archiva-structure", version="1", generated_at=datetime.utcnow().isoformat())
+    definitions_el = ET.SubElement(root, "definitions")
+    instances_el = ET.SubElement(root, "instances")
+
+    cabinet_types = db.query(CabinetType).order_by(CabinetType.order, CabinetType.name).all()
+    for cabinet_type in cabinet_types:
+        ct_el = ET.SubElement(definitions_el, "cabinet-type")
+        _xml_attr(ct_el, "name", cabinet_type.name)
+        _xml_attr(ct_el, "description", cabinet_type.description)
+        _xml_attr(ct_el, "order", cabinet_type.order)
+
+        ct_fields_el = ET.SubElement(ct_el, "metadata-fields")
+        for field in sorted(cabinet_type.metadata_fields, key=lambda item: (item.order, item.name)):
+            _metadata_field_to_xml(ct_fields_el, field)
+
+        register_types_el = ET.SubElement(ct_el, "register-types")
+        for register_type in sorted(cabinet_type.register_types, key=lambda item: (item.order, item.name)):
+            rt_el = ET.SubElement(register_types_el, "register-type")
+            _xml_attr(rt_el, "name", register_type.name)
+            _xml_attr(rt_el, "description", register_type.description)
+            _xml_attr(rt_el, "order", register_type.order)
+            rt_fields_el = ET.SubElement(rt_el, "metadata-fields")
+            for field in sorted(register_type.metadata_fields, key=lambda item: (item.order, item.name)):
+                _metadata_field_to_xml(rt_fields_el, field)
+            rt_doc_types_el = ET.SubElement(rt_el, "document-types")
+            for document_type in sorted(register_type.document_type_definitions, key=lambda item: (item.order, item.name)):
+                _document_type_to_xml(rt_doc_types_el, document_type)
+
+        ct_doc_types_el = ET.SubElement(ct_el, "document-types")
+        for document_type in sorted(cabinet_type.document_type_definitions, key=lambda item: (item.order, item.name)):
+            _document_type_to_xml(ct_doc_types_el, document_type)
+
+        cabinets_el = ET.SubElement(instances_el, "cabinet-type-instances", cabinet_type=cabinet_type.name)
+        active_cabinets = [cabinet for cabinet in cabinet_type.cabinets if cabinet.deleted_at is None]
+        for cabinet in sorted(active_cabinets, key=lambda item: (item.order, item.name)):
+            cabinet_el = ET.SubElement(cabinets_el, "cabinet")
+            _xml_attr(cabinet_el, "name", cabinet.name)
+            _xml_attr(cabinet_el, "description", cabinet.description)
+            _xml_attr(cabinet_el, "metadata_json", cabinet.metadata_json)
+            _xml_attr(cabinet_el, "order", cabinet.order)
+            cabinet_fields_el = ET.SubElement(cabinet_el, "metadata-fields")
+            for field in sorted(cabinet.metadata_fields, key=lambda item: (item.order, item.name)):
+                _metadata_field_to_xml(cabinet_fields_el, field)
+            cabinet_doc_types_el = ET.SubElement(cabinet_el, "document-types")
+            for document_type in sorted(cabinet.document_types, key=lambda item: (item.order, item.name)):
+                _document_type_to_xml(cabinet_doc_types_el, document_type)
+            registers_el = ET.SubElement(cabinet_el, "registers")
+            active_registers = [register for register in cabinet.registers if register.deleted_at is None]
+            for register in sorted(active_registers, key=lambda item: (item.order, item.name)):
+                register_el = ET.SubElement(registers_el, "register")
+                _xml_attr(register_el, "name", register.name)
+                _xml_attr(register_el, "description", register.description)
+                _xml_attr(register_el, "metadata_json", register.metadata_json)
+                _xml_attr(register_el, "order", register.order)
+                _xml_attr(register_el, "register_type", register.register_type.name if register.register_type else None)
+                register_fields_el = ET.SubElement(register_el, "metadata-fields")
+                for field in sorted(register.metadata_fields, key=lambda item: (item.order, item.name)):
+                    _metadata_field_to_xml(register_fields_el, field)
+                register_doc_types_el = ET.SubElement(register_el, "document-types")
+                for document_type in sorted(register.document_types, key=lambda item: (item.order, item.name)):
+                    _document_type_to_xml(register_doc_types_el, document_type)
+
+    ET.indent(root, space="  ")
+    return ET.tostring(root, encoding="unicode", xml_declaration=True)
+
+
+def _upsert_metadata_field(db: Session, target_filter: dict[str, Any], field_el: ET.Element) -> tuple[MetadataField, bool]:
+    name = (field_el.get("name") or "").strip()
+    if not name:
+        raise ValueError("Metadatenfeld ohne name")
+    query = db.query(MetadataField).where(MetadataField.name == name)
+    for column_name, column_value in target_filter.items():
+        query = query.where(getattr(MetadataField, column_name) == column_value)
+    field = query.first()
+    created = field is None
+    if field is None:
+        field = MetadataField(name=name, **target_filter)
+        db.add(field)
+    field.field_type = field_el.get("field_type") or "text"
+    field.label = field_el.get("label") or name
+    field.description = field_el.get("description") or None
+    field.placeholder = field_el.get("placeholder") or None
+    field.default_value = field_el.get("default_value") or None
+    field.is_required = _xml_bool(field_el.get("is_required"))
+    field.is_unique = _xml_bool(field_el.get("is_unique"))
+    field.order = _xml_int(field_el.get("order"))
+    field.width = field_el.get("width") or "half"
+    field.config_json = field_el.get("config_json") or None
+    field.options = field_el.get("options") or None
+    field.min_value = _xml_int(field_el.get("min_value"), 0) if field_el.get("min_value") else None
+    field.max_value = _xml_int(field_el.get("max_value"), 0) if field_el.get("max_value") else None
+    field.min_length = _xml_int(field_el.get("min_length"), 0) if field_el.get("min_length") else None
+    field.max_length = _xml_int(field_el.get("max_length"), 0) if field_el.get("max_length") else None
+    field.pattern = field_el.get("pattern") or None
+    db.flush()
+    return field, created
+
+
+def _import_metadata_fields(db: Session, parent_el: ET.Element | None, target_filter: dict[str, Any], stats: dict[str, int]) -> None:
+    if parent_el is None:
+        return
+    for field_el in parent_el.findall("metadata-field"):
+        _field, created = _upsert_metadata_field(db, target_filter, field_el)
+        stats["metadata_fields_created" if created else "metadata_fields_updated"] += 1
+
+
+def _upsert_document_type(db: Session, target_filter: dict[str, Any], doc_el: ET.Element) -> tuple[DocumentType, bool]:
+    name = (doc_el.get("name") or "").strip()
+    if not name:
+        raise ValueError("Dokumenttyp ohne name")
+    query = db.query(DocumentType).where(DocumentType.name == name)
+    for column_name, column_value in target_filter.items():
+        query = query.where(getattr(DocumentType, column_name) == column_value)
+    document_type = query.first()
+    created = document_type is None
+    if document_type is None:
+        document_type = DocumentType(name=name, **target_filter)
+        db.add(document_type)
+    document_type.description = doc_el.get("description") or None
+    document_type.icon = doc_el.get("icon") or None
+    document_type.file_type = doc_el.get("file_type") or None
+    document_type.md5_duplicate_check = _xml_bool(doc_el.get("md5_duplicate_check"), True)
+    document_type.pdf_stampede_auto_stamp = _xml_bool(doc_el.get("pdf_stampede_auto_stamp"), False)
+    document_type.pdf_stampede_template_id = doc_el.get("pdf_stampede_template_id") or None
+    document_type.order = _xml_int(doc_el.get("order"))
+    db.flush()
+    return document_type, created
+
+
+def _import_document_types(db: Session, parent_el: ET.Element | None, target_filter: dict[str, Any], stats: dict[str, int]) -> None:
+    if parent_el is None:
+        return
+    for doc_el in parent_el.findall("document-type"):
+        document_type, created = _upsert_document_type(db, target_filter, doc_el)
+        stats["document_types_created" if created else "document_types_updated"] += 1
+        _import_metadata_fields(db, doc_el.find("metadata-fields"), {"document_type_id": document_type.id}, stats)
+
+
+def import_structure_xml(db: Session, xml_text: str) -> dict[str, int]:
+    root = ET.fromstring(xml_text)
+    if root.tag != "archiva-structure":
+        raise ValueError("Keine Archiva-Struktur-XML")
+    stats = {
+        "cabinet_types_created": 0,
+        "cabinet_types_updated": 0,
+        "register_types_created": 0,
+        "register_types_updated": 0,
+        "document_types_created": 0,
+        "document_types_updated": 0,
+        "metadata_fields_created": 0,
+        "metadata_fields_updated": 0,
+        "cabinets_created": 0,
+        "cabinets_updated": 0,
+        "registers_created": 0,
+        "registers_updated": 0,
+    }
+    definitions_el = root.find("definitions")
+    if definitions_el is not None:
+        for ct_el in definitions_el.findall("cabinet-type"):
+            name = (ct_el.get("name") or "").strip()
+            if not name:
+                continue
+            cabinet_type = db.query(CabinetType).where(CabinetType.name == name).first()
+            created = cabinet_type is None
+            if cabinet_type is None:
+                cabinet_type = CabinetType(name=name)
+                db.add(cabinet_type)
+            cabinet_type.description = ct_el.get("description") or None
+            cabinet_type.order = _xml_int(ct_el.get("order"))
+            db.flush()
+            stats["cabinet_types_created" if created else "cabinet_types_updated"] += 1
+            _import_metadata_fields(db, ct_el.find("metadata-fields"), {"cabinet_type_id": cabinet_type.id}, stats)
+
+            register_types_el = ct_el.find("register-types")
+            if register_types_el is not None:
+                for rt_el in register_types_el.findall("register-type"):
+                    rt_name = (rt_el.get("name") or "").strip()
+                    if not rt_name:
+                        continue
+                    register_type = db.query(RegisterType).where(RegisterType.cabinet_type_id == cabinet_type.id, RegisterType.name == rt_name).first()
+                    rt_created = register_type is None
+                    if register_type is None:
+                        register_type = RegisterType(cabinet_type_id=cabinet_type.id, name=rt_name)
+                        db.add(register_type)
+                    register_type.description = rt_el.get("description") or None
+                    register_type.order = _xml_int(rt_el.get("order"))
+                    db.flush()
+                    stats["register_types_created" if rt_created else "register_types_updated"] += 1
+                    _import_metadata_fields(db, rt_el.find("metadata-fields"), {"register_type_id": register_type.id}, stats)
+                    _import_document_types(db, rt_el.find("document-types"), {"register_type_id": register_type.id}, stats)
+
+            _import_document_types(db, ct_el.find("document-types"), {"cabinet_type_id": cabinet_type.id}, stats)
+
+    instances_el = root.find("instances")
+    if instances_el is not None:
+        for cti_el in instances_el.findall("cabinet-type-instances"):
+            ct_name = (cti_el.get("cabinet_type") or "").strip()
+            cabinet_type = db.query(CabinetType).where(CabinetType.name == ct_name).first() if ct_name else None
+            if cabinet_type is None:
+                continue
+            for cabinet_el in cti_el.findall("cabinet"):
+                cabinet_name = (cabinet_el.get("name") or "").strip()
+                if not cabinet_name:
+                    continue
+                cabinet = db.query(Cabinet).where(Cabinet.cabinet_type_id == cabinet_type.id, Cabinet.name == cabinet_name).first()
+                cabinet_created = cabinet is None
+                if cabinet is None:
+                    cabinet = Cabinet(cabinet_type_id=cabinet_type.id, name=cabinet_name)
+                    db.add(cabinet)
+                cabinet.description = cabinet_el.get("description") or None
+                cabinet.metadata_json = cabinet_el.get("metadata_json") or None
+                cabinet.order = _xml_int(cabinet_el.get("order"))
+                cabinet.deleted_at = None
+                db.flush()
+                stats["cabinets_created" if cabinet_created else "cabinets_updated"] += 1
+                _import_metadata_fields(db, cabinet_el.find("metadata-fields"), {"cabinet_id": cabinet.id}, stats)
+                _import_document_types(db, cabinet_el.find("document-types"), {"cabinet_id": cabinet.id}, stats)
+
+                registers_el = cabinet_el.find("registers")
+                if registers_el is not None:
+                    for register_el in registers_el.findall("register"):
+                        register_name = (register_el.get("name") or "").strip()
+                        if not register_name:
+                            continue
+                        register = db.query(Register).where(Register.cabinet_id == cabinet.id, Register.name == register_name).first()
+                        register_created = register is None
+                        if register is None:
+                            register = Register(cabinet_id=cabinet.id, name=register_name)
+                            db.add(register)
+                        rt_name = register_el.get("register_type") or ""
+                        register_type = db.query(RegisterType).where(RegisterType.cabinet_type_id == cabinet_type.id, RegisterType.name == rt_name).first() if rt_name else None
+                        register.register_type_id = register_type.id if register_type else None
+                        register.description = register_el.get("description") or None
+                        register.metadata_json = register_el.get("metadata_json") or None
+                        register.order = _xml_int(register_el.get("order"))
+                        register.deleted_at = None
+                        db.flush()
+                        stats["registers_created" if register_created else "registers_updated"] += 1
+                        _import_metadata_fields(db, register_el.find("metadata-fields"), {"register_id": register.id}, stats)
+                        _import_document_types(db, register_el.find("document-types"), {"register_id": register.id}, stats)
+
+    db.commit()
+    return stats
+
+
 @router.get("/login", response_class=HTMLResponse)
 async def ui_login_page(
     request: Request,
@@ -1546,6 +1863,7 @@ async def ui_admin_home(
             selected_definition_kind=selected_definition_kind,
             selected_definition_id=selected_definition_id,
             selected_metadata_field_id=selected_metadata_field_id,
+            message=message,
         )
     )
 
@@ -1582,8 +1900,44 @@ async def ui_admin_document_type_detail(
             selected_definition_kind=selected_definition_kind or "document_type",
             selected_definition_id=selected_definition_id or str(document_type_id),
             selected_metadata_field_id=selected_metadata_field_id,
+            message=message,
         )
     )
+
+
+@router.get("/admin/structure/export.xml")
+async def ui_admin_export_structure_xml(
+    db: Session = Depends(get_db),
+) -> Response:
+    xml_content = export_structure_xml(db)
+    filename = f"archiva-structure-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.xml"
+    return Response(
+        content=xml_content,
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/admin/structure/import")
+async def ui_admin_import_structure_xml(
+    structure_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    if not structure_file.filename.lower().endswith(".xml"):
+        return _ui_redirect_with_message("/ui/admin?message=Bitte+eine+XML-Datei+auswählen")
+    try:
+        raw = await structure_file.read()
+        stats = import_structure_xml(db, raw.decode("utf-8-sig"))
+    except ET.ParseError:
+        db.rollback()
+        return _ui_redirect_with_message("/ui/admin?message=XML+konnte+nicht+gelesen+werden")
+    except Exception as exc:
+        db.rollback()
+        return _ui_redirect_with_message(f"/ui/admin?message={quote_plus(f'Strukturimport fehlgeschlagen: {exc}')}")
+    created = sum(value for key, value in stats.items() if key.endswith("_created"))
+    updated = sum(value for key, value in stats.items() if key.endswith("_updated"))
+    message = f"Struktur importiert: {created} neu, {updated} aktualisiert"
+    return _ui_redirect_with_message(f"/ui/admin?message={quote_plus(message)}")
 
 
 @router.get("/admin/queues", response_class=HTMLResponse)
@@ -4148,6 +4502,7 @@ def _render_admin_page(
     selected_definition_kind: str | None = None,
     selected_definition_id: str | None = None,
     selected_metadata_field_id: str | None = None,
+    message: str | None = None,
 ) -> str:
     structure_html = _render_structure(cabinets)
     definition_structure_html = _render_definition_structure(
@@ -4186,6 +4541,7 @@ def _render_admin_page(
     pdf_stampede_base_url = str(settings.pdf_stampede.base_url).rstrip("/")
     pdf_stampede_editor_url = pdf_stampede_base_url[:-7] if pdf_stampede_base_url.endswith("/api/v1") else pdf_stampede_base_url
     pdf_stampede_editor_url = f"{pdf_stampede_editor_url.rstrip('/')}/admin/pdf-stamp-editor"
+    message_html = f'<div class="message">{_escape(message)}</div>' if message else ""
 
     return f"""
 <!doctype html>
@@ -4228,6 +4584,7 @@ def _render_admin_page(
     .pill {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(77,212,255,0.12); border-radius: 999px; padding: 7px 11px; color: var(--text); font-size:.92rem; }}
     .grid {{ display: grid; grid-template-columns: 320px minmax(0, 1fr) 360px; gap: 16px; align-items:start; }}
     .panel {{ background: linear-gradient(180deg, rgba(18,25,51,0.96), rgba(15,22,48,0.96)); border: 1px solid rgba(77,212,255,0.10); border-radius: 18px; padding: 16px; box-shadow: var(--shadow); }}
+    .message {{ margin-bottom:16px; padding:12px 14px; border-radius:16px; border:1px solid rgba(110,231,183,.28); background:rgba(110,231,183,.10); color:#d9ffec; }}
     .panel h2, .panel h3 {{ margin-top: 0; }}
     .stack {{ display: grid; gap: 20px; }}
     .cols {{ display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 20px; }}
@@ -4323,6 +4680,7 @@ def _render_admin_page(
           <a class="pill" href="/ui/admin/queues">Queues & Logs</a>
           <a class="pill" href="/ui/admin/trash">Papierkorb</a>
           <a class="pill" href="/ui/admin/identity">Identity & Rollen</a>
+          <a class="pill" href="/ui/admin/structure/export.xml">Struktur XML Export</a>
           <a class="pill" href="/ui/workflow-designer">Workflow Designer</a>
           <a class="pill" href="{_escape(pdf_stampede_editor_url)}" target="_blank" rel="noopener">PDFStampede Vorlagen</a>
           <form method="post" action="/ui/admin/setup/invoice-mvp" style="margin:0; display:inline-flex;"><button class="pill" type="submit">Eingangsrechnungs-MVP einrichten</button></form>
@@ -4337,6 +4695,7 @@ def _render_admin_page(
         </div>
       </div>
     </section>
+    {message_html}
     <section class="grid">
       <aside class="stack">
         <div class="panel tree"><h2>Definitionsmodell</h2>{definition_structure_html}</div>
@@ -8238,7 +8597,18 @@ def _render_admin_create_panel(
             <button type="button" class="primary admin-create-toggle" data-target="admin-form-cabinet">Cabinet</button>
             <button type="button" class="primary admin-create-toggle" data-target="admin-form-register">Register</button>
             <button type="button" class="primary admin-create-toggle" data-target="admin-form-metadata-field">Metadatenfeld</button>
+            <button type="button" class="primary admin-create-toggle" data-target="admin-form-structure-xml">XML Export/Import</button>
           </div>
+        </div>
+
+        <div class="panel admin-create-section" id="admin-form-structure-xml" style="display:none; margin-bottom:0;">
+          <h3>Struktur XML exportieren/importieren</h3>
+          <p class="muted">Exportiert Definitionen und Objektstruktur: Cabinettypen, Registertypen, Dokumenttypen, Metadatenfelder sowie konkrete Cabinets/Register. Dokumentdateien und Workflow-Laufzeiten bleiben draußen.</p>
+          <div class="actions"><a class="primary pill" href="/ui/admin/structure/export.xml">Struktur als XML exportieren</a></div>
+          <form method="post" action="/ui/admin/structure/import" enctype="multipart/form-data" style="margin-top:16px;">
+            <div class="field-grid"><div class="field full"><label>XML-Datei importieren</label><input type="file" name="structure_file" accept=".xml,application/xml,text/xml" required><p class="small">Import ist idempotent nach Namen/Pfad: vorhandene Elemente werden aktualisiert, fehlende angelegt.</p></div></div>
+            <div class="actions"><button class="primary" type="submit">XML-Struktur importieren</button></div>
+          </form>
         </div>
 
         <form method="post" action="/ui/admin/cabinet-types" class="panel admin-create-section" id="admin-form-cabinet-type" style="display:none; margin-bottom:0;"><h3>Cabinettyp anlegen</h3><p class="muted">Definiere die fachliche Klasse von Cabinets, z. B. ERB, Personal oder Verträge.</p><div class="field-grid"><div class="field"><label>Name</label><input type="text" name="name" required></div><div class="field"><label>Reihenfolge</label><input type="number" name="order" value="0"></div><div class="field full"><label>Beschreibung</label><textarea name="description"></textarea></div></div><div class="actions"><button class="primary" type="submit">Cabinettyp speichern</button></div></form>

@@ -8,6 +8,7 @@ Lightweight Enterprise Content Management with Full-Text Search.
 - 🧩 Admin-managed document/object definitions: Cabinet Types, Cabinets, Registers, Document Types, Metadata Fields
 - 🔐 Login-protected UI with local users, roles, password hashes and signed sessions
 - 📝 App workspace for daily ECM work: browse structure, capture documents, edit object metadata values
+- 🔁 XML export/import for Admin object structure and metadata definitions
 - ✅ Server-side metadata validation driven by document type definitions
 - 🔍 Full-text search with OpenSearch when available and PostgreSQL fallback indexing
 - 🖼️ Preview/index queue worker started together with the app
@@ -250,6 +251,28 @@ uv run python -m archiva.main
 
 If the browser still shows old UI, hard-refresh with `Cmd+Shift+R`.
 
+
+## Admin structure XML export/import
+
+The Admin UI can export and import the reusable object structure as XML.
+
+Open `Admin → Objekte anlegen → XML Export/Import` or use the authenticated direct download link:
+
+```text
+http://localhost:8000/ui/admin/structure/export.xml
+```
+
+The XML contains:
+
+- Cabinet Types
+- Register Types
+- Document Types
+- Metadata Fields
+- concrete Cabinets and Registers
+
+It intentionally excludes uploaded document files, document rows, preview/index jobs and workflow runtime instances.
+
+Import is available in the same Admin panel. It is idempotent by name/path: existing structure entries are updated, missing entries are created.
 
 ## Login and Identity
 
