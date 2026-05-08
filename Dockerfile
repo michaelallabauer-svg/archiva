@@ -27,7 +27,7 @@ RUN python -m pip install --upgrade pip \
 
 RUN useradd --create-home --uid 10001 archiva \
     && mkdir -p /app/data/documents \
-    && chown -R archiva:archiva /app/data
+    && chown -R archiva:archiva /app
 
 USER archiva
 
