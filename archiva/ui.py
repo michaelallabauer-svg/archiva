@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import logging
 import os
 import re
+import secrets
+import smtplib
 import time
 import xml.etree.ElementTree as ET
 from html import escape
-from datetime import datetime, timedelta
+from email.message import EmailMessage
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -30,7 +34,7 @@ from archiva.config import load_settings
 from archiva.email_attachments import create_email_attachment_children
 from archiva.email_utils import email_metadata, parse_eml
 from archiva.metadata_validation import metadata_from_json, validate_document_metadata, MetadataValidationError
-from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowHistoryEvent, WorkflowInstance, WorkflowStepDefinition, WorkflowTask, WorkflowTransitionDefinition
+from archiva.models import AssignmentTarget, Cabinet, CabinetType, DocType, Document, DocumentType, IndexJob, MetadataField, PasswordResetToken, PreviewJob, Register, RegisterType, Role, Team, TeamMembership, User, UserRoleAssignment, WorkflowDefinition, WorkflowHistoryEvent, WorkflowInstance, WorkflowStepDefinition, WorkflowTask, WorkflowTransitionDefinition
 from archiva.preview_queue import enqueue_preview_job, get_latest_preview_artifact, get_latest_preview_job
 from archiva.pdf_stampede import PdfStampedeError, list_pdf_stampede_templates, stamp_pdf_with_pdf_stampede
 from archiva.indexer.dispatcher import enqueue_document_index
@@ -41,9 +45,11 @@ from archiva.storage import StorageManager
 from archiva.workflow_runtime import WorkflowRuntimeError, active_instances_for_document, cancel_workflow, complete_workflow, start_workflow_for_document, transition_workflow
 
 router = APIRouter(tags=["ui"])
+logger = logging.getLogger("archiva.ui")
 
 SESSION_COOKIE_NAME = "archiva_session"
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 12
+PASSWORD_RESET_MAX_AGE_SECONDS = 60 * 30
 PASSWORD_HASHER = PasswordHasher()
 
 
@@ -51,8 +57,44 @@ def _auth_secret() -> str:
     return os.environ.get("ARCHIVA_SESSION_SECRET") or "archiva-local-dev-session-secret"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 def _hash_password(password: str) -> str:
     return PASSWORD_HASHER.hash(password)
+
+
+def _hash_reset_token(token: str) -> str:
+    return hmac.new(_auth_secret().encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _send_password_reset_email(to_email: str, reset_url: str) -> None:
+    settings = load_settings()
+    mail = settings.mail
+    subject = "Archiva Passwort zuruecksetzen"
+    body = (
+        "Hallo,\n\n"
+        "fuer dein Archiva-Konto wurde ein Passwort-Reset angefordert.\n"
+        f"Oeffne diesen Link innerhalb von 30 Minuten:\n\n{reset_url}\n\n"
+        "Wenn du das nicht warst, kannst du diese Nachricht ignorieren.\n"
+    )
+    if not mail.smtp_host:
+        logger.warning("Archiva password reset link for %s: %s", to_email, reset_url)
+        return
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = mail.from_email
+    message["To"] = to_email
+    message.set_content(body)
+
+    with smtplib.SMTP(mail.smtp_host, mail.smtp_port, timeout=10) as smtp:
+        if mail.use_tls:
+            smtp.starttls()
+        if mail.smtp_user:
+            smtp.login(mail.smtp_user, mail.smtp_password or "")
+        smtp.send_message(message)
 
 
 def _verify_legacy_pbkdf2_password(password: str, password_hash: str) -> bool:
@@ -1819,6 +1861,87 @@ async def ui_login_submit(
     return response
 
 
+@router.get("/password-reset", response_class=HTMLResponse)
+async def ui_password_reset_request_page(
+    message: str | None = None,
+) -> HTMLResponse:
+    return HTMLResponse(content=_render_password_reset_request_page(message=message))
+
+
+@router.post("/password-reset")
+async def ui_password_reset_request_submit(
+    request: Request,
+    email: str = Form(...),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    normalized_email = email.strip().lower()
+    user = db.query(User).where(User.email.ilike(normalized_email), User.status == "active").first()
+    if user:
+        now = _utc_now()
+        db.query(PasswordResetToken).where(
+            PasswordResetToken.user_id == user.id,
+            PasswordResetToken.used_at.is_(None),
+        ).update({"used_at": now})
+        token = secrets.token_urlsafe(32)
+        reset_token = PasswordResetToken(
+            user_id=user.id,
+            token_hash=_hash_reset_token(token),
+            expires_at=now + timedelta(seconds=PASSWORD_RESET_MAX_AGE_SECONDS),
+        )
+        db.add(reset_token)
+        db.commit()
+        base_url = str(request.base_url).rstrip("/")
+        reset_url = f"{base_url}/ui/reset-password?token={quote_plus(token)}"
+        try:
+            _send_password_reset_email(user.email, reset_url)
+        except Exception:
+            logger.exception("Failed to send Archiva password reset email to %s", user.email)
+
+    message = "Wenn die Adresse bekannt ist, wurde ein Reset-Link versendet."
+    return RedirectResponse(url=f"/ui/password-reset?message={quote_plus(message)}", status_code=303)
+
+
+@router.get("/reset-password", response_class=HTMLResponse)
+async def ui_password_reset_page(
+    token: str = "",
+    message: str | None = None,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    reset_token = None
+    if token:
+        reset_token = db.query(PasswordResetToken).where(
+            PasswordResetToken.token_hash == _hash_reset_token(token),
+            PasswordResetToken.used_at.is_(None),
+            PasswordResetToken.expires_at >= _utc_now(),
+        ).first()
+    return HTMLResponse(content=_render_password_reset_page(token=token, token_valid=bool(reset_token), message=message))
+
+
+@router.post("/reset-password")
+async def ui_password_reset_submit(
+    token: str = Form(...),
+    password: str = Form(...),
+    password_confirm: str = Form(...),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    reset_token = db.query(PasswordResetToken).where(
+        PasswordResetToken.token_hash == _hash_reset_token(token),
+        PasswordResetToken.used_at.is_(None),
+        PasswordResetToken.expires_at >= _utc_now(),
+    ).first()
+    if not reset_token or not reset_token.user or reset_token.user.status != "active":
+        return RedirectResponse(url="/ui/reset-password?message=Reset-Link ist ungueltig oder abgelaufen", status_code=303)
+    if password != password_confirm:
+        return RedirectResponse(url=f"/ui/reset-password?token={quote_plus(token)}&message={quote_plus('Passwoerter stimmen nicht ueberein')}", status_code=303)
+    if len(password) < 8:
+        return RedirectResponse(url=f"/ui/reset-password?token={quote_plus(token)}&message={quote_plus('Passwort muss mindestens 8 Zeichen haben')}", status_code=303)
+
+    reset_token.user.password_hash = _hash_password(password)
+    reset_token.used_at = _utc_now()
+    db.commit()
+    return RedirectResponse(url=f"/ui/login?message={quote_plus('Passwort wurde aktualisiert')}", status_code=303)
+
+
 @router.post("/logout")
 async def ui_logout() -> RedirectResponse:
     response = RedirectResponse(url="/ui/login?message=Abgemeldet", status_code=303)
@@ -2117,6 +2240,7 @@ async def ui_app_home(
             db,
             workflow_panel == "1",
             active_workflow_count,
+            index_search_submitted=request.query_params.get("index_search") == "1",
         )
     )
 
@@ -4166,16 +4290,17 @@ def _render_queue_panel(title: str, subtitle: str, jobs: list[Any], kind: str) -
                 diagnostics_html = f"<div class='queue-diagnostics'>{' · '.join(part for part in diag_parts if part and not part.endswith(': '))}</div>"
                 if getattr(document, 'index_error', None):
                     diagnostics_html += f"<div class='queue-error'>{_escape(str(document.index_error))}</div>"
-        rows.append(
-            "<div class='queue-item'>"
-            f"<div class='queue-head'><div><strong>{_escape(document_name)}</strong><div class='queue-meta'>{' · '.join(meta_parts)}</div></div><span class='queue-status queue-status-{_escape(status.lower())}'>{_escape(status)}</span></div>"
-            + diagnostics_html
-            + (f"<div class='queue-error'>{_escape(error_message)}</div>" if error_message else "")
-            + (f"<div class='queue-actions'><a class='pill' href='/ui/app/documents/{document.id}'>Dokument öffnen</a><a class='pill' href='/ui/admin/documents/{document.id}/extracted-text' target='_blank' rel='noopener noreferrer'>Extrahierten Text anzeigen</a><form method='post' action='/ui/admin/documents/{document.id}/reindex' style='display:inline;'><button class='pill' type='submit'>Indexjob wiederholen</button></form></div>" if document and kind == 'index' else (f"<div class='queue-actions'><a class='pill' href='/ui/app/documents/{document.id}'>Dokument öffnen</a></div>" if document else ""))
-            + "</div>"
-        )
-
-    return f"<div class='panel'><h2>{_escape(title)}</h2><p class='muted'>{_escape(subtitle)}</p><div class='queue-list'>{''.join(rows)}</div></div>"
+        actions = ''
+        if document:
+            actions = f'<a href="/ui/app/documents/{document.id}">Dokument öffnen</a>'
+            if kind == 'index':
+                actions += (f'<a href="/ui/admin/documents/{document.id}/extracted-text" target="_blank" rel="noopener noreferrer">Extrahierten Text anzeigen</a>'
+                            f'<form method="post" action="/ui/admin/documents/{document.id}/reindex"><button type="submit">Indexjob wiederholen</button></form>')
+        action_cell = _row_action_cell(document_name, actions) if actions else '<td class="row-actions-cell">—</td>'
+        rows.append(f'<tr data-overview-row tabindex="0">{action_cell}<td>{_escape(document_name)}</td><td>{_escape(status)}</td>'
+                    f'<td>{" · ".join(meta_parts)}</td><td>{diagnostics_html or "—"}</td><td>{_escape(error_message or "—")}</td></tr>')
+    table = _render_overview_table(['Dokument', 'Status', 'Laufzeiten / Versuche', 'Diagnose', 'Fehler'], rows, caption=title)
+    return f"<div class='panel'><h2>{_escape(title)}</h2><p class='muted'>{_escape(subtitle)}</p>{table}</div>"
 
 
 
@@ -4220,6 +4345,8 @@ def _render_admin_queues_page(*, preview_jobs: list[PreviewJob], index_jobs: lis
     .queue-diagnostics {{ margin-top:12px; color:var(--muted); font-size:.84rem; line-height:1.5; padding-top:10px; border-top:1px solid rgba(255,255,255,0.06); }}
     .queue-actions {{ margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }}
   </style>
+<link rel="stylesheet" href="/assets/overview-tables.css?v=1">
+<script src="/assets/overview-tables.js?v=1" defer></script>
 </head>
 <body>
   <div class="page">
@@ -4255,13 +4382,9 @@ def _render_admin_trash_page(
         return getattr(item, "deleted_by_label", None) or (user.display_name if user else "Unbekannt")
 
     def trash_item(*, label: str, title: str, subtitle: str, deleted_at: Any, deleted_by: str, restore_url: str) -> str:
-        return (
-            "<div class='trash-item'>"
-            f"<div><strong>{_escape(label)} {_escape(title)}</strong>"
-            f"<div class='trash-meta'>{_escape(subtitle)} · Gelöscht: {_escape(str(deleted_at or ''))} · Von: {_escape(deleted_by)}</div></div>"
-            f"<form method='post' action='{_escape(restore_url)}'><button class='pill primary' type='submit'>Wiederherstellen</button></form>"
-            "</div>"
-        )
+        actions = f'<form method="post" action="{_escape(restore_url)}"><button type="submit">Wiederherstellen</button></form>'
+        values = [title, label, subtitle, str(deleted_at or ''), deleted_by]
+        return f'<tr data-overview-row tabindex="0">{_row_action_cell(title, actions)}' + ''.join(f'<td>{_escape(value)}</td>' for value in values) + '</tr>'
 
     rows: list[str] = []
     for cabinet in deleted_cabinets:
@@ -4298,10 +4421,8 @@ def _render_admin_trash_page(
             )
         )
 
-    if rows:
-        trash_html = "<div class='trash-list'>" + "".join(rows) + "</div>"
-    else:
-        trash_html = "<div class='panel'><p class='muted'>Der Papierkorb ist leer.</p></div>"
+    trash_html = _render_overview_table(['Name', 'Art', 'Beschreibung', 'Gelöscht am', 'Gelöscht von'], rows,
+                                        caption=f'{len(rows)} Einträge im Papierkorb', empty_message='Der Papierkorb ist leer.')
     message_html = f"<div class='message'>{_escape(message)}</div>" if message else ""
     total_count = len(rows)
     return f"""
@@ -4321,6 +4442,8 @@ def _render_admin_trash_page(
     .pillbar, .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }} .pill {{ display:inline-flex; align-items:center; border-radius:999px; padding:8px 12px; background:rgba(255,255,255,.04); border:1px solid rgba(77,212,255,.12); color:var(--text); font:inherit; cursor:pointer; }} .primary {{ background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:white; }}
     .trash-list {{ display:grid; gap:12px; }} .trash-item {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }} .trash-meta {{ margin-top:8px; line-height:1.45; font-size:.9rem; }} .message {{ margin-bottom:16px; color:#d9ffec; border-color:rgba(110,231,183,.28); background:rgba(110,231,183,.10); }}
   </style>
+<link rel="stylesheet" href="/assets/overview-tables.css?v=1">
+<script src="/assets/overview-tables.js?v=1" defer></script>
 </head>
 <body>
   <div class="page">
@@ -4421,6 +4544,8 @@ def _render_admin_identity_page(
     @media (max-width: 1100px) {{ .identity-workspace {{ grid-template-columns:1fr; }} }}
     @media (max-width: 720px) {{ .page {{ padding:10px; }} .field-grid, .def-detail-row {{ grid-template-columns:1fr; }} .identity-head {{ display:grid; }} }}
   </style>
+<link rel="stylesheet" href="/assets/overview-tables.css?v=1">
+<script src="/assets/overview-tables.js?v=1" defer></script>
 </head>
 <body>
   <div class="page">
@@ -4471,6 +4596,7 @@ def _render_login_page(*, return_to: str = "/ui/app", message: str | None = None
     button {{ width:100%; margin-top:16px; border:0; border-radius:999px; padding:12px 14px; font:inherit; cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#fff; box-shadow:0 8px 24px rgba(77,212,255,.24); }}
     .login-message {{ margin-bottom:12px; padding:10px 12px; border-radius:14px; background:rgba(77,212,255,.10); border:1px solid rgba(77,212,255,.18); color:var(--text); }}
     .hint {{ margin-top:12px; font-size:.9rem; color:var(--muted); }}
+    .text-link {{ display:inline-block; margin-top:12px; color:var(--accent-2); text-decoration:none; font-weight:700; }}
   </style>
 </head>
 <body>
@@ -4482,7 +4608,95 @@ def _render_login_page(*, return_to: str = "/ui/app", message: str | None = None
     <div class="field"><label>E-Mail</label><input type="email" name="email" autocomplete="username" required autofocus></div>
     <div class="field"><label>Passwort</label><input type="password" name="password" autocomplete="current-password"></div>
     <button type="submit">Einloggen</button>
+    <a class="text-link" href="/ui/password-reset">Passwort vergessen?</a>
     <div class="hint">Dev-Hinweis: Solange noch kein Passwort gesetzt wurde, ist initialer Login mit leerem Passwort möglich.</div>
+  </form>
+</body>
+</html>
+"""
+
+
+def _render_password_reset_request_page(*, message: str | None = None) -> str:
+    message_html = f'<div class="login-message">{_escape(message)}</div>' if message else ""
+    return f"""
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archiva Passwort zuruecksetzen</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+  <style>
+    :root {{ color-scheme:dark; --bg:#0b1020; --panel:#121933; --panel-deep:#0f1630; --text:#eef2ff; --muted:#a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family:Inter, ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--text); }}
+    .login-card {{ width:min(440px, calc(100vw - 28px)); padding:22px; border-radius:24px; border:1px solid rgba(77,212,255,.14); background:linear-gradient(180deg, rgba(18,25,51,.97), rgba(15,22,48,.97)); box-shadow:0 22px 70px rgba(0,0,0,.38); }}
+    h1 {{ margin:0 0 8px; font-size:1.5rem; }}
+    p {{ margin:0 0 16px; color:var(--muted); line-height:1.45; }}
+    .field {{ display:grid; gap:6px; margin-top:12px; }}
+    label {{ font-weight:700; font-size:.94rem; }}
+    input {{ width:100%; border-radius:14px; border:1px solid rgba(77,212,255,.12); background:var(--panel-deep); color:var(--text); padding:12px; font:inherit; }}
+    button {{ width:100%; margin-top:16px; border:0; border-radius:999px; padding:12px 14px; font:inherit; cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#fff; }}
+    .login-message {{ margin-bottom:12px; padding:10px 12px; border-radius:14px; background:rgba(77,212,255,.10); border:1px solid rgba(77,212,255,.18); color:var(--text); }}
+    a {{ display:inline-block; margin-top:12px; color:var(--accent-2); text-decoration:none; font-weight:700; }}
+  </style>
+</head>
+<body>
+  <form class="login-card" method="post" action="/ui/password-reset">
+    <h1>Passwort zuruecksetzen</h1>
+    <p>Gib die E-Mail-Adresse deines Archiva-Kontos ein. Wenn sie bekannt ist, senden wir einen einmaligen Reset-Link.</p>
+    {message_html}
+    <div class="field"><label>E-Mail</label><input type="email" name="email" autocomplete="username" required autofocus></div>
+    <button type="submit">Reset-Link senden</button>
+    <a href="/ui/login">Zurueck zum Login</a>
+  </form>
+</body>
+</html>
+"""
+
+
+def _render_password_reset_page(*, token: str, token_valid: bool, message: str | None = None) -> str:
+    message_html = f'<div class="login-message">{_escape(message)}</div>' if message else ""
+    form_html = (
+        f"""
+        <input type="hidden" name="token" value="{_escape(token)}">
+        <div class="field"><label>Neues Passwort</label><input type="password" name="password" autocomplete="new-password" minlength="8" required autofocus></div>
+        <div class="field"><label>Neues Passwort wiederholen</label><input type="password" name="password_confirm" autocomplete="new-password" minlength="8" required></div>
+        <button type="submit">Passwort speichern</button>
+        """
+        if token_valid
+        else "<p>Dieser Reset-Link ist ungueltig oder abgelaufen.</p>"
+    )
+    return f"""
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archiva Neues Passwort</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
+  <style>
+    :root {{ color-scheme:dark; --bg:#0b1020; --panel:#121933; --panel-deep:#0f1630; --text:#eef2ff; --muted:#a8b2d1; --accent:#4f8cff; --accent-2:#4dd4ff; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center; font-family:Inter, ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--text); }}
+    .login-card {{ width:min(440px, calc(100vw - 28px)); padding:22px; border-radius:24px; border:1px solid rgba(77,212,255,.14); background:linear-gradient(180deg, rgba(18,25,51,.97), rgba(15,22,48,.97)); box-shadow:0 22px 70px rgba(0,0,0,.38); }}
+    h1 {{ margin:0 0 8px; font-size:1.5rem; }}
+    p {{ margin:0 0 16px; color:var(--muted); line-height:1.45; }}
+    .field {{ display:grid; gap:6px; margin-top:12px; }}
+    label {{ font-weight:700; font-size:.94rem; }}
+    input {{ width:100%; border-radius:14px; border:1px solid rgba(77,212,255,.12); background:var(--panel-deep); color:var(--text); padding:12px; font:inherit; }}
+    button {{ width:100%; margin-top:16px; border:0; border-radius:999px; padding:12px 14px; font:inherit; cursor:pointer; background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#fff; }}
+    .login-message {{ margin-bottom:12px; padding:10px 12px; border-radius:14px; background:rgba(77,212,255,.10); border:1px solid rgba(77,212,255,.18); color:var(--text); }}
+    a {{ display:inline-block; margin-top:12px; color:var(--accent-2); text-decoration:none; font-weight:700; }}
+  </style>
+</head>
+<body>
+  <form class="login-card" method="post" action="/ui/reset-password">
+    <h1>Neues Passwort setzen</h1>
+    <p>Waehle ein neues Passwort mit mindestens 8 Zeichen.</p>
+    {message_html}
+    {form_html}
+    <a href="/ui/login">Zurueck zum Login</a>
   </form>
 </body>
 </html>
@@ -4516,14 +4730,16 @@ def _render_admin_page(
         selected_definition_kind=selected_definition_kind,
         selected_definition_id=selected_definition_id,
     )
-    cabinet_type_list_html = "".join(
-        f'<li><strong>{_escape(cabinet_type.name)}</strong><div class="small">{_escape(cabinet_type.description or "Ohne Beschreibung")}</div></li>'
-        for cabinet_type in cabinet_types
-    ) or "<li>Keine Cabinettypen vorhanden.</li>"
-    type_list_html = "".join(
-        f'<li><a href="/ui/admin/document-types/{doc_type.id}">{doc_type.name}</a></li>'
-        for doc_type in document_types
-    ) or "<li>Keine Dokumenttypen vorhanden.</li>"
+    def definition_table(items, kind):
+        rows = []
+        for item in items:
+            href = f'/ui/admin?selected_definition_kind={kind}&selected_definition_id={item.id}'
+            actions = f'<a href="{_escape(href)}">Definition bearbeiten</a>'
+            rows.append(f'<tr data-overview-row tabindex="0">{_row_action_cell(item.name, actions)}'
+                        f'<td><a href="{_escape(href)}">{_escape(item.name)}</a></td><td>{_escape(item.description or "Ohne Beschreibung")}</td></tr>')
+        return _render_overview_table(['Name', 'Beschreibung'], rows, caption=f'{len(items)} Definitionen')
+    cabinet_type_list_html = definition_table(cabinet_types, 'cabinet_type')
+    type_list_html = definition_table(document_types, 'document_type')
     recent_documents_html = _render_recent_documents(recent_documents)
     admin_summary_html = _render_admin_summary(selected_document_type)
     admin_create_html = _render_admin_create_panel(
@@ -4656,6 +4872,8 @@ def _render_admin_page(
     @media (max-width: 1400px) {{ .grid {{ grid-template-columns: 280px minmax(0, 1fr); }} .admin-detail-column {{ grid-column: 1 / -1; }} }}
     @media (max-width: 1100px) {{ .grid, .hero, .cols {{ grid-template-columns: 1fr; }} }}
   </style>
+<link rel="stylesheet" href="/assets/overview-tables.css?v=1">
+<script src="/assets/overview-tables.js?v=1" defer></script>
 </head>
 <body>
   <div class="page">
@@ -4700,8 +4918,8 @@ def _render_admin_page(
       <aside class="stack">
         <div class="panel tree"><h2>Definitionsmodell</h2>{definition_structure_html}</div>
         <div class="panel tree"><h2>Instanzstruktur</h2>{structure_html}</div>
-        <div class="panel"><h2>Cabinettypen</h2><ul>{cabinet_type_list_html}</ul></div>
-        <div class="panel"><h2>Dokumenttypen</h2><ul>{type_list_html}</ul></div>
+        <div class="panel"><h2>Cabinettypen</h2>{cabinet_type_list_html}</div>
+        <div class="panel"><h2>Dokumenttypen</h2>{type_list_html}</div>
       </aside>
       <main class="stack">
         <div class="panel"><h2>Objekte anlegen</h2>{admin_create_html}</div>
@@ -4923,12 +5141,9 @@ def _render_search_results(documents: list[Document], search_query: str) -> tupl
             "<div class='panel'><p class='muted'>Keine Objekte für diese Suche oder Filter gefunden.</p></div>",
             f"<div class=\"panel\" style=\"margin-bottom:16px;\"><h2 style=\"margin-top:0;\">Suchtreffer</h2><p class=\"muted\">Volltextsuche nach: {_escape(search_query)}</p></div>",
         )
-    results = ''.join(
-        _render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}")
-        for document in documents
-    )
+    results = _render_document_table(documents)
     header = f"<div class=\"panel\" style=\"margin-bottom:16px;\"><h2 style=\"margin-top:0;\">Suchtreffer</h2><p class=\"muted\">Volltextsuche nach: {_escape(search_query)} · {len(documents)} Treffer</p></div>"
-    return f"<div class='object-list'>{results}</div>", header
+    return results, header
 
 
 def _workflow_assignment_label(step: WorkflowStepDefinition | None) -> str:
@@ -5108,10 +5323,11 @@ def _render_workflow_subject_index_overview(document: Document, db: Session) -> 
         .order_by(Document.source_attachment_index.asc().nullslast(), Document.created_at.asc())
         .all()
     )
-    child_rows = "".join(
-        f"<tr><td><a href='/ui/app?node_kind=document&node_id={child.id}'>{_escape(child.name)}</a></td><td>{_escape(child.relation_type or 'Child')}</td><td>{_escape(child.doc_type.value if hasattr(child.doc_type, 'value') else str(child.doc_type))}</td><td>{_escape(child.index_status or '—')}</td></tr>"
-        for child in child_documents
-    ) or "<tr><td colspan='4' class='muted'>Keine Child-Dokumente/Anhänge.</td></tr>"
+    child_rows = [f'<tr data-overview-row tabindex="0">{_row_action_cell(child.name, _document_row_actions(child))}'
+        f'<td><a href="/ui/app?node_kind=document&amp;node_id={child.id}">{_escape(child.name)}</a></td>'
+        f'<td>{_escape(child.relation_type or "Child")}</td><td>{_escape(child.doc_type.value if hasattr(child.doc_type, "value") else str(child.doc_type))}</td>'
+        f'<td>{_escape(child.index_status or "—")}</td></tr>' for child in child_documents]
+    child_table = _render_overview_table(['Name', 'Relation', 'Typ', 'Index'], child_rows, caption='Anhänge', empty_message='Keine Child-Dokumente/Anhänge.')
     stamp_rows = ""
     if document.stamp_status or document.stamped_pdf_storage_path:
         stamped_link = f"<a href='/ui/app/documents/{document.id}/stamped-pdf' target='_blank'>Gestempeltes PDF öffnen</a>" if document.stamped_pdf_storage_path else "—"
@@ -5152,7 +5368,7 @@ def _render_workflow_subject_index_overview(document: Document, db: Session) -> 
         </details>
         <details class="workflow-index-text">
           <summary>Child-Dokumente / Mail-Anhänge</summary>
-          <table><thead><tr><th>Name</th><th>Relation</th><th>Typ</th><th>Index</th></tr></thead><tbody>{child_rows}</tbody></table>
+          {child_table}
         </details>
       </div>
     """
@@ -5170,22 +5386,15 @@ def _render_workflow_inbox_page(tasks: list[WorkflowTask], active_count: int, do
         due_label = str(task.due_at) if task.due_at else "Keine Frist"
         subject_href = f"/ui/app?node_kind=document&node_id={instance.subject_id}&workflow_panel=1#workflow-panel" if instance and instance.subject_kind == "document" else "/ui/app"
         subject_label = (document.title or document.name) if document else (f"Dokument {str(instance.subject_id)[:8]}" if instance else "Objekt")
-        rows.append(
-            f"""
-            <a class="inbox-card" href="{_escape(subject_href)}">
-              <div class="inbox-card-main">
-                <div class="eyebrow">{_escape(workflow_name)}</div>
-                <h3>{_escape(step_name)}</h3>
-                <p class="muted">{_escape(subject_label)} · Zuständig: {_escape(assignment_label)}</p>
-              </div>
-              <div class="inbox-card-side">
-                <span class="service-badge">offen</span>
-                <span class="muted">{_escape(due_label)}</span>
-              </div>
-            </a>
-            """
-        )
-    rows_html = "".join(rows) or "<div class='panel'><p class='muted'>Keine offenen Workflow-Aufgaben. Sehr angenehm.</p></div>"
+        actions = f'<a href="{_escape(subject_href)}">Workflow öffnen</a>'
+        if document:
+            actions += _document_row_actions(document)
+        values = [workflow_name, step_name, assignment_label, due_label, 'offen']
+        rows.append(f'<tr data-overview-row tabindex="0">{_row_action_cell(subject_label, actions)}'
+                    f'<td><a href="{_escape(subject_href)}">{_escape(subject_label)}</a></td>'
+                    + ''.join(f'<td>{_escape(value)}</td>' for value in values) + '</tr>')
+    rows_html = _render_overview_table(['Dokument', 'Workflow', 'Schritt', 'Zuständig', 'Fällig', 'Status'], rows,
+                                       caption=f'{len(tasks)} offene Aufgaben', empty_message='Keine offenen Workflow-Aufgaben.')
     return f"""<!doctype html>
 <html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Archiva Workflow Inbox</title><link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
@@ -5201,7 +5410,9 @@ a {{ color:var(--accent-2); text-decoration:none; }} .muted {{ color:var(--muted
 .inbox-card:hover {{ border-color:rgba(77,212,255,.42); box-shadow:0 0 0 4px rgba(77,212,255,.10), 0 18px 48px rgba(0,0,0,.28); }}
 .inbox-card h3 {{ margin:4px 0 6px; }} .inbox-card p {{ margin:0; }} .inbox-card-side {{ display:grid; gap:8px; justify-items:end; min-width:130px; }}
 @media (max-width:760px) {{ .page {{ padding:10px; }} .hero, .inbox-card {{ display:grid; }} .inbox-card-side {{ justify-items:start; }} }}
-</style></head><body><div class="page">
+</style><link rel="stylesheet" href="/assets/overview-tables.css?v=1">
+<script src="/assets/overview-tables.js?v=1" defer></script>
+</head><body><div class="page">
 <div class="panel hero"><div><div class="eyebrow">Workflow Inbox</div><h1 style="margin:4px 0 0;">Offene Workflow-Aufgaben</h1><p class="muted">Arbeitsliste für aktive Workflow-Schritte in Archiva.</p><div class="pillbar"><a class="pill" href="/ui/app">Zur App</a><span class="pill">{_escape(active_count_label)}</span><span class="pill">{len(tasks)} offene Aufgaben</span></div></div></div>
 <div class="inbox-list">{rows_html}</div>
 </div></body></html>"""
@@ -5317,10 +5528,9 @@ def _render_invoice_dashboard_page(
         for status_name, count in status_counts.items()
         if count or status_name in status_order[:6]
     )
-    rows = "".join(
-        _render_invoice_dashboard_row(item)
-        for item in sorted(filtered, key=lambda item: (item["due_date"] or datetime.max, item["supplier"].lower()))
-    ) or '<tr><td colspan="8" class="muted">Keine Eingangsrechnungen für diese Filter.</td></tr>'
+    rows = [_render_invoice_dashboard_row(item) for item in sorted(filtered, key=lambda item: (item["due_date"] or datetime.max, item["supplier"].lower()))]
+    table_html = _render_overview_table(['ER-ID', 'Rechnung', 'Lieferant', 'Betrag', 'Fällig', 'Workflow', 'Index/Stempel'], rows,
+                                       caption=f'{len(filtered)} Rechnungen', empty_message='Keine Eingangsrechnungen für diese Filter.')
     return f"""<!doctype html>
 <html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Archiva Eingangsrechnungen Dashboard</title><link rel="icon" type="image/svg+xml" href="/assets/archiva-favicon.svg">
@@ -5337,11 +5547,13 @@ a {{ color:var(--accent-2); text-decoration:none; }} .muted {{ color:var(--muted
 table {{ width:100%; border-collapse:collapse; margin-top:12px; }} th, td {{ border-bottom:1px solid rgba(255,255,255,.08); padding:11px 9px; text-align:left; vertical-align:top; }} th {{ color:#d6fff0; font-size:.85rem; }} tr:hover td {{ background:rgba(77,212,255,.035); }}
 .status-chip {{ display:inline-flex; border-radius:999px; padding:5px 9px; border:1px solid rgba(110,231,183,.18); background:rgba(110,231,183,.08); color:#d6fff0; font-size:.84rem; }} .danger {{ color:#ffcccc; }}
 @media (max-width:900px) {{ .hero, .filter-grid, .stats-grid {{ display:grid; grid-template-columns:1fr; }} table {{ font-size:.9rem; }} }}
-</style></head><body><div class="page">
+</style><link rel="stylesheet" href="/assets/overview-tables.css?v=1">
+<script src="/assets/overview-tables.js?v=1" defer></script>
+</head><body><div class="page">
 <div class="panel hero"><div><div class="eyebrow">Eingangsrechnungen</div><h1 style="margin:4px 0 0;">Dashboard</h1><p class="muted">Offene Rechnungen nach Workflowstatus, Fälligkeit, Lieferant und Geschäftsjahr.</p><div class="pillbar"><a class="pill" href="/ui/app">Zur App</a><a class="pill" href="/ui/app/workflows/inbox">Workflow Inbox</a><span class="pill">{len(enriched)} Rechnungen gesamt</span><span class="pill">{len(filtered)} im Filter</span><span class="pill">Summe: {_escape(f'{total_amount:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.'))} EUR</span></div></div><div><span class="service-badge">{overdue_count} überfällig</span><br><br><span class="service-badge">{due7_count} bald fällig</span></div></div>
 <div class="stats-grid">{status_cards}</div>
 <div class="panel"><form method="get" action="/ui/app/invoices/dashboard"><div class="filter-grid"><select name="status">{status_options}</select><select name="year">{year_options}</select><input type="search" name="supplier" value="{_escape(filters.get('supplier') or '')}" placeholder="Lieferant suchen"><select name="due">{due_options}</select></div><div class="actions"><button type="submit">Filtern</button><a class="pill" href="/ui/app/invoices/dashboard">Zurücksetzen</a><a class="pill" href="/ui/app?selected_document_type_id={_escape(str(documents[0].document_type_id) if documents else '')}#intake-form">Neue Rechnung erfassen</a></div></form></div>
-<div class="panel"><table><thead><tr><th>ER-ID</th><th>Rechnung</th><th>Lieferant</th><th>Betrag</th><th>Fällig</th><th>Workflow</th><th>Index/Stempel</th><th>Aktion</th></tr></thead><tbody>{rows}</tbody></table></div>
+{table_html}
 </div></body></html>"""
 
 
@@ -5355,7 +5567,8 @@ def _render_invoice_dashboard_row(item: dict[str, Any]) -> str:
     amount = f'{item["gross_amount"]:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
     stamped = " · gestempelt" if document.stamp_status == "ready" else (" · Stempel fehlgeschlagen" if document.stamp_status == "failed" else "")
     return f"""
-      <tr>
+      <tr data-overview-row tabindex="0">
+        {_row_action_cell(document.title or document.name, _document_row_actions(document))}
         <td>{_escape(str(metadata.get('er_id') or '—'))}</td>
         <td><a href="/ui/app?node_kind=document&node_id={document.id}">{_escape(str(metadata.get('invoice_number') or document.title or document.name))}</a><div class="muted">{_escape(document.name)}</div></td>
         <td>{_escape(item['supplier'])}</td>
@@ -5363,7 +5576,6 @@ def _render_invoice_dashboard_row(item: dict[str, Any]) -> str:
         <td class="{due_class}">{_escape(due_label)}</td>
         <td><span class="status-chip">{_escape(item['workflow_status'])}</span></td>
         <td>{_escape(document.index_status or '—')}{_escape(stamped)}</td>
-        <td><a class="pill" href="/ui/app?node_kind=document&node_id={document.id}&workflow_panel=1#workflow-panel">Öffnen</a></td>
       </tr>
     """
 
@@ -5409,6 +5621,7 @@ def _render_app_page(
     db: Session | None = None,
     workflow_panel_open: bool = False,
     active_workflow_count: int = 0,
+    index_search_submitted: bool = False,
 ) -> str:
     active_workflow_count_label = _active_workflow_count_label(active_workflow_count)
     recent_documents_html = _render_recent_documents(recent_documents)
@@ -5425,10 +5638,13 @@ def _render_app_page(
         search_query=search_query,
         filter_kind=filter_kind,
     )
-    if search_query.strip():
+    index_search_submitted = bool(selected_node and selected_node.get("kind") == "document_type" and (index_search_submitted or index_search_filters))
+    if search_query.strip() and not index_search_submitted:
         node_results_html, node_header_html = _render_search_results(all_documents, search_query)
     else:
-        node_results_html, node_header_html = _render_node_results(cabinets, all_documents, selected_node, search_query, index_search_filters or {}, document_types)
+        node_results_html, node_header_html = _render_node_results(cabinets, all_documents, selected_node, search_query, index_search_filters or {}, document_types, index_search_submitted=index_search_submitted)
+    if index_search_submitted:
+        object_summary_html = object_overview_html = ""
     context_panel_html = _render_context_panel(selected_node, cabinets, cabinet_types)
     selected_document = None
     if selected_node and selected_node.get("kind") == "document":
@@ -5725,8 +5941,10 @@ def _render_app_page(
     .banner {{ border-radius:18px; padding:14px 16px; margin-bottom:20px; border:1px solid rgba(77,212,255,0.16); }} .success-banner {{ background:rgba(110,231,183,.10); border-color:rgba(110,231,183,.26); color:#d9ffec; box-shadow:0 0 0 4px rgba(110,231,183,0.10); }} .error-banner {{ background:rgba(255,120,120,.12); border-color:rgba(255,120,120,.28); color:#ffd0d0; }}
     .success-actions {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }}
     .main-grid {{ display:grid; grid-template-columns: 1.15fr 0.85fr; gap:16px; align-items:start; }}
-    .workspace-grid {{ display:grid; grid-template-columns: minmax(280px, 320px) minmax(0, 1fr) minmax(320px, 380px); gap:14px; align-items:start; }}
+    .workspace-grid {{ display:grid; grid-template-columns: minmax(280px, 320px) minmax(0, 1fr); gap:14px; align-items:start; }}
+    .workspace-grid.has-selected-document {{ grid-template-columns: minmax(280px, 320px) minmax(0, 1fr) minmax(320px, 380px); }}
     .admin-detail-column {{ min-width:0; display:block !important; }}
+    .admin-detail-column[hidden] {{ display:none !important; }}
     .workspace-grid > .panel, .workspace-grid > div {{ min-width:0; }}
     .field-grid {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
     .compact-indexdata .field-grid {{ grid-template-columns: 1fr; gap:10px; }}
@@ -5825,6 +6043,21 @@ def _render_app_page(
     .tooltip-bubble {{ position:absolute; left:50%; bottom:calc(100% + 10px); transform:translateX(-50%); min-width:220px; max-width:320px; padding:10px 12px; border-radius:12px; background:#0f1630; border:1px solid rgba(77,212,255,0.24); box-shadow:0 18px 48px rgba(0,0,0,0.35); color:var(--text); font-size:.84rem; line-height:1.45; opacity:0; pointer-events:none; transition:opacity .14s ease, transform .14s ease; z-index:30; }}
     .tooltip:hover .tooltip-bubble, .tooltip:focus .tooltip-bubble, .tooltip:focus-within .tooltip-bubble {{ opacity:1; transform:translateX(-50%) translateY(-2px); }}
     .archive-tree {{ display:grid; gap:8px; position:relative; }}
+    .tree-density-control {{ display:flex; gap:4px; margin:0 0 14px; padding:3px; border:1px solid var(--border); border-radius:10px; }}
+    .tree-density-option {{ flex:1; position:relative; text-align:center; cursor:pointer; }}
+    .tree-density-option input {{ position:absolute; opacity:0; width:1px; height:1px; min-height:0; }}
+    .tree-density-option span {{ display:block; padding:6px 10px; border-radius:7px; font-size:.84rem; color:var(--muted); }}
+    .tree-density-option input:checked + span {{ background:rgba(77,212,255,.14); color:var(--accent-2); }}
+    .tree-density-option input:focus-visible + span {{ outline:2px solid var(--accent-2); outline-offset:1px; }}
+    .tree-compact .archive-tree {{ gap:3px; }}
+    .tree-compact .tree-node {{ padding:3px 6px; gap:5px; border-radius:7px; min-height:32px; font-size:.84rem; line-height:1.25; }}
+    .tree-compact .tree-actions {{ gap:4px; flex-shrink:0; }}
+    .tree-compact .tree-menu-button {{ padding:3px 6px; min-width:24px; min-height:24px; border-radius:6px; }}
+    .tree-compact .tree-link {{ min-width:0; overflow-wrap:anywhere; }}
+    .tree-compact .tree-node.depth-1 {{ margin-left:10px; }}
+    .tree-compact .tree-node.depth-2 {{ margin-left:20px; }}
+    .tree-compact .tree-node.depth-3 {{ margin-left:30px; }}
+    .tree-compact .tree-node.active, .tree-compact .tree-node.just-created {{ box-shadow:none; }}
     .tree-node {{ display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border-radius:14px; border:1px solid rgba(77,212,255,0.08); background:rgba(255,255,255,0.02); position:relative; }}
     .tree-node[data-menu]:hover {{ border-color:rgba(77,212,255,.32); }}
     .tree-actions {{ display:flex; align-items:center; gap:8px; }}
@@ -5867,12 +6100,28 @@ def _render_app_page(
     .metadata-value {{ color:var(--text); line-height:1.28; font-size:.94rem; word-break:break-word; }}
     .metadata-field-editor {{ padding:14px; border:1px solid rgba(77,212,255,0.10); border-radius:16px; background:rgba(255,255,255,0.025); margin-bottom:12px; }}
     .index-search-panel {{ border-color:rgba(110,231,183,0.18); background:linear-gradient(180deg, rgba(18,25,51,0.98), rgba(12,28,42,0.96)); }}
-    .index-search-form .field-grid {{ margin-top:12px; }}
+    .index-search-panel .field-grid {{ margin-top:12px; grid-template-columns:repeat(12, minmax(0, 1fr)); }}
+    .search-editor {{ margin-bottom:12px; }}
+    .search-editor > summary {{ cursor:pointer; color:var(--accent-2); padding:8px 0; }}
+    .search-editor[open] > summary {{ margin-bottom:8px; }}
+    .index-search-panel .field {{ min-width:0; grid-column:span 6; }}
+    .index-search-panel .field.width-full {{ grid-column:1 / -1; }}
+    .index-search-panel .field.width-half {{ grid-column:span 6; }}
+    .index-search-panel .field.width-third {{ grid-column:span 4; }}
+    .index-search-panel .field.width-quarter {{ grid-column:span 3; }}
+    .index-search-panel .field-heading {{ display:flex; align-items:center; gap:4px; }}
+    .index-search-panel .tooltip {{ flex-shrink:0; }}
+    .index-search-panel .tooltip-bubble {{ visibility:hidden; width:240px; min-width:0; max-width:70vw; font-weight:400; letter-spacing:normal; }}
+    .index-search-panel .tooltip:hover .tooltip-bubble,
+    .index-search-panel .tooltip:focus .tooltip-bubble {{ visibility:visible; }}
+    @media (max-width: 640px) {{ .index-search-panel .field-grid > .field {{ grid-column:1 / -1; }} }}
     .compact-checkbox-group {{ padding:10px; gap:6px; }}
     .compact-checkbox-group .checkbox-item {{ padding:6px 8px; }}
-    @media (max-width: 1200px) {{ .main-grid, .hero, .workspace-grid {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} .hero-card {{ padding-right:18px; }} .hero-action-row {{ position:relative; top:auto; right:auto; margin-top:14px; flex-wrap:wrap; }} }}
+    @media (max-width: 1200px) {{ .main-grid, .hero, .workspace-grid, .workspace-grid.has-selected-document {{ grid-template-columns: 1fr; }} .flow-lanes, .stats-grid, .hero-cta-strip {{ grid-template-columns: 1fr; }} .search-row {{ grid-template-columns: 1fr; }} .hero-card {{ padding-right:18px; }} .hero-action-row {{ position:relative; top:auto; right:auto; margin-top:14px; flex-wrap:wrap; }} }}
     @media (max-width: 820px) {{ .workflow-inbox-hero-link, .invoice-dashboard-hero-link {{ min-width:0; width:100%; }} }}
   </style>
+<link rel="stylesheet" href="/assets/overview-tables.css?v=1">
+<script src="/assets/overview-tables.js?v=1" defer></script>
 </head>
 <body>
   <div class="page">
@@ -5923,9 +6172,13 @@ def _render_app_page(
           <form method="post" action="/ui/logout" style="display:inline;"><button class="chip" type="submit">Abmelden</button></form>
         </div>
       </div>
-      <div class="workspace-grid">
-        <div class="panel" style="margin-bottom:0;">
+      <div class="workspace-grid{' has-selected-document' if selected_document else ''}">
+        <div class="panel" id="archive-tree-panel" style="margin-bottom:0;">
           <h2 style="margin-top:0;">Archivbaum{tooltip_hint.replace('Mehr Kontext bei Hover oder Fokus.', 'Strukturansicht von Cabinettypen, Cabinets, Registern und Dokumenttypen. Über das Kontextmenü kannst du direkt neue Elemente anlegen.')}</h2>
+          <div class="tree-density-control" role="group" aria-label="Archivbaum-Darstellung">
+            <label class="tree-density-option"><input type="radio" name="tree_density" value="normal" checked><span>Normal</span></label>
+            <label class="tree-density-option"><input type="radio" name="tree_density" value="compact"><span>Kompakt</span></label>
+          </div>
           {archive_tree_html}
           <div id="tree-context-menu" class="context-menu" aria-hidden="true"></div>
         </div>
@@ -5941,7 +6194,7 @@ def _render_app_page(
             {object_overview_html}
           </div>
         </div>
-        <div class="admin-detail-column" style="display:block;">
+        <div class="admin-detail-column" {'hidden' if not selected_document else ''}>
           <div class="panel compact-indexdata" style="margin-bottom:12px;">
             <h2 style="margin-top:0;">Inhaltsvorschau</h2>
             {workflow_hero_html}
@@ -5958,6 +6211,22 @@ def _render_app_page(
   </div>
   <script>
     const documentTypeSelect = document.getElementById('document-type-select');
+    const archiveTreePanel = document.getElementById('archive-tree-panel');
+    if (archiveTreePanel) {{
+      const densityKey = 'archiva.archiveTree.density';
+      const densityInputs = archiveTreePanel.querySelectorAll('input[name="tree_density"]');
+      const applyDensity = (value) => {{
+        const density = value === 'compact' ? 'compact' : 'normal';
+        archiveTreePanel.classList.toggle('tree-compact', density === 'compact');
+        densityInputs.forEach(input => {{ input.checked = input.value === density; }});
+      }};
+      try {{ applyDensity(localStorage.getItem(densityKey)); }} catch {{ applyDensity('normal'); }}
+      densityInputs.forEach(input => input.addEventListener('change', () => {{
+        if (!input.checked) return;
+        applyDensity(input.value);
+        try {{ localStorage.setItem(densityKey, input.value); }} catch {{ /* Ansicht bleibt ohne Speicherung nutzbar. */ }}
+      }}));
+    }}
     const fileInput = document.getElementById('file-input');
     const fileDropzone = document.getElementById('file-dropzone');
     const dropzoneHint = document.getElementById('dropzone-hint');
@@ -6079,6 +6348,11 @@ def _render_app_page(
     }}
 
     if (window.location.hash === '#metadata-workbench') openMetadataWorkbench();
+    const createMode = new URLSearchParams(window.location.search).get('create');
+    if (['cabinet', 'register'].includes(createMode)) {{
+      const params = new URLSearchParams(window.location.search);
+      openQuickCreate(createMode, params.get('node_kind') || '', params.get('node_id') || '');
+    }}
 
     document.querySelectorAll('[data-menu]').forEach((node) => {{
       const trigger = node.querySelector('button.tree-menu-button');
@@ -7340,15 +7614,7 @@ def _render_admin_summary(selected_document_type: DocumentType | None) -> str:
 
 
 def _render_recent_documents(recent_documents: list[Document]) -> str:
-    if not recent_documents:
-        return "<p class='muted'>Noch keine Dokumente gespeichert.</p>"
-    cards = []
-    for document in recent_documents:
-        metadata = metadata_from_json(document.metadata_json)
-        metadata_html = f"<pre>{json.dumps(metadata, ensure_ascii=False, indent=2)}</pre>" if metadata else ""
-        doc_type_label = document.document_type.name if document.document_type else "ohne Typ"
-        cards.append(f"<div class='panel'><div><strong>{document.title or document.name}</strong></div><div class='muted'>{doc_type_label} · {document.created_at}</div>{metadata_html}</div>")
-    return "".join(cards)
+    return _render_document_table(recent_documents, caption='Zuletzt erfasste Dokumente')
 
 
 def _render_definition_structure(
@@ -7942,13 +8208,22 @@ def _render_document_object_card(document: Document, href: str) -> str:
     )
 
 
+def _render_search_hint(text: str, hint_id: str) -> str:
+    return (
+        f'<span class="tooltip" tabindex="0" role="img" aria-label="Hinweis" '
+        f'aria-describedby="{_escape(hint_id)}">?'
+        f'<span class="tooltip-bubble" role="tooltip" id="{_escape(hint_id)}">'
+        f'{_escape(text)}</span></span>'
+    )
+
+
 def _render_index_search_input(field: MetadataField, selected_values: list[str]) -> str:
     input_name = f"idx_{field.name}"
     label = field.label or field.name
     selected = selected_values or []
     selected_first = selected[0] if selected else ""
     options = _parse_field_options(field)
-    description_html = f'<div class="muted field-help">{_escape(field.description)}</div>' if field.description else ""
+    description_html = _render_search_hint(field.description, f"{input_name}_help") if field.description else ""
     if field.field_type == "boolean":
         control = (
             f'<select name="{_escape(input_name)}">'
@@ -7969,14 +8244,16 @@ def _render_index_search_input(field: MetadataField, selected_values: list[str])
             for option in options
         ) + '</div>'
     elif field.field_type == "date":
-        control = f'<input type="date" name="{_escape(input_name)}" value="{_escape(selected_first)}">'
+        control = f'<input type="date" name="{_escape(input_name)}" value="{_escape(selected_first)}" autocomplete="off">'
     elif field.field_type == "datetime":
-        control = f'<input type="datetime-local" name="{_escape(input_name)}" value="{_escape(selected_first)}">'
+        control = f'<input type="datetime-local" name="{_escape(input_name)}" value="{_escape(selected_first)}" autocomplete="off">'
     elif field.field_type in ("number", "currency"):
         control = f'<input type="number" step="any" name="{_escape(input_name)}" value="{_escape(selected_first)}" placeholder="Wert suchen">'
     else:
         control = f'<input type="search" name="{_escape(input_name)}" value="{_escape(selected_first)}" placeholder="{_escape(label)} suchen">'
-    return f'<div class="field {_metadata_width_class(field.width)}"><label>{_escape(label)}</label>{control}{description_html}</div>'
+    if not (field.field_type == "multi_selection" and options):
+        control = control.replace('name="', f'id="{_escape(input_name)}" name="', 1)
+    return f'<div class="field {_metadata_width_class(field.width)}"><div class="field-heading"><label for="{_escape(input_name)}">{_escape(label)}</label>{description_html}</div>{control}</div>'
 
 
 def _render_document_type_index_search(
@@ -8000,13 +8277,17 @@ def _render_document_type_index_search(
         <div class="section-head">
           <div>
             <div class="eyebrow">Indexdaten-Suche</div>
-            <h2 style="margin:0;">{_escape(document_type.name)} suchen</h2>
-            <p class="muted" style="margin:6px 0 0;">Indexdaten eingeben und passende Dokumente dieses Typs filtern. {result_count} Treffer aktuell.</p>
+            <h2 style="margin:0;">{_escape(document_type.name)} suchen{_render_search_hint('Indexdaten eingeben und passende Dokumente dieses Typs filtern. Leere Felder schränken die Suche nicht ein.', 'index-search-help')}</h2>
+            <p style="margin:6px 0 0;">{result_count} Treffer aktuell.</p>
           </div>
-          <a class="chip" href="{_escape(reset_url)}">Zurücksetzen</a>
+          <div class="actions" style="margin-top:0;">
+            <button class="primary" type="submit" form="index-search-form-{_escape(str(document_type.id))}">Suchen</button>
+            <a class="chip" href="{_escape(reset_url)}">Zurücksetzen</a>
+          </div>
         </div>
-        <form method="get" action="/ui/app" class="index-search-form">
+        <form method="get" action="/ui/app" id="index-search-form-{_escape(str(document_type.id))}" class="index-search-form" autocomplete="off">
           <input type="hidden" name="node_kind" value="document_type">
+          <input type="hidden" name="index_search" value="1">
           <input type="hidden" name="node_id" value="{_escape(str(document_type.id))}">
           <input type="hidden" name="q" value="{_escape(search_query)}">
           <div class="field-grid">{field_inputs}</div>
@@ -8020,6 +8301,111 @@ def _render_document_type_index_search(
     """
 
 
+def _row_action_cell(label: str, actions_html: str) -> str:
+    return (
+        '<td class="row-actions-cell">'
+        f'<button type="button" class="row-action-trigger" aria-label="Aktionen für {_escape(label)}" '
+        'aria-haspopup="menu" aria-expanded="false" title="Aktionen">⋯</button>'
+        f'<template class="row-action-template">{actions_html}</template></td>'
+    )
+
+
+def _document_row_actions(document: Document) -> str:
+    doc_id = _escape(str(document.id))
+    href = f'/ui/app?node_kind=document&amp;node_id={doc_id}'
+    label = document.title or document.name
+    return (
+        f'<a href="{href}">Öffnen / Vorschau</a>'
+        f'<a href="/ui/app/documents/{doc_id}">Details öffnen</a>'
+        f'<a href="{href}" target="_blank" rel="noopener noreferrer">In neuem Tab öffnen</a>'
+        f'<a href="{href}&amp;workflow_panel=1#workflow-panel">Workflow anzeigen</a>'
+        f'<form method="post" action="/ui/app/documents/{doc_id}/workflows/start-invoice">'
+        '<button type="submit">Eingangsrechnungs-WF starten</button></form>'
+        f'<form method="post" action="/ui/app/documents/{doc_id}/delete" '
+        f'data-confirm="{_escape(label)} in den Papierkorb verschieben?">'
+        f'<input type="hidden" name="return_to" value="{_escape(_document_archive_focus_url(document))}">'
+        '<button type="submit" class="danger-action">Löschen</button></form>'
+    )
+
+
+def _render_overview_table(headings: list[str], rows: list[str], *, caption: str, empty_message: str = "Keine Einträge vorhanden.") -> str:
+    header = '<th scope="col" class="row-actions-cell" aria-label="Aktionen">⋯</th>' + ''.join(
+        f'<th scope="col">{_escape(heading)}</th>' for heading in headings
+    )
+    body = ''.join(rows) or f'<tr><td colspan="{len(headings) + 1}">{_escape(empty_message)}</td></tr>'
+    return (
+        '<div class="search-results-container"><label class="search-scroll-control" hidden>'
+        '<span>Spalten scrollen</span><input type="range" min="0" max="0" value="0" step="1" aria-label="Tabelle horizontal scrollen"></label>'
+        '<div class="panel search-results-scroll" tabindex="0" role="region" '
+        f'aria-label="{_escape(caption)}, horizontal und vertikal scrollbar"><table class="search-results-table">'
+        f'<caption>{_escape(caption)}</caption><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table></div></div>'
+    )
+
+
+def _render_document_table(documents: list[Document], fields: list[MetadataField] | None = None, *, caption: str | None = None, selected_id: str = "") -> str:
+    if fields is None:
+        by_name: dict[str, MetadataField] = {}
+        seen_types: set[str] = set()
+        for document in documents:
+            key = str(document.document_type_id)
+            if key not in seen_types:
+                seen_types.add(key)
+                for field in _definition_fields_for_document_type(document.document_type):
+                    by_name.setdefault(field.name, field)
+        fields = list(by_name.values())
+    headings = ['Dokument', 'Dokumenttyp', 'Status'] + [field.label or field.name for field in fields] + ['Erstellt']
+    rows = []
+    for document in documents:
+        metadata = metadata_from_json(document.metadata_json) or {}
+        cells = ''.join(f'<td>{_escape(_format_metadata_display_value(metadata.get(field.name)))}</td>' for field in fields)
+        created = document.created_at.strftime('%d.%m.%Y') if document.created_at else '—'
+        label = document.title or document.name
+        selected = ' class="is-selected" aria-selected="true"' if str(document.id) == selected_id else ''
+        rows.append(
+            f'<tr data-overview-row tabindex="0"{selected}>'
+            + _row_action_cell(label, _document_row_actions(document))
+            + f'<td><a href="/ui/app?node_kind=document&amp;node_id={_escape(str(document.id))}">{_escape(label)}</a></td>'
+            + f'<td>{_escape(document.document_type.name if document.document_type else "Ohne Dokumenttyp")}</td>'
+            + f'<td>{"Klassifiziert" if document.document_type else "Offen"}</td>{cells}<td>{created}</td></tr>'
+        )
+    return _render_overview_table(headings, rows, caption=caption or f'{len(documents)} Dokumente', empty_message='Keine Dokumente gefunden.')
+
+
+def _render_structure_table(entries: list[tuple[str, Any, str]]) -> str:
+    rows = []
+    for kind, item, summary in entries:
+        href = f'/ui/app?node_kind={kind}&node_id={item.id}'
+        actions = f'<a href="{_escape(href)}">Öffnen</a><a href="{_escape(href)}" target="_blank" rel="noopener noreferrer">In neuem Tab öffnen</a>'
+        definitions = _creation_actions_for_node(node_kind=kind, node_id=str(item.id), node_label=item.name,
+            cabinet=item if kind == 'cabinet' else None, register=item if kind == 'register' else None,
+            document_type=item if kind == 'document_type' else None)
+        for action in definitions:
+            action_kind = action['action']
+            if action_kind == 'delete-node':
+                actions += (f'<form method="post" action="/ui/app/{kind}s/{item.id}/delete" data-confirm="{_escape(item.name)} in den Papierkorb verschieben?">'
+                            '<input type="hidden" name="return_to" value="/ui/app">'
+                            '<button type="submit" class="danger-action">Löschen</button></form>')
+            else:
+                target = href
+                if action_kind == 'edit-metadata':
+                    target += '#metadata-workbench'
+                elif action_kind == 'new-document':
+                    target += f'&selected_document_type_id={action["document_type_id"]}#intake-form'
+                elif action_kind in {'new-cabinet', 'new-register'}:
+                    target += f'&create={action_kind[4:]}#quick-create'
+                else:
+                    continue
+                actions += f'<a href="{_escape(target)}">{_escape(action["title"])}</a>'
+        kind_label = {'cabinet':'Cabinet', 'register':'Register', 'document_type':'Dokumenttyp'}[kind]
+        rows.append(f'<tr data-overview-row tabindex="0">{_row_action_cell(item.name, actions)}'
+                    f'<td><a href="{_escape(href)}">{_escape(item.name)}</a></td><td>{kind_label}</td><td>{_escape(summary)}</td></tr>')
+    return _render_overview_table(['Name', 'Art', 'Inhalt'], rows, caption=f'{len(entries)} Strukturelemente')
+
+
+def _render_index_search_results_table(documents: list[Document], fields: list[MetadataField]) -> str:
+    return _render_document_table(documents, fields, caption=f'{len(documents)} Treffer')
+
+
 def _render_node_results(
     cabinets: list[Cabinet],
     all_documents: list[Document],
@@ -8027,9 +8413,11 @@ def _render_node_results(
     search_query: str,
     index_search_filters: dict[str, list[str]] | None = None,
     document_types: list[DocumentType] | None = None,
+    *,
+    index_search_submitted: bool = False,
 ) -> tuple[str, str]:
     normalized_query = (search_query or "").strip().lower()
-    if normalized_query:
+    if normalized_query and not index_search_submitted:
         matching_documents = []
         for document in all_documents:
             metadata = metadata_from_json(document.metadata_json)
@@ -8046,18 +8434,13 @@ def _render_node_results(
             if normalized_query in haystack:
                 matching_documents.append(document)
 
-        result_cards = []
-        for document in matching_documents[:30]:
-            result_cards.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
         header = f"""
         <div class=\"panel\" style=\"margin-bottom:16px;\">
           <h2 style=\"margin-top:0;\">Suchtreffer</h2>
           <p class=\"muted\">Volltextsuche nach: {_escape(search_query)}</p>
         </div>
         """
-        if not result_cards:
-            return "<div class='panel'><p class='muted'>Keine Treffer gefunden.</p></div>", header
-        return '<div class="object-list">' + ''.join(result_cards) + '</div>', header
+        return _render_document_table(matching_documents), header
 
     if not selected_node:
         header = """
@@ -8079,32 +8462,28 @@ def _render_node_results(
         typed_cabinets = [cab for cab in cabinets if cab.cabinet_type and str(cab.cabinet_type.id) == selected_id]
         typed_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and _resolved_document_cabinet(doc).cabinet_type and str(_resolved_document_cabinet(doc).cabinet_type.id) == selected_id]
         subtitle = f"{len(typed_cabinets)} Cabinets · {len(typed_documents)} Dokumente in diesem Cabinettyp"
+        entries = []
         for cabinet in sorted(typed_cabinets, key=lambda item: item.order):
             register_count = len(_active_registers_for_cabinet(cabinet))
             doc_type_count = len(cabinet.document_types or [])
             cabinet_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id)]
-            results.append(
-                f"<a class='object-card' href='/ui/app?node_kind=cabinet&node_id={cabinet.id}'><strong>🗂️ {_escape(cabinet.name)}</strong><div class='muted'>{register_count} Register · {doc_type_count} direkte Dokumenttypen · {len(cabinet_documents)} Dokumente</div></a>"
-            )
+            entries.append(('cabinet', cabinet, f"{register_count} Register · {doc_type_count} Dokumenttypen · {len(cabinet_documents)} Dokumente"))
+        results.append(_render_structure_table(entries))
     elif selected_kind == "cabinet":
         cabinet = next((cab for cab in cabinets if str(cab.id) == selected_id), None)
         if cabinet:
             subtitle = "Inhalt dieses Cabinets"
-            structure_results: list[str] = []
-            document_results: list[str] = []
+            structure_entries = []
             for register in sorted(_active_registers_for_cabinet(cabinet), key=lambda item: item.order):
                 register_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id) and doc.document_type and doc.document_type.register_id and str(doc.document_type.register_id) == str(register.id)]
-                structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=register&node_id={register.id}'><strong>📑 {_escape(register.name)}</strong><div class='muted'>{len(register.document_types)} Dokumenttypen · {len(register_documents)} Dokumente</div></a>")
+                structure_entries.append(("register", register, f"{len(register.document_types)} Dokumenttypen · {len(register_documents)} Dokumente"))
             for doc_type in sorted(cabinet.document_types, key=lambda item: item.order):
                 matching_documents = [doc for doc in all_documents if doc.document_type_id and str(doc.document_type_id) == str(doc_type.id)]
-                structure_results.append(f"<a class='object-card' href='/ui/app?node_kind=document_type&node_id={doc_type.id}'><strong>📄 {_escape(doc_type.name)}</strong><div class='muted'>{len(matching_documents)} Dokumente</div></a>")
+                structure_entries.append(("document_type", doc_type, f"{len(matching_documents)} Dokumente"))
             cabinet_documents = [doc for doc in all_documents if _resolved_document_cabinet(doc) and str(_resolved_document_cabinet(doc).id) == str(cabinet.id)]
-            if structure_results:
-                results.append("<div class='panel' style='margin-bottom:12px;'><h3 style='margin:0;'>Struktur</h3></div>")
-                results.extend(structure_results)
-            for document in cabinet_documents[:20]:
-                document_results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
-            results.extend(document_results)
+            if structure_entries:
+                results.append(_render_structure_table(structure_entries))
+            results.append(_render_document_table(cabinet_documents))
     elif selected_kind == "register":
         register = None
         parent_cabinet = None
@@ -8119,11 +8498,13 @@ def _render_node_results(
         if register:
             matching_documents = [doc for doc in all_documents if doc.document_type and doc.document_type.register_id and str(doc.document_type.register_id) == selected_id]
             subtitle = f"{len(register.document_types)} Dokumenttypen · {len(matching_documents)} Dokumente dieses Registers"
+            structure_entries = []
             for doc_type in sorted(register.document_types, key=lambda item: item.order):
                 doc_type_documents = [doc for doc in matching_documents if doc.document_type_id and str(doc.document_type_id) == str(doc_type.id)]
-                results.append(f"<a class='object-card' href='/ui/app?node_kind=document_type&node_id={doc_type.id}'><strong>📄 {_escape(doc_type.name)}</strong><div class='muted'>Dokumenttyp in {_escape(register.name)} · {len(doc_type_documents)} Dokumente</div></a>")
-            for document in matching_documents[:20]:
-                results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
+                structure_entries.append(("document_type", doc_type, f"{len(doc_type_documents)} Dokumente"))
+            if structure_entries:
+                results.append(_render_structure_table(structure_entries))
+            results.append(_render_document_table(matching_documents))
     elif selected_kind == "document_type":
         matching_documents = [doc for doc in all_documents if doc.document_type_id and str(doc.document_type_id) == selected_id]
         selected_document_type_for_search = next(
@@ -8136,26 +8517,27 @@ def _render_node_results(
             selected_document_type_for_search = next((doc_type for doc_type in (document_types or []) if str(doc_type.id) == selected_id), None)
         subtitle = f"{len(matching_documents)} Dokumente dieses Dokumenttyps"
         if selected_document_type_for_search:
-            results.append(
-                _render_document_type_index_search(
+            search_form = _render_document_type_index_search(
                     selected_document_type_for_search,
                     index_search_filters or {},
                     result_count=len(matching_documents),
                     search_query=search_query,
                 )
-            )
-        for document in matching_documents[:30]:
-            results.append(_render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}"))
+            if index_search_submitted:
+                results.append(f'<details class="search-editor"><summary>Suche bearbeiten</summary>{search_form}</details>')
+            else:
+                results.append(search_form)
+        if index_search_submitted:
+            results.append(_render_index_search_results_table(matching_documents, _definition_fields_for_document_type(selected_document_type_for_search)))
+        else:
+            results.append(_render_document_table(matching_documents, _definition_fields_for_document_type(selected_document_type_for_search)))
     elif selected_kind == "document":
         document = next((doc for doc in all_documents if str(doc.id) == str(selected_id)), None)
         if document:
             parent_document_type_id = str(document.document_type_id) if document.document_type_id else ""
             matching_documents = [doc for doc in all_documents if parent_document_type_id and doc.document_type_id and str(doc.document_type_id) == parent_document_type_id]
             subtitle = f"{len(matching_documents)} Dokumente dieses Dokumenttyps"
-            for candidate in matching_documents[:30]:
-                active_class = " active" if str(candidate.id) == str(document.id) else ""
-                card = _render_document_object_card(candidate, f"/ui/app?node_kind=document&node_id={candidate.id}")
-                results.append(card.replace('class="object-card document-card"', f'class="object-card{active_class} document-card"', 1))
+            results.append(_render_document_table(matching_documents, selected_id=str(document.id)))
 
     if search_query.strip():
         subtitle = (subtitle + " · " if subtitle else "") + f"Suche aktiv: {_escape(search_query)}"
@@ -8170,10 +8552,7 @@ def _render_node_results(
             search_documents = all_documents[:30]
         if search_documents:
             subtitle = f"{len(search_documents)} Suchtreffer"
-            results = [
-                _render_document_object_card(document, f"/ui/app?node_kind=document&node_id={document.id}")
-                for document in search_documents[:30]
-            ]
+            results = [_render_document_table(search_documents)]
 
     if not results:
         results_html = "<div class='panel'><p class='muted'>Für diesen Knoten wurden noch keine Unterelemente gefunden.</p></div>"
@@ -8440,27 +8819,13 @@ def _render_object_overview(
       </div>
     """
 
-    if not filtered_documents:
-        list_html = "<div class='muted'>Keine Objekte für diese Suche oder Filter gefunden.</div>"
-    else:
-        cards = [
-            _render_document_object_card(document, f"/ui/app/documents/{document.id}")
-            for document in filtered_documents
-        ]
-        list_html = '<div class="object-list">' + ''.join(cards) + '</div>'
+    list_html = _render_document_table(filtered_documents)
 
-    recent_links = []
-    for index, document in enumerate(all_documents[:6]):
-        marker = "★" if index < 2 else "🕘"
-        recent_links.append(
-            f'<a class="recent-link" href="/ui/app/documents/{document.id}"><strong>{marker} {_escape(document.title or document.name)}</strong>'
-            f'<div class="muted">{_escape(document.document_type.name if document.document_type else "Ohne Dokumenttyp")}</div></a>'
-        )
-    recent_html = ''.join(recent_links) or "<p class='muted'>Noch keine zuletzt genutzten Objekte.</p>"
+    recent_html = _render_document_table(all_documents[:6], caption='Zuletzt verwendet')
 
     summary_html = stats_html + toolbar_html
     overview_html = list_html
-    return overview_html, summary_html, f'<div class="recent-grid">{recent_html}</div>'
+    return overview_html, summary_html, recent_html
 
 
 def _admin_document_type_options(
@@ -8710,52 +9075,28 @@ def _render_identity_panel(
     ) or '<div class="muted">Noch keine Benutzer vorhanden.</div>'
     message_html = f'<div class="badge" style="display:inline-block;">{_escape(message)}</div>' if message else ""
 
-    user_rows = []
-    for user in users:
-        assigned_roles = sorted({assignment.role.name for assignment in user.role_assignments if assignment.role})
-        role_badges = " ".join(f'<span class="badge">{_escape(role_name)}</span>' for role_name in assigned_roles) or '<span class="muted">Keine Rollen</span>'
-        source_badge = "Lokal" if user.auth_source == "local" else user.auth_source
-        user_rows.append(
-            f"<div class='identity-card'>"
-            f"<h3>👤 {_escape(user.display_name)}</h3>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>E-Mail</div><div class='def-detail-value'>{_escape(user.email)}</div></div>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Quelle</div><div class='def-detail-value'>{_escape(source_badge)}</div></div>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Status</div><div class='def-detail-value'>{_escape(user.status)}</div></div>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Rollen</div><div class='def-detail-value'>{role_badges}</div></div>"
-            f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=users&selected_user_id={user.id}#identity-admin'>Bearbeiten</a>"
-            f"<form method='post' action='/ui/admin/users/{user.id}/toggle-status' style='display:inline;'><button class='chip' type='submit'>{'Deaktivieren' if user.status == 'active' else 'Aktivieren'}</button></form></div>"
-            f"</div>"
-        )
-    users_html = "".join(user_rows) or "<p class='empty-state'>Noch keine Benutzer angelegt.</p>"
+    def identity_table(items, kind, headings, values_for):
+        rows = []
+        singular = {'users':'user', 'roles':'role', 'teams':'team'}[kind]
+        for item in items:
+            label = item.display_name if kind == 'users' else item.name
+            href = f'/ui/admin/identity?identity_tab={kind}&selected_{singular}_id={item.id}#identity-admin'
+            actions = f'<a href="{_escape(href)}">Bearbeiten</a>'
+            if kind == 'users':
+                actions += (f'<form method="post" action="/ui/admin/users/{item.id}/toggle-status">'
+                            f'<button type="submit">{"Deaktivieren" if item.status == "active" else "Aktivieren"}</button></form>')
+            rows.append(f'<tr data-overview-row tabindex="0">{_row_action_cell(label, actions)}'
+                        f'<td><a href="{_escape(href)}">{_escape(label)}</a></td>'
+                        + ''.join(f'<td>{_escape(str(value))}</td>' for value in values_for(item)) + '</tr>')
+        return _render_overview_table(headings, rows, caption=f'{len(items)} Einträge')
 
-    role_rows = []
-    for role in roles:
-        assignment_count = sum(1 for assignment in role.assignments if assignment.user)
-        role_rows.append(
-            f"<div class='identity-card'>"
-            f"<h3>🛡️ {_escape(role.name)}</h3>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Beschreibung</div><div class='def-detail-value'>{_escape(role.description or '—')}</div></div>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Systemrolle</div><div class='def-detail-value'>{'Ja' if role.is_system else 'Nein'}</div></div>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Zuweisungen</div><div class='def-detail-value'>{assignment_count}</div></div>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Rechte</div><div class='def-detail-value'><pre style='margin:0;white-space:pre-wrap;word-break:break-word;'>{_escape(role.permissions_json or '[]')}</pre></div></div>"
-            f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=roles&selected_role_id={role.id}#identity-admin'>Bearbeiten</a></div>"
-            f"</div>"
-        )
-    roles_html = "".join(role_rows) or "<p class='empty-state'>Noch keine Rollen angelegt.</p>"
-
-    team_rows = []
-    for team in teams:
-        member_names = sorted({membership.user.display_name for membership in team.memberships if membership.user})
-        member_badges = " ".join(f'<span class="badge">{_escape(member_name)}</span>' for member_name in member_names) or '<span class="muted">Keine Mitglieder</span>'
-        team_rows.append(
-            f"<div class='identity-card'>"
-            f"<h3>👥 {_escape(team.name)}</h3>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Beschreibung</div><div class='def-detail-value'>{_escape(team.description or '—')}</div></div>"
-            f"<div class='def-detail-row'><div class='def-detail-key'>Mitglieder</div><div class='def-detail-value'>{member_badges}</div></div>"
-            f"<div class='actions'><a class='chip' href='/ui/admin/identity?identity_tab=teams&selected_team_id={team.id}#identity-admin'>Bearbeiten</a></div>"
-            f"</div>"
-        )
-    teams_html = "".join(team_rows) or "<p class='empty-state'>Noch keine Teams angelegt.</p>"
+    users_html = identity_table(users, 'users', ['Name', 'E-Mail', 'Quelle', 'Status', 'Rollen'], lambda user: [
+        user.email, 'Lokal' if user.auth_source == 'local' else user.auth_source, user.status,
+        ', '.join(sorted({a.role.name for a in user.role_assignments if a.role})) or 'Keine Rollen'])
+    roles_html = identity_table(roles, 'roles', ['Name', 'Beschreibung', 'Systemrolle', 'Zuweisungen', 'Rechte'], lambda role: [
+        role.description or '—', 'Ja' if role.is_system else 'Nein', sum(1 for a in role.assignments if a.user), role.permissions_json or '[]'])
+    teams_html = identity_table(teams, 'teams', ['Name', 'Beschreibung', 'Mitglieder'], lambda team: [
+        team.description or '—', ', '.join(sorted({m.user.display_name for m in team.memberships if m.user})) or 'Keine Mitglieder'])
 
     users_section_style = "display:grid;" if active_tab == "users" else "display:none;"
     roles_section_style = "display:grid;" if active_tab == "roles" else "display:none;"
@@ -8805,7 +9146,7 @@ def _render_identity_panel(
           </div>
           <div class="identity-list-section panel">
             <div class="identity-list-header"><h3 style="margin:0;">Benutzer</h3><span class="pill">{len(users)} Konten</span></div>
-            <div class="identity-list-grid">{users_html}</div>
+            {users_html}
           </div>
         </div>
 
@@ -8834,7 +9175,7 @@ def _render_identity_panel(
           </div>
           <div class="identity-list-section panel">
             <div class="identity-list-header"><h3 style="margin:0;">Rollen</h3><span class="pill">{len(roles)} Rollen</span></div>
-            <div class="identity-list-grid">{roles_html}</div>
+            {roles_html}
           </div>
         </div>
 
@@ -8863,7 +9204,7 @@ def _render_identity_panel(
           </div>
           <div class="identity-list-section panel">
             <div class="identity-list-header"><h3 style="margin:0;">Teams</h3><span class="pill">{len(teams)} Teams</span></div>
-            <div class="identity-list-grid">{teams_html}</div>
+            {teams_html}
           </div>
         </div>
       </div>

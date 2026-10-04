@@ -20,6 +20,14 @@ search:
   opensearch_url: "http://localhost:9200"
   index_name: "archiva-documents-v1"
 
+mail:
+  from_email: "archiva@localhost"
+  smtp_host: null
+  smtp_port: 587
+  smtp_user: null
+  smtp_password: null
+  use_tls: true
+
 pdf_stampede:
   enabled: true
   base_url: "http://localhost:8001"

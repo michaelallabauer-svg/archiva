@@ -89,7 +89,8 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def ui_login_guard(request: Request, call_next):
         path = request.url.path
-        if path.startswith("/ui") and not path.startswith("/ui/login") and path not in {"/ui/logout"}:
+        public_ui_paths = {"/ui/logout", "/ui/password-reset", "/ui/reset-password"}
+        if path.startswith("/ui") and not path.startswith("/ui/login") and path not in public_ui_paths:
             if _parse_session_cookie(request.cookies.get(SESSION_COOKIE_NAME)) is None:
                 return_to = path + (f"?{request.url.query}" if request.url.query else "")
                 return RedirectResponse(url=f"/ui/login?return_to={quote_plus(return_to)}", status_code=303)

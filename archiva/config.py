@@ -39,6 +39,17 @@ class SearchSettings(BaseSettings):
     index_name: str = "archiva-documents-v1"
 
 
+class MailSettings(BaseSettings):
+    """SMTP settings for account recovery messages."""
+
+    from_email: str = "archiva@localhost"
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    use_tls: bool = True
+
+
 class AppSettings(BaseSettings):
     """Application settings."""
 
@@ -64,6 +75,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    mail: MailSettings = Field(default_factory=MailSettings)
     app: AppSettings = Field(default_factory=AppSettings)
     pdf_stampede: PdfStampedeSettings = Field(default_factory=PdfStampedeSettings)
 
